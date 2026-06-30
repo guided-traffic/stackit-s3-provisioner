@@ -34,7 +34,7 @@ const (
 )
 
 var bucketGVR = schema.GroupVersionResource{
-	Group:    "s3.gtrfc.com",
+	Group:    "stackit-bucket.gtrfc.com",
 	Version:  "v1",
 	Resource: "buckets",
 }
@@ -89,7 +89,7 @@ func TestBucketSkeletonReconcile(t *testing.T) {
 	const namespace = "default"
 
 	bucket := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "s3.gtrfc.com/v1",
+		"apiVersion": "stackit-bucket.gtrfc.com/v1",
 		"kind":       "Bucket",
 		"metadata":   map[string]any{"name": name, "namespace": namespace},
 		"spec": map[string]any{
@@ -133,5 +133,5 @@ func TestBucketSkeletonReconcile(t *testing.T) {
 	got, err := dyn.Resource(bucketGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	require.NoError(t, err)
 	finalizers := got.GetFinalizers()
-	assert.Contains(t, finalizers, "s3.gtrfc.com/finalizer", "operator should add its finalizer")
+	assert.Contains(t, finalizers, "stackit-bucket.gtrfc.com/finalizer", "operator should add its finalizer")
 }
