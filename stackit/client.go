@@ -33,7 +33,10 @@ type Account struct {
 // LoadAccount reads a STACKIT SA key JSON file and extracts the projectId.
 // The RSA private key stays in the file and is consumed only by the SDK.
 func LoadAccount(keyPath string) (Account, error) {
-	raw, err := os.ReadFile(keyPath)
+	// keyPath is operator-supplied configuration (CLI flag / env var / mounted
+	// Secret path), not attacker-controlled input — directory traversal is not a
+	// concern here.
+	raw, err := os.ReadFile(keyPath) // #nosec G304
 	if err != nil {
 		return Account{}, fmt.Errorf("read key file: %w", err)
 	}
