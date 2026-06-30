@@ -30,3 +30,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# STACKIT service-account keys — contain RSA private keys, NEVER commit
+account-*.json
+*.sa-key.json
