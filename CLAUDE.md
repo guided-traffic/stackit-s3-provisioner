@@ -4,8 +4,11 @@ Kubernetes-Operator (Go), der über die **StackIT Object Storage API** Buckets,
 Workload-Zugangsdaten und Bucket-Policies provisioniert. Ein Operator-Deployment
 pro Cluster, jeweils gebunden an **ein StackIT-Projekt** via Service-Account-Key.
 
-**Phase:** Machbarkeit verifiziert (echte API-Tests grün). Noch **kein** Operator/CRD-Code —
-nur ein getesteter API-Wrapper als Fundament. Detaillierte Findings: **`INIT-SETUP.md`** (Quelle der Wahrheit).
+**Phase:** Machbarkeit verifiziert (echte API-Tests grün). **Operator-Skelett + CI stehen**
+(kubebuilder-Layout, `Bucket`-CRD, controller-runtime Manager, Helm-Chart, GitHub-Pages-Release,
+Renovate, semantic-release — alle Checks grün). Der Reconciler ist noch ein **Stub**
+(Finalizer + `Ready=NotImplemented`-Condition, kein Cloud-Call). Detaillierte Findings:
+**`INIT-SETUP.md`** (Quelle der Wahrheit). Go-Modul: `github.com/guided-traffic/stackit-s3-provisioner`.
 
 ## Repo-Layout
 
@@ -14,6 +17,15 @@ stackit/client.go                        API-Wrapper (Auth, Bucket-/Group-/Acces
 stackit/client_test.go                   Offline-Unit-Tests (Key-Parsing)
 stackit/integration_test.go              //go:build integration — Layer-1 (Cross-Projekt-Isolation)
 stackit/credentials_integration_test.go  //go:build integration — Layer-2 (Workload-Creds + echtes S3)
+api/v1/bucket_types.go                    CRD `Bucket` (s3.gtrfc.com/v1) + Helper, +kubebuilder-Marker
+cmd/main.go                              controller-runtime Manager (baut stackit.Client aus SA-Key-Env)
+internal/controller/bucket_controller.go Reconciler (STUB: Finalizer + Condition, TODO Provisioning §8)
+config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
+deploy/helm/stackit-s3-provisioner/      Helm-Chart (CRD via `make sync-helm-crd` synchronisiert)
+test/integration/                        //go:build integration — envtest gegen echten API-Server
+test/e2e/                                //go:build e2e — Kind-Smoke (Operator healthy + CR reconciled)
+Makefile / Containerfile / renovate.json CI-Gerüst (an Valkey-Operator orientiert)
+.github/workflows/                       release.yml (Test+Release), build.yml (Docker+Helm), renovate.yml
 account-1.json / account-2.json          SA-Keys (ECHTE RSA-Private-Keys, .gitignore'd, NIE committen)
 INIT-SETUP.md                            Vollständige Findings, Policy-Templates, offene Fragen
 ```
@@ -26,6 +38,13 @@ go vet -tags integration ./...
 go test ./stackit/ -run TestLoadAccount -v                                  # offline (kein Netz)
 go test -tags integration ./stackit/ -run Integration -v -timeout 15m       # echte API (legt Ressourcen an, räumt auf)
 go test -tags integration ./stackit/ -run IntegrationWorkloadCredentials -v  # nur Layer 2
+
+# Operator/CI (make):
+make help                       # alle Targets
+make generate-all               # CRD + DeepCopy regenerieren, Helm-Chart-CRD syncen (nach api/v1-Änderung!)
+make lint gosec vuln cyclo      # Linter + Security-Scans (wie CI)
+make test-unit-coverage         # Unit (offline), make test-integration-coverage = envtest
+make e2e-local                  # Kind hochziehen, via Helm installieren, e2e-Smoke
 ```
 
 Integration-Tests treffen die **echte** StackIT-API (Projekte `1f426c6e…` und `eb4205a7…`,
@@ -83,6 +102,9 @@ Zwei Ebenen:
 
 ## Nächster Schritt
 
-Kubebuilder-Scaffold + CRD `Bucket` (= Bucket + Credentials-Group + Access-Key + Deny-Policy in einer CR)
-+ Reconciler, der die in `stackit/client.go` verifizierten Calls verdrahtet. Reconcile-/Finalizer-Flow: `INIT-SETUP.md` §8.
+Skelett steht (CRD `Bucket`, Manager, Helm, CI). **Offen: Provisioning-Logik im Reconciler-Stub**
+(`internal/controller/bucket_controller.go`) — die in `stackit/client.go` verifizierten Calls
+verdrahten: `CreateBucket` → `CreateCredentialsGroup` → `CreateAccessKey` → Secret schreiben →
+`PutBucketPolicy` (Deny-Template §4.1); Finalizer-Teardown (nur wenn Bucket leer). Flow: `INIT-SETUP.md` §8.
+Vorher Q2 (Minimal-Rolle) und Q4 (Bucket-Namensraum) klären.
 </content>

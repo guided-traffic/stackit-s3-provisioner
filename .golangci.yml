@@ -1,0 +1,73 @@
+version: "2"
+
+run:
+  allow-parallel-runners: true
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - unconvert
+    - unparam
+    - goconst
+    - prealloc
+    - revive
+
+  settings:
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unreachable-code
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+
+  exclusions:
+    rules:
+      # Exclude some linters from running on test files.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - goconst
+      # The StackIT objectstorage top-level package is deprecated until 2026-09-30;
+      # migration to the versioned sub-package is deliberately deferred (see CLAUDE.md
+      # SDK-Fallstricke). Suppress only this specific deprecation in the wrapper, so any
+      # other deprecation still surfaces. Remove this rule once the migration lands.
+      - path: stackit/client\.go
+        text: "SA1019"
+        linters:
+          - staticcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/guided-traffic/stackit-s3-provisioner

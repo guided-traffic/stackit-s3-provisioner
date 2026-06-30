@@ -1,0 +1,14 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "stackit-s3-provisioner.fullname" . }}
+  labels:
+    {{- include "stackit-s3-provisioner.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "stackit-s3-provisioner.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "stackit-s3-provisioner.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

@@ -1,0 +1,44 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+cover.out
+coverage.html
+coverage/
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# Node.js (semantic-release)
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Kubernetes / secrets — never ship into the image
+kubeconfig
+*.kubeconfig
+account-*.json
+*.sa-key.json
+
+# CI / docs not needed in the build context
+.github/
+graphify-out/

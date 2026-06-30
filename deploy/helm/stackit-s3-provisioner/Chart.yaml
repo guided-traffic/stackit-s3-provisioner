@@ -1,0 +1,20 @@
+apiVersion: v2
+name: stackit-s3-provisioner
+description: A Kubernetes operator that provisions StackIT Object Storage buckets, workload credentials and isolation policies
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+maintainers:
+  - name: Guided Traffic
+    url: https://github.com/guided-traffic
+keywords:
+  - stackit
+  - object-storage
+  - s3
+  - bucket
+  - provisioner
+  - operator
+  - kubernetes
+home: https://github.com/guided-traffic/stackit-s3-provisioner
+sources:
+  - https://github.com/guided-traffic/stackit-s3-provisioner

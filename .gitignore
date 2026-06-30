@@ -8,14 +8,22 @@
 *.so
 *.dylib
 
+# Locally built tool/manager binaries
+bin/
+manager
+
 # Test binary, built with `go test -c`
 *.test
 
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*
+coverage/
 *.coverprofile
 profile.cov
+
+# Node.js dependencies (for semantic-release)
+node_modules/
 
 # Dependency directories (remove the comment below to include it)
 # vendor/

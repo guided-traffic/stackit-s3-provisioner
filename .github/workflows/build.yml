@@ -1,0 +1,231 @@
+name: Release Docker & Helm
+on:
+  release:
+    types: [published]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GO_VERSION: '1.26.3'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: read
+  attestations: write
+
+jobs:
+  build:
+    name: Build Docker Image
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.12.0
+            network=host
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: guidedtraffic
+          password: ${{ secrets.DOCKERHUB_PAT }}
+
+      - name: Docker meta
+        id: tag_names
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            guidedtraffic/stackit-s3-provisioner
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+          labels: |
+            org.opencontainers.image.title=StackIT S3 Provisioner
+            org.opencontainers.image.description=A Kubernetes operator that provisions StackIT Object Storage buckets, workload credentials and isolation policies
+            org.opencontainers.image.vendor=Guided Traffic
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.documentation=https://github.com/guided-traffic/stackit-s3-provisioner
+            org.opencontainers.image.source=https://github.com/guided-traffic/stackit-s3-provisioner
+
+      - name: Get current epoch time
+        id: time
+        run: echo "epoch=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: Extract version without v prefix
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Extracted version: ${VERSION}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        id: build
+        with:
+          file: Containerfile
+          context: .
+          build-args: |
+            BUILD_NUMBER=${{ steps.version.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.time.outputs.epoch }}
+          platforms: linux/amd64  # ,linux/arm64
+          push: true
+          tags: ${{ steps.tag_names.outputs.tags }}
+          labels: ${{ steps.tag_names.outputs.labels }}
+          # Security features for better Docker Hub score
+          provenance: true
+          sbom: true
+          outputs: type=image,name=target,annotation-index.org.opencontainers.image.description=StackIT S3 Provisioner
+
+      - name: Generate and upload SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: guidedtraffic/stackit-s3-provisioner:${{ steps.version.outputs.version }}
+          format: spdx-json
+          upload-artifact: true
+          upload-release-assets: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload SBOM to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ${{ github.workspace }}/guidedtraffic-stackit-s3-provisioner_*.spdx.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Scout scan
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: guidedtraffic/stackit-s3-provisioner:${{ steps.version.outputs.version }}
+          sarif-file: scout-report.sarif
+          summary: true
+          dockerhub-user: guidedtraffic
+          dockerhub-password: ${{ secrets.DOCKERHUB_PAT }}
+
+  release-helm-gh:
+    name: Release Helm Chart to GitHub Pages
+    needs: build
+    runs-on: self-hosted
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.16.3
+
+      # Regenerate CRDs + DeepCopy and sync them into the Helm chart, then fail
+      # loudly if the working tree is dirty. This guarantees the released chart
+      # always carries the CRD that matches the Go API types — a stale checked-in
+      # CRD cannot reach end-user clusters.
+      - name: Regenerate CRDs and sync to Helm chart
+        run: make generate-all
+
+      - name: Verify generated artifacts are committed
+        run: |
+          if ! git diff --quiet; then
+            echo "::error::Generated CRDs / DeepCopy / Helm chart CRD are out of sync with api/v1/."
+            echo "Run 'make generate-all' locally and commit the result before releasing."
+            git --no-pager diff --stat
+            git --no-pager diff
+            exit 1
+          fi
+
+      - name: Update Chart Version
+        run: |
+          # Extract version from the release tag (without 'v' prefix)
+          VERSION=${GITHUB_REF_NAME#v}
+          # Update chart and app version
+          sed -i "s/^version:.*$/version: ${VERSION}/" deploy/helm/stackit-s3-provisioner/Chart.yaml
+          sed -i "s/^appVersion:.*$/appVersion: \"${VERSION}\"/" deploy/helm/stackit-s3-provisioner/Chart.yaml
+          # Update image tag in values.yaml
+          sed -i "s/^  tag:.*$/  tag: \"${VERSION}\"/" deploy/helm/stackit-s3-provisioner/values.yaml
+
+      - name: Create Helm Package
+        run: |
+          cd deploy/helm
+          helm package stackit-s3-provisioner/
+          mkdir -p repo
+          mv *.tgz repo/
+          helm repo index repo/ --url https://guided-traffic.github.io/stackit-s3-provisioner/
+          cd ../..
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Save Chart Package
+        run: |
+          mkdir -p /tmp/helm-charts
+          cp -r deploy/helm/repo/* /tmp/helm-charts/
+
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to GitHub Pages
+        run: |
+          # Copy new charts into the repository root
+          cp /tmp/helm-charts/*.tgz .
+
+          # Merge with existing index.yaml if present
+          if [ -f index.yaml ]; then
+            mkdir -p temp-repo
+            cp *.tgz temp-repo/
+            helm repo index temp-repo/ --url https://guided-traffic.github.io/stackit-s3-provisioner/ --merge index.yaml
+            cp temp-repo/index.yaml .
+            rm -rf temp-repo
+          else
+            helm repo index . --url https://guided-traffic.github.io/stackit-s3-provisioner/
+          fi
+
+          git add --force *.tgz index.yaml
+          git commit -m "Release Helm chart for $GITHUB_REF_NAME"
+          git push --force origin gh-pages
+
+      - name: Update Release Assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            *.tgz
+            index.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

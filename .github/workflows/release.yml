@@ -1,0 +1,822 @@
+name: Test and Release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write  # For PR comments
+  issues: write         # For issue comments
+
+env:
+  GO_VERSION: '1.26.3'
+  KUBERNETES_VERSION: '1.33.4'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  e2e-tests:
+    name: E2E Tests
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: guidedtraffic
+          password: ${{ secrets.DOCKERHUB_PAT }}
+
+      - name: Prepare host for DinD networking
+        run: |
+          # kube-proxy in iptables mode requires specific kernel modules.
+          # On self-hosted DinD runners these may not be loaded, causing
+          # kube-proxy to crash with "Error" immediately.
+          for mod in br_netfilter nf_conntrack nf_conntrack_ipv4 xt_conntrack \
+                     ip_tables ip6_tables iptable_nat iptable_filter; do
+            sudo modprobe "$mod" 2>/dev/null || true
+          done
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1  2>/dev/null || true
+          sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=1 2>/dev/null || true
+          sudo sysctl -w net.ipv4.ip_forward=1                 2>/dev/null || true
+          echo "Loaded kernel modules:"
+          lsmod | grep -E 'br_netfilter|nf_conntrack|ip_tables|ip6_tables' || true
+
+      - name: Create Kind config for DinD
+        run: |
+          cat << EOF > kind-config.yaml
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: stackit-s3-provisioner-test
+          networking:
+            kubeProxyMode: "iptables"
+          nodes:
+          - role: control-plane
+          # Use native snapshotter to avoid nested overlay issues in DinD
+          containerdConfigPatches:
+          - |-
+            [plugins."io.containerd.grpc.v1.cri".containerd]
+              snapshotter = "native"
+              disable_snapshot_annotations = false
+          EOF
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: 'v${{ env.KUBERNETES_VERSION }}'
+
+      - name: Create Kind cluster
+        id: kind-cluster
+        uses: helm/kind-action@v1.14.0
+        with:
+          version: v0.30.0
+          node_image: kindest/node:v${{ env.KUBERNETES_VERSION }}
+          cluster_name: stackit-s3-provisioner-test
+          wait: 300s
+          ignore_failed_clean: true
+          config: kind-config.yaml
+
+      - name: Verify Kind cluster
+        run: |
+          set -euo pipefail
+          kubectl cluster-info
+          kubectl wait --for=condition=Ready nodes --all --timeout=180s
+          kubectl get nodes
+
+      - name: Fix inotify limits inside Kind node
+        run: |
+          # Since Linux 5.13, inotify limits are user-namespace-aware.
+          # Host sysctl settings are NOT inherited by containers.
+          # kube-proxy crashes with "too many open files" without this.
+          docker exec stackit-s3-provisioner-test-control-plane sysctl -w fs.inotify.max_user_watches=1048576
+          docker exec stackit-s3-provisioner-test-control-plane sysctl -w fs.inotify.max_user_instances=8192
+
+      - name: Wait for kube-system pods
+        run: |
+          set -euo pipefail
+          echo "=== kube-system pod status before wait ==="
+          kubectl -n kube-system get pods -o wide
+          echo ""
+
+          # ---------- helper: resilient daemonset wait ----------
+          # kube-proxy can crash on DinD runners when iptables kernel modules
+          # are slow to initialise. This helper detects Error/CrashLoopBackOff
+          # pods, collects logs for diagnosis, deletes them so the DaemonSet
+          # controller recreates them, and retries.
+          wait_daemonset() {
+            local ds_name="$1" label="$2" max_attempts=5
+            for attempt in $(seq 1 $max_attempts); do
+              echo "[${ds_name}] attempt ${attempt}/${max_attempts}"
+              if kubectl -n kube-system rollout status daemonset/"${ds_name}" --timeout=60s 2>/dev/null; then
+                echo "[${ds_name}] ready."
+                return 0
+              fi
+              bad_pods=$(kubectl -n kube-system get pods -l "${label}" --no-headers 2>/dev/null \
+                         | grep -E 'Error|CrashLoopBackOff|Init:Error' | awk '{print $1}') || true
+              if [ -n "$bad_pods" ]; then
+                for pod in $bad_pods; do
+                  echo "[${ds_name}] logs from ${pod}:"
+                  kubectl -n kube-system logs "$pod" --tail=30 2>&1 || true
+                  echo "[${ds_name}] deleting ${pod} to trigger recreation..."
+                  kubectl -n kube-system delete pod "$pod" --force --grace-period=0 2>/dev/null || true
+                done
+                sleep 10
+              else
+                echo "[${ds_name}] no error pods found, pods may still be starting..."
+                sleep 15
+              fi
+            done
+            echo "ERROR: daemonset ${ds_name} not ready after ${max_attempts} attempts"
+            kubectl -n kube-system describe daemonset/"${ds_name}" || true
+            kubectl -n kube-system describe pods -l "${label}" || true
+            return 1
+          }
+
+          wait_daemonset "kube-proxy" "k8s-app=kube-proxy"
+          wait_daemonset "kindnet"    "app=kindnet"
+
+          echo "Waiting for coredns..."
+          kubectl -n kube-system rollout status deployment/coredns --timeout=120s
+
+          echo ""
+          echo "=== Final pod status ==="
+          kubectl -n kube-system get pods -o wide
+          echo "kube-system pods ready."
+
+      - name: Verify in-cluster API connectivity
+        run: |
+          # kube-proxy pods being Ready does NOT mean their iptables DNAT rules for
+          # ClusterIPs (e.g. kubernetes.default.svc -> 10.96.0.1:443) are applied yet.
+          # In DinD this race causes "dial tcp 10.96.0.1:443: i/o timeout" inside pods.
+          # Fix: probe from inside the cluster; if it fails, restart kube-proxy to force
+          # a full iptables resync, then verify again.
+          echo "Probing in-cluster kubernetes service connectivity..."
+          PROBE_OK=false
+          for attempt in 1 2 3; do
+            kubectl run api-probe -n default \
+              --image=busybox:1.36 \
+              --restart=Never \
+              -- sleep 60
+            kubectl wait -n default --for=condition=Ready pod/api-probe --timeout=60s
+
+            if kubectl exec -n default api-probe -- \
+                timeout 20 sh -c \
+                'until nc -z -w 2 kubernetes.default.svc 443 2>/dev/null; do sleep 2; done'; then
+              echo "In-cluster API connectivity OK (attempt ${attempt})"
+              PROBE_OK=true
+              kubectl delete -n default pod api-probe --force --grace-period=0
+              break
+            fi
+
+            echo "Connectivity check failed on attempt ${attempt} — restarting kube-proxy to force iptables resync..."
+            kubectl delete -n default pod api-probe --force --grace-period=0 || true
+            kubectl -n kube-system rollout restart daemonset/kube-proxy
+            kubectl -n kube-system rollout status daemonset/kube-proxy --timeout=60s
+          done
+
+          if [ "$PROBE_OK" = "false" ]; then
+            echo "ERROR: In-cluster API connectivity could not be established after 3 attempts"
+            exit 1
+          fi
+
+      - name: Build and load operator image
+        run: |
+          make docker-build IMG=stackit-s3-provisioner:test
+          # Manual ctr import without --all-platforms/--snapshotter flags
+          # to avoid "no unpack platforms defined" error with native snapshotter in DinD
+          docker save stackit-s3-provisioner:test | docker exec -i stackit-s3-provisioner-test-control-plane ctr --namespace=k8s.io images import -
+
+      - name: Verify image in cluster
+        run: |
+          echo "=== Verifying image is available in Kind cluster ==="
+          docker exec stackit-s3-provisioner-test-control-plane crictl images | grep -E 'stackit-s3-provisioner\s+test|stackit-s3-provisioner:test' || {
+            echo "ERROR: Image not found in cluster!"
+            echo "Available images:"
+            docker exec stackit-s3-provisioner-test-control-plane crictl images
+            exit 1
+          }
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: 'v3.16.3'
+
+      - name: Debug cluster state
+        run: |
+          echo "=== Cluster info ==="
+          kubectl cluster-info
+          echo "=== Nodes ==="
+          kubectl get nodes -o wide
+          echo "=== Namespaces ==="
+          kubectl get namespaces
+          echo "=== Storage classes ==="
+          kubectl get storageclass
+
+      - name: Install operator via Helm
+        id: helm-install
+        continue-on-error: true
+        run: |
+          helm install stackit-s3-provisioner deploy/helm/stackit-s3-provisioner \
+            --namespace stackit-s3-provisioner-system \
+            --create-namespace \
+            --values test/e2e/helm-values.yaml \
+            --set image.repository=stackit-s3-provisioner \
+            --set image.tag=test \
+            --wait \
+            --timeout 180s \
+            --debug
+
+      - name: Debug Helm install failure
+        if: steps.helm-install.outcome == 'failure'
+        run: |
+          echo "=== Helm install failed, collecting diagnostics ==="
+          echo "=== Pods in operator namespace ==="
+          kubectl -n stackit-s3-provisioner-system get pods -o wide || true
+
+          POD_NAME=$(kubectl -n stackit-s3-provisioner-system get pods -l app.kubernetes.io/name=stackit-s3-provisioner -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          echo "Pod name: ${POD_NAME}"
+
+          if [ -n "$POD_NAME" ]; then
+            echo "=== Operator logs (current attempt) ==="
+            kubectl -n stackit-s3-provisioner-system logs "$POD_NAME" --tail=100 2>&1 || echo "No current logs available"
+            echo "=== Operator logs (previous crash) ==="
+            kubectl -n stackit-s3-provisioner-system logs "$POD_NAME" --previous --tail=100 2>&1 || echo "No previous logs available"
+          fi
+
+          echo "=== Describe pods ==="
+          kubectl -n stackit-s3-provisioner-system describe pods || true
+          echo "=== Events ==="
+          kubectl -n stackit-s3-provisioner-system get events --sort-by='.lastTimestamp' || true
+          echo "=== RBAC ==="
+          kubectl get clusterrolebinding | grep stackit-s3-provisioner || true
+
+          exit 1
+
+      - name: Wait for operator
+        run: kubectl -n stackit-s3-provisioner-system wait --for=condition=available --timeout=120s deployment/stackit-s3-provisioner
+
+      - name: Run E2E tests
+        run: make test-e2e
+        env:
+          E2E_TESTS: "true"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== Operator logs ==="
+          kubectl -n stackit-s3-provisioner-system logs -l app.kubernetes.io/name=stackit-s3-provisioner --tail=100 || true
+          echo "=== Describe pods ==="
+          kubectl -n stackit-s3-provisioner-system describe pods || true
+          echo "=== Events ==="
+          kubectl -n stackit-s3-provisioner-system get events --sort-by='.lastTimestamp' || true
+
+      - name: Cleanup Kind cluster
+        if: always()
+        run: kind delete cluster --name stackit-s3-provisioner-test || true
+
+  linter:
+    name: Code Linting
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Run linting
+        run: make lint
+
+  gosec:
+    name: GoSec Security Scan
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Run GoSec security scan
+        timeout-minutes: 10
+        run: make gosec
+
+  malware-scan:
+    name: Malware Scan (Source Code)
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install ClamAV
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clamav clamav-daemon
+
+      - name: Update ClamAV database
+        run: |
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam
+
+      - name: Run ClamAV scan on source code
+        run: |
+          echo "🔍 Scanning source code for malware..."
+          clamscan --recursive --infected --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=bin . | tee clamav-report.txt
+
+          if grep -q "Infected files: 0" clamav-report.txt; then
+            echo "✅ No malware detected in source code"
+          else
+            echo "❌ MALWARE DETECTED! Blocking release."
+            cat clamav-report.txt
+            exit 1
+          fi
+
+      - name: Upload ClamAV report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: clamav-report
+          path: clamav-report.txt
+          retention-days: 30
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Run unit tests with coverage
+        run: make test-unit-coverage
+
+      - name: Upload unit coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-coverage
+          path: coverage/unit.out
+          retention-days: 7
+
+  govulncheck:
+    name: Vulnerability Check
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Run vulnerability check
+        run: make vuln
+
+  cyclomatic-complexity:
+    name: Cyclomatic Complexity
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Run cyclomatic complexity check
+        run: make cyclo
+
+      - name: Generate complexity report
+        if: always()
+        run: |
+          echo "## 📊 Cyclomatic Complexity Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Top 20 most complex functions:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          gocyclo -top 20 . >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Threshold: 15 (functions above this are flagged)" >> $GITHUB_STEP_SUMMARY
+
+  integration-tests:
+    name: Integration Tests (envtest)
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Run integration tests with coverage
+        run: make test-integration-coverage
+
+      - name: Upload integration coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-coverage
+          path: coverage/integration.out
+          retention-days: 7
+
+  coverage-report:
+    name: Combined Coverage Report
+    runs-on: self-hosted
+    needs: [unit-tests, integration-tests]
+    if: always() && (needs.unit-tests.result == 'success' || needs.integration-tests.result == 'success')
+    permissions:
+      contents: read  # Read only - semantic-release will commit the badge
+      pull-requests: write  # Needed to comment on PRs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download unit test coverage
+        uses: actions/download-artifact@v8
+        with:
+          name: unit-coverage
+        continue-on-error: true
+
+      - name: Download integration test coverage
+        uses: actions/download-artifact@v8
+        with:
+          name: integration-coverage
+        continue-on-error: true
+
+      - name: Merge coverage reports
+        id: merge-coverage
+        run: |
+          echo "Merging coverage reports..."
+
+          COVERAGE_FILES=""
+          if [ -f "unit.out" ]; then
+            echo "✓ Unit test coverage found"
+            COVERAGE_FILES="$COVERAGE_FILES unit.out"
+          fi
+          if [ -f "integration.out" ]; then
+            echo "✓ Integration test coverage found"
+            COVERAGE_FILES="$COVERAGE_FILES integration.out"
+          fi
+
+          if [ -z "$COVERAGE_FILES" ]; then
+            echo "ERROR: No coverage files found"
+            exit 1
+          fi
+
+          echo "mode: set" > coverage-merged.out
+          grep -h -v "^mode:" $COVERAGE_FILES >> coverage-merged.out || true
+
+          mkdir -p coverage
+          go tool cover -func=coverage-merged.out > coverage/coverage.txt
+          go tool cover -html=coverage-merged.out -o coverage/coverage.html
+
+          TOTAL_COVERAGE=$(grep "total:" coverage/coverage.txt | awk '{print $3}' | sed 's/%//')
+          echo "percentage=$TOTAL_COVERAGE" >> $GITHUB_OUTPUT
+          echo "========================================"
+          echo "📊 Combined Coverage: ${TOTAL_COVERAGE}%"
+          echo "========================================"
+
+          echo "## Coverage by Package" > coverage/summary.txt
+          grep -v "total:" coverage/coverage.txt | awk '{printf "- **%s**: %s\n", $1, $3}' >> coverage/summary.txt || true
+
+          {
+            echo "coverage_text<<EOF"
+            cat coverage/coverage.txt
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+          echo "## Combined Coverage Report" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat coverage/coverage.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload combined coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-combined
+          path: coverage/
+
+      - name: Create coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          COVERAGE="${{ steps.merge-coverage.outputs.percentage }}"
+
+          COLOR=$(python3 -c "
+          coverage = float('$COVERAGE')
+          if coverage >= 90:
+              print('brightgreen')
+          elif coverage >= 80:
+              print('green')
+          elif coverage >= 70:
+              print('yellow')
+          elif coverage >= 60:
+              print('orange')
+          else:
+              print('red')
+          ")
+
+          mkdir -p .github/badges
+          cat > .github/badges/coverage.json << EOF
+          {
+            "schemaVersion": 1,
+            "label": "coverage",
+            "message": "${COVERAGE}%",
+            "color": "${COLOR}"
+          }
+          EOF
+
+          echo "Coverage badge created: ${COVERAGE}% (${COLOR})"
+
+      - name: Upload coverage badge as artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-badge
+          path: .github/badges/coverage.json
+
+      - name: Get main branch coverage
+        if: github.event_name == 'pull_request'
+        id: main-coverage
+        continue-on-error: true
+        run: |
+          MAIN_COVERAGE="N/A"
+          MAIN_BADGE_URL="https://raw.githubusercontent.com/${{ github.repository }}/main/.github/badges/coverage.json"
+          echo "Fetching main branch coverage from: $MAIN_BADGE_URL"
+          if curl -f -s "$MAIN_BADGE_URL" -o main-coverage.json; then
+            MAIN_COVERAGE=$(jq -r '.message' main-coverage.json | sed 's/%//')
+            echo "Main branch coverage: ${MAIN_COVERAGE}%"
+          else
+            echo "Could not fetch main branch coverage badge"
+          fi
+          echo "percentage=$MAIN_COVERAGE" >> $GITHUB_OUTPUT
+
+      - name: Calculate coverage difference
+        if: github.event_name == 'pull_request'
+        id: coverage-diff
+        run: |
+          CURRENT="${{ steps.merge-coverage.outputs.percentage }}"
+          MAIN="${{ steps.main-coverage.outputs.percentage }}"
+          if [ "$MAIN" = "N/A" ]; then
+            echo "diff=N/A" >> $GITHUB_OUTPUT
+            echo "emoji=ℹ️" >> $GITHUB_OUTPUT
+            echo "trend=baseline" >> $GITHUB_OUTPUT
+          else
+            DIFF=$(python3 -c "print(round($CURRENT - $MAIN, 2))")
+            echo "diff=$DIFF" >> $GITHUB_OUTPUT
+            if [ "$(python3 -c "print(1 if $DIFF > 0 else 0)")" = "1" ]; then
+              echo "emoji=📈" >> $GITHUB_OUTPUT
+              echo "trend=improved" >> $GITHUB_OUTPUT
+            elif [ "$(python3 -c "print(1 if $DIFF < 0 else 0)")" = "1" ]; then
+              echo "emoji=📉" >> $GITHUB_OUTPUT
+              echo "trend=decreased" >> $GITHUB_OUTPUT
+            else
+              echo "emoji=➡️" >> $GITHUB_OUTPUT
+              echo "trend=unchanged" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Generate coverage summary for PR
+        if: github.event_name == 'pull_request'
+        id: coverage-summary
+        run: |
+          echo "COVERAGE_SUMMARY<<EOF" >> $GITHUB_ENV
+          cat coverage/summary.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Comment PR with combined coverage
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: coverage
+          message: |
+            ## 📊 Combined Test Coverage Report
+
+            **Current Coverage:** `${{ steps.merge-coverage.outputs.percentage }}%`
+            **Main Branch Coverage:** `${{ steps.main-coverage.outputs.percentage }}%`
+            **Difference:** ${{ steps.coverage-diff.outputs.emoji }} `${{ steps.coverage-diff.outputs.diff }}%`
+
+            <details>
+            <summary>📁 Coverage by Package</summary>
+
+            ${{ env.COVERAGE_SUMMARY }}
+
+            </details>
+
+            <details>
+            <summary>📄 Full Coverage Report</summary>
+
+            ```
+            ${{ steps.merge-coverage.outputs.coverage_text }}
+            ```
+
+            </details>
+
+            > Coverage is calculated from unit tests + integration tests combined.
+
+  container-malware-scan:
+    name: Container Malware Scan
+    runs-on: self-hosted
+    needs: [malware-scan]  # Run after source scan passes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: guidedtraffic
+          password: ${{ secrets.DOCKERHUB_PAT }}
+
+      - name: Get current epoch time
+        id: time
+        run: echo "epoch=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: Build container for scanning
+        uses: docker/build-push-action@v7
+        with:
+          file: Containerfile
+          context: .
+          build-args: |
+            BUILD_NUMBER=scan-${{ github.sha }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.time.outputs.epoch }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: stackit-s3-provisioner:scan-${{ github.sha }}
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: stackit-s3-provisioner:scan-${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          scanners: 'vuln,secret,misconfig'
+
+      - name: Run Trivy scan (SARIF output)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: stackit-s3-provisioner:scan-${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          scanners: 'vuln,secret,misconfig'
+
+      - name: Upload Trivy scan results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-container-report
+          path: trivy-results.sarif
+          retention-days: 30
+
+      - name: Cleanup scan image
+        if: always()
+        run: docker rmi stackit-s3-provisioner:scan-${{ github.sha }} || true
+
+  semantic-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, unit-tests, integration-tests, e2e-tests, coverage-report]
+    name: Semantic Release
+    runs-on: self-hosted
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT }}
+
+      - name: Download coverage badge
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-badge
+          path: .github/badges/
+        continue-on-error: true
+
+      - name: Verify coverage badge downloaded
+        run: |
+          if [ -f ".github/badges/coverage.json" ]; then
+            echo "✅ Coverage badge downloaded successfully"
+            cat .github/badges/coverage.json
+          else
+            echo "⚠️ Coverage badge not found, using existing file"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "lts/*"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Verify the integrity of provenance attestations and registry signatures for installed dependencies
+        run: npm audit signatures
+
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_PAT }}
+        run: npx semantic-release

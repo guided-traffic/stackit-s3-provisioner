@@ -1,0 +1,24 @@
+# Helm values for E2E testing (Kind, image built and loaded locally).
+replicaCount: 1
+
+image:
+  repository: stackit-s3-provisioner
+  pullPolicy: Never
+  tag: test
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+leaderElection:
+  enabled: false
+
+# Skeleton mode: no StackIT service-account key, so the operator does not touch
+# the cloud during e2e. Provisioning is covered by the integration tests.
+stackit:
+  serviceAccountKey:
+    secretName: ""

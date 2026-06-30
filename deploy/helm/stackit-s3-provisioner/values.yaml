@@ -1,0 +1,53 @@
+# Default values for stackit-s3-provisioner.
+
+replicaCount: 1
+
+image:
+  repository: guidedtraffic/stackit-s3-provisioner
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created.
+  create: true
+  # Annotations to add to the service account.
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template.
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Leader election ensures only one operator instance is active at a time.
+# Enable when running more than one replica.
+leaderElection:
+  enabled: false
+
+# stackit configures the operator's binding to a StackIT project.
+stackit:
+  # region is the StackIT region the operator provisions buckets in.
+  region: eu01
+  # serviceAccountKey references an existing Secret holding the StackIT
+  # service-account key JSON (key flow, embedded RSA private key).
+  # Leave secretName empty to run the operator in skeleton mode (no provisioning).
+  serviceAccountKey:
+    secretName: ""
+    secretKey: sa-key.json
