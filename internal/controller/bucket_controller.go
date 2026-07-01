@@ -229,13 +229,7 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	}
 
 	if err := r.ensureBucket(ctx, b, name, admin); err != nil {
-		var collision *ownershipCollisionError
-		if errors.As(err, &collision) {
-			r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed,
-				"bucket ownership collision: a bucket with this name exists but was not provisioned by this operator")
-			return r.failNoRequeue(ctx, b, err)
-		}
-		return r.fail(ctx, b, fmt.Errorf("ensure bucket: %w", err))
+		return r.failEnsureBucket(ctx, b, err)
 	}
 
 	host, bucketURL, err := r.Stackit.BucketConnInfo(ctx, name)
@@ -319,6 +313,19 @@ func (r *BucketReconciler) ensureBucket(ctx context.Context, b *s3v1.Bucket, nam
 		return err
 	}
 	return s3admin.SetBucketTags(ctx, name, r.ownershipTags(b))
+}
+
+// failEnsureBucket maps an ensureBucket error onto the right terminal state: an
+// ownership collision is a human-actionable fault that must not requeue-hammer,
+// while any other error is transient and retried.
+func (r *BucketReconciler) failEnsureBucket(ctx context.Context, b *s3v1.Bucket, err error) (ctrl.Result, error) {
+	var collision *ownershipCollisionError
+	if errors.As(err, &collision) {
+		r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed,
+			"bucket ownership collision: a bucket with this name exists but was not provisioned by this operator")
+		return r.failNoRequeue(ctx, b, err)
+	}
+	return r.fail(ctx, b, fmt.Errorf("ensure bucket: %w", err))
 }
 
 // adoptOrCollide inspects a pre-existing bucket's ownership tags and decides
@@ -524,22 +531,8 @@ func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
 	}
 
 	if bucketExists {
-		// Ownership guard (defense in depth on top of the empty-check): never delete
-		// a bucket this operator does not own. A foreign bucket that shares this
-		// name, or one we created but crashed before tagging, is left in place and
-		// surfaced rather than removed.
-		owned, err := r.bucketOwnedByUs(ctx, b, name)
-		if err != nil {
+		if err := r.deleteBucketIfOwned(ctx, b, name); err != nil {
 			return err
-		}
-		if owned {
-			if err := r.Stackit.DeleteBucket(ctx, name); err != nil && stackit.StatusCode(err) != 404 {
-				return err
-			}
-		} else {
-			log.FromContext(ctx).Info("skipping bucket deletion: bucket is not owned by this operator", "bucket", name)
-			r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed,
-				"not deleting bucket: it is not owned by this operator (no matching ownership tags)")
 		}
 	}
 
@@ -576,6 +569,28 @@ func (r *BucketReconciler) assertBucketEmpty(ctx context.Context, b *s3v1.Bucket
 	if !empty {
 		r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed, "refusing to delete non-empty bucket")
 		return fmt.Errorf("bucket %q is not empty; refusing to delete (data-loss guard)", name)
+	}
+	return nil
+}
+
+// deleteBucketIfOwned is the teardown ownership guard (defense in depth on top of
+// the empty-check): it deletes the bucket only when its ownership tags prove this
+// operator provisioned it. A foreign bucket that shares this name, or one we
+// created but crashed before tagging, is left in place and surfaced rather than
+// removed.
+func (r *BucketReconciler) deleteBucketIfOwned(ctx context.Context, b *s3v1.Bucket, name string) error {
+	owned, err := r.bucketOwnedByUs(ctx, b, name)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		log.FromContext(ctx).Info("skipping bucket deletion: bucket is not owned by this operator", "bucket", name)
+		r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed,
+			"not deleting bucket: it is not owned by this operator (no matching ownership tags)")
+		return nil
+	}
+	if err := r.Stackit.DeleteBucket(ctx, name); err != nil && stackit.StatusCode(err) != 404 {
+		return err
 	}
 	return nil
 }
