@@ -36,9 +36,9 @@ type BucketReconciler struct {
 	OperatorVersion string
 }
 
-// +kubebuilder:rbac:groups=s3.gtrfc.com,resources=buckets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=s3.gtrfc.com,resources=buckets/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=s3.gtrfc.com,resources=buckets/finalizers,verbs=update
+// +kubebuilder:rbac:groups=stackit-bucket.gtrfc.com,resources=buckets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=stackit-bucket.gtrfc.com,resources=buckets/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=stackit-bucket.gtrfc.com,resources=buckets/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 

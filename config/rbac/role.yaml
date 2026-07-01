@@ -24,7 +24,7 @@ rules:
   - update
   - watch
 - apiGroups:
-  - s3.gtrfc.com
+  - stackit-bucket.gtrfc.com
   resources:
   - buckets
   verbs:
@@ -36,13 +36,13 @@ rules:
   - update
   - watch
 - apiGroups:
-  - s3.gtrfc.com
+  - stackit-bucket.gtrfc.com
   resources:
   - buckets/finalizers
   verbs:
   - update
 - apiGroups:
-  - s3.gtrfc.com
+  - stackit-bucket.gtrfc.com
   resources:
   - buckets/status
   verbs:

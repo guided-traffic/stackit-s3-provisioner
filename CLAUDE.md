@@ -17,7 +17,7 @@ stackit/client.go                        API-Wrapper (Auth, Bucket-/Group-/Acces
 stackit/client_test.go                   Offline-Unit-Tests (Key-Parsing)
 stackit/integration_test.go              //go:build integration — Layer-1 (Cross-Projekt-Isolation)
 stackit/credentials_integration_test.go  //go:build integration — Layer-2 (Workload-Creds + echtes S3)
-api/v1/bucket_types.go                    CRD `Bucket` (s3.gtrfc.com/v1) + Helper, +kubebuilder-Marker
+api/v1/bucket_types.go                    CRD `Bucket` (stackit-bucket.gtrfc.com/v1) + Helper, +kubebuilder-Marker
 cmd/main.go                              controller-runtime Manager (baut stackit.Client aus SA-Key-Env)
 internal/controller/bucket_controller.go Reconciler (STUB: Finalizer + Condition, TODO Provisioning §8)
 config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
@@ -87,6 +87,32 @@ Zwei Ebenen:
   (Host aus `Bucket.urlPathStyle` ableitbar).
 - `objectstorage`-Top-Level-Paket ist **deprecated ab 2026-09-30** → später aufs versionierte Subpaket migrieren.
 
+## Credentials-Secret (Vertrag)
+
+Der Operator schreibt **Zugangsdaten + S3-Verbindungsparameter** ins referenzierte
+Secret (`spec.secretRef.name`), damit sich anbindende Workloads ohne Zusatzconfig
+verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nutzbar):
+
+| Default-Key             | Wert                                    | Quelle                        |
+| ----------------------- | --------------------------------------- | ----------------------------- |
+| `AWS_ACCESS_KEY_ID`     | S3 Access-Key-ID                        | `SecretValues.AccessKeyID`    |
+| `AWS_SECRET_ACCESS_KEY` | S3 Secret                               | `SecretValues.SecretAccessKey`|
+| `S3_BUCKET`             | Bucket-Name                             | `spec.bucketName`             |
+| `S3_REGION`             | Region                                  | `GetRegion()` (Default eu01)  |
+| `S3_ENDPOINT`           | Endpoint-Host (ohne Scheme)             | `SecretValues.Endpoint` (opt.)|
+| `S3_BUCKET_URL`         | voller Path-Style-Bucket-URL            | `SecretValues.BucketURL` (opt.)|
+
+- **Jeder Key-Name** ist pro Bucket via `spec.secretRef.keys.<feld>` überschreibbar
+  (leeres Feld → Default). Logische Felder: `accessKeyID`, `secretAccessKey`,
+  `bucketName`, `region`, `endpoint`, `bucketURL`.
+- Helper in `api/v1/bucket_types.go` (Quelle der Wahrheit, vollständig unit-getestet):
+  - `SecretKeys.<X>Key()` — resolved Key-Name (mit Default).
+  - `Bucket.SecretData(SecretValues)` — baut die `map[string][]byte`-Secret-Data;
+    optionale Felder (`endpoint`, `bucketURL`) nur bei nicht-leerem Wert.
+  - `Bucket.ValidateSecretKeys()` — Fehler bei Key-Kollision (zwei Felder → selber Key,
+    sonst stiller Datenverlust). Reconciler muss das **vor** dem Secret-Write prüfen.
+- Default-Key-Konstanten: `Default*Key` in `api/v1/bucket_types.go`.
+
 ## Konventionen
 
 - Integration-Tests hinter `//go:build integration`; Offline-Suite (`go test ./...`) bleibt netzfrei.
@@ -104,7 +130,8 @@ Zwei Ebenen:
 
 Skelett steht (CRD `Bucket`, Manager, Helm, CI). **Offen: Provisioning-Logik im Reconciler-Stub**
 (`internal/controller/bucket_controller.go`) — die in `stackit/client.go` verifizierten Calls
-verdrahten: `CreateBucket` → `CreateCredentialsGroup` → `CreateAccessKey` → Secret schreiben →
+verdrahten: `CreateBucket` → `CreateCredentialsGroup` → `CreateAccessKey` →
+`ValidateSecretKeys()` + `SecretData(...)` ins `secretRef`-Secret schreiben →
 `PutBucketPolicy` (Deny-Template §4.1); Finalizer-Teardown (nur wenn Bucket leer). Flow: `INIT-SETUP.md` §8.
 Vorher Q2 (Minimal-Rolle) und Q4 (Bucket-Namensraum) klären.
 </content>
