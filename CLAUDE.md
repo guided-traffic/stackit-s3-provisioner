@@ -6,20 +6,25 @@ pro Cluster, jeweils gebunden an **ein StackIT-Projekt** via Service-Account-Key
 
 **Phase:** Machbarkeit verifiziert (echte API-Tests grün). **Operator-Skelett + CI stehen**
 (kubebuilder-Layout, `Bucket`-CRD, controller-runtime Manager, Helm-Chart, GitHub-Pages-Release,
-Renovate, semantic-release — alle Checks grün). Der Reconciler ist noch ein **Stub**
-(Finalizer + `Ready=NotImplemented`-Condition, kein Cloud-Call). Detaillierte Findings:
+Renovate, semantic-release — alle Checks grün). **Reconciler produktiv implementiert** (§8-Flow:
+Admin-Bootstrap → Bucket → Credentials-Group → AccessKey+Secret → Deny-Policy; Finalizer-Teardown
+nur wenn Bucket leer). Idempotent via Find-or-Create-by-Name (kein Leak über Crashes), Secret ist
+Source-of-Truth fürs Live-Credential, Policy self-heilend bei Drift. **Ohne SA-Key = Skeleton-Mode**
+(`Ready=NotImplemented`, kein Cloud-Call — envtest deckt das ab). Detaillierte Findings:
 **`INIT-SETUP.md`** (Quelle der Wahrheit). Go-Modul: `github.com/guided-traffic/stackit-s3-provisioner`.
 
 ## Repo-Layout
 
 ```
-stackit/client.go                        API-Wrapper (Auth, Bucket-/Group-/AccessKey-Ops, S3-Endpoint)
+stackit/client.go                        API-Wrapper (Auth, Bucket-/Group-/AccessKey-Ops, S3-Endpoint, Find/EnsureGroup)
+stackit/s3.go                            Data-Plane: S3Admin (minio) Put/Get-Policy + BucketEmpty, BuildIsolationPolicy §4.1
 stackit/client_test.go                   Offline-Unit-Tests (Key-Parsing)
+stackit/s3_test.go                       Offline-Unit-Tests (Policy-Builder + Drift-Vergleich)
 stackit/integration_test.go              //go:build integration — Layer-1 (Cross-Projekt-Isolation)
 stackit/credentials_integration_test.go  //go:build integration — Layer-2 (Workload-Creds + echtes S3)
 api/v1/bucket_types.go                    CRD `Bucket` (stackit-bucket.gtrfc.com/v1) + Helper, +kubebuilder-Marker
-cmd/main.go                              controller-runtime Manager (baut stackit.Client aus SA-Key-Env)
-internal/controller/bucket_controller.go Reconciler (STUB: Finalizer + Condition, TODO Provisioning §8)
+cmd/main.go                              controller-runtime Manager (stackit.Client + Admin-Secret-Name/-Namespace)
+internal/controller/bucket_controller.go Reconciler (VOLL: §8-Provisioning + Admin-Bootstrap + Finalizer-Teardown)
 config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
 deploy/helm/stackit-s3-provisioner/      Helm-Chart (CRD via `make sync-helm-crd` synchronisiert)
 test/integration/                        //go:build integration — envtest gegen echten API-Server
@@ -126,12 +131,31 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
 - **Q4:** Bucket-Namensraum pro Projekt oder pro Region geteilt? (→ Präfix-Schema nötig?)
 - Entschieden: Region `eu01`, Layer 1+2, Delete nur wenn leer, Keys ohne Ablauf (Details `INIT-SETUP.md` §0).
 
+## Reconciler-Design (implementiert)
+
+- **Admin-Bootstrap (`ensureAdmin`):** einmalige `operator-admin`-Credentials-Group + S3-Key,
+  persistiert im operator-eigenen Secret (`--admin-credentials-secret-name`, Default
+  `stackit-s3-provisioner-admin`, in `POD_NAMESPACE`). Deren URN steht in **jeder** Bucket-Policy
+  (`NotPrincipal`, Lockout-Schutz). Fehlt/unvollständig → Find-or-Create-Group + Keys-clear + neuer Key.
+- **Provisioning (`reconcileNormal`):** `ValidateSecretKeys` → Admin-Secret-Guard → Region-Guard →
+  `ensureAdmin` → `EnsureService` → Bucket (idempotent by name) → `BucketConnInfo` → Workload-Group
+  (Find-or-Create by deterministischem Namen `s3op-<ns>-<name>-<uid8>`) → AccessKey+Secret → Policy.
+- **AccessKey/Secret:** Secret ist Source-of-Truth. Hat Secret Creds **und** Group ≥1 Key → skip.
+  Sonst: **erst alle Group-Keys löschen, dann neuen Key + Secret schreiben** (leak-frei, da Clear
+  vor Create); scheitert Secret-Write → neuen Key sofort löschen (Secret unrecoverable).
+- **Policy (`ensureBucketPolicy`):** `BuildIsolationPolicy` (§4.1), nur bei Drift neu setzen
+  (`PoliciesEquivalent`). Self-healing gegen manuelle Änderungen.
+- **Finalizer-Teardown:** Empty-Check **zuerst** (Admin-S3, Data-Loss-Guard) → dann Keys → Group →
+  Bucket → Secret. Shared Admin-Group wird **nie** angefasst.
+- **Guards (produktionssicher):** CR darf `secretRef` **nicht** aufs Admin-Secret zeigen (sonst
+  Pollution + Admin-Lockout beim Delete); `spec.region` muss = Operator-Region sein (Single-Region v1).
+  Beides → `Ready=Failed` ohne Requeue-Hammer.
+
 ## Nächster Schritt
 
-Skelett steht (CRD `Bucket`, Manager, Helm, CI). **Offen: Provisioning-Logik im Reconciler-Stub**
-(`internal/controller/bucket_controller.go`) — die in `stackit/client.go` verifizierten Calls
-verdrahten: `CreateBucket` → `CreateCredentialsGroup` → `CreateAccessKey` →
-`ValidateSecretKeys()` + `SecretData(...)` ins `secretRef`-Secret schreiben →
-`PutBucketPolicy` (Deny-Template §4.1); Finalizer-Teardown (nur wenn Bucket leer). Flow: `INIT-SETUP.md` §8.
-Vorher Q2 (Minimal-Rolle) und Q4 (Bucket-Namensraum) klären.
+Reconciler steht + alle Offline/lint/envtest-Checks grün. **Offen:** (1) End-to-End-Provisioning gegen
+die **echte** StackIT-API testen (analog `stackit/credentials_integration_test.go`, aber über den
+Reconciler); (2) e2e-Smoke (`make e2e-local`) mit echtem SA-Key gegen Kind; (3) Q2 (Minimal-Rolle),
+Q4 (Bucket-Namensraum) klären. RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) —
+bereits von den cluster-weiten Secret-RBAC-Markern abgedeckt.
 </content>

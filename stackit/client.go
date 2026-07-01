@@ -83,6 +83,9 @@ func NewClient(acc Account, region string) (*Client, error) {
 // ProjectID returns the project this client is bound to.
 func (c *Client) ProjectID() string { return c.account.ProjectID }
 
+// Region returns the region this client operates in.
+func (c *Client) Region() string { return c.region }
+
 // EnsureService makes sure Object Storage is enabled for the project (a
 // prerequisite for creating buckets). It is idempotent: if the service is
 // already enabled it returns nil without re-enabling.
@@ -240,6 +243,61 @@ type CredentialsGroupInfo struct {
 	DisplayName string
 }
 
+// FindCredentialsGroupByName looks up a credentials group by its display name.
+// Display names are the operator's idempotency handle: a deterministic name per
+// Bucket CR lets a reconcile find a group it (or a crashed predecessor) already
+// created, instead of creating a duplicate.
+func (c *Client) FindCredentialsGroupByName(ctx context.Context, displayName string) (id, urn string, found bool, err error) {
+	groups, err := c.ListCredentialsGroups(ctx)
+	if err != nil {
+		return "", "", false, err
+	}
+	for _, g := range groups {
+		if g.DisplayName == displayName {
+			return g.ID, g.URN, true, nil
+		}
+	}
+	return "", "", false, nil
+}
+
+// EnsureCredentialsGroup returns the id/urn of the group with the given display
+// name, creating it if absent. It is idempotent across reconciles and crashes as
+// long as displayName is deterministic for the desired resource.
+func (c *Client) EnsureCredentialsGroup(ctx context.Context, displayName string) (id, urn string, err error) {
+	id, urn, found, err := c.FindCredentialsGroupByName(ctx, displayName)
+	if err != nil {
+		return "", "", err
+	}
+	if found {
+		return id, urn, nil
+	}
+	return c.CreateCredentialsGroup(ctx, displayName)
+}
+
+// DeleteAllAccessKeys removes every access key in a credentials group. It is
+// used both to drain a group before deletion and to clear stale keys before
+// (re)provisioning a fresh key — an access key's secret is only available at
+// create time, so a key whose secret was lost is worthless and must be replaced.
+// A missing group is treated as already drained.
+func (c *Client) DeleteAllAccessKeys(ctx context.Context, groupID string) error {
+	ids, err := c.ListAccessKeyIDs(ctx, groupID)
+	if err != nil {
+		if StatusCode(err) == 404 {
+			return nil
+		}
+		return err
+	}
+	for _, id := range ids {
+		if err := c.DeleteAccessKey(ctx, groupID, id); err != nil {
+			if StatusCode(err) == 404 {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // ListCredentialsGroups lists the credentials groups in the client's project.
 func (c *Client) ListCredentialsGroups(ctx context.Context) ([]CredentialsGroupInfo, error) {
 	resp, err := c.api.ListCredentialsGroups(ctx, c.account.ProjectID, c.region).Execute()
@@ -269,20 +327,30 @@ func (c *Client) ListAccessKeyIDs(ctx context.Context, groupID string) ([]string
 	return out, nil
 }
 
-// BucketEndpointHost returns the S3 endpoint host (no scheme, no bucket) for a
-// bucket, derived from its path-style URL — used to configure an S3 client.
-func (c *Client) BucketEndpointHost(ctx context.Context, name string) (string, error) {
+// BucketConnInfo returns the S3 connection details for a bucket: the endpoint
+// host (no scheme, no bucket) used to configure an S3 client, and the full
+// path-style bucket URL (scheme + host + bucket) written into the workload
+// credentials Secret. Both are derived from the bucket's path-style URL rather
+// than hardcoded.
+func (c *Client) BucketConnInfo(ctx context.Context, name string) (host, pathStyleURL string, err error) {
 	resp, err := c.api.GetBucket(ctx, c.account.ProjectID, c.region, name).Execute()
 	if err != nil {
-		return "", fmt.Errorf("get bucket %q: %w", name, err)
+		return "", "", fmt.Errorf("get bucket %q: %w", name, err)
 	}
 	b := resp.GetBucket()
 	raw := b.GetUrlPathStyle()
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
-		return "", fmt.Errorf("parse bucket path-style url %q: %w", raw, err)
+		return "", "", fmt.Errorf("parse bucket path-style url %q: %w", raw, err)
 	}
-	return u.Host, nil
+	return u.Host, raw, nil
+}
+
+// BucketEndpointHost returns the S3 endpoint host (no scheme, no bucket) for a
+// bucket, derived from its path-style URL — used to configure an S3 client.
+func (c *Client) BucketEndpointHost(ctx context.Context, name string) (string, error) {
+	host, _, err := c.BucketConnInfo(ctx, name)
+	return host, err
 }
 
 // StatusCode extracts the HTTP status code from a STACKIT API error, or 0 if the

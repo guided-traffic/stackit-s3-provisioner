@@ -10,7 +10,6 @@ package stackit
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -21,35 +20,11 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-// bucketIsolationPolicy confines a bucket to two principals:
-//   - adminURN keeps full control (lockout protection + management/cleanup),
-//   - workloadURN is restricted to object operations only.
-//
-// StackIT default access is open within a project, so restriction requires
-// explicit Deny statements (NotPrincipal denies all outsiders; NotAction limits
-// the workload to object ops).
+// bucketIsolationPolicy delegates to the production policy builder so the test
+// exercises the exact document the operator writes (single source of truth in
+// s3.go). See BuildIsolationPolicy for the isolation rationale.
 func bucketIsolationPolicy(bucket, adminURN, workloadURN string) string {
-	res := []string{"arn:aws:s3:::" + bucket, "arn:aws:s3:::" + bucket + "/*"}
-	doc := map[string]any{
-		"Statement": []any{
-			map[string]any{
-				"Sid":          "deny-all-except-admin-and-workload",
-				"Effect":       "Deny",
-				"NotPrincipal": map[string]any{"AWS": []string{adminURN, workloadURN}},
-				"Action":       []string{"s3:*"},
-				"Resource":     res,
-			},
-			map[string]any{
-				"Sid":       "workload-objects-only",
-				"Effect":    "Deny",
-				"Principal": map[string]any{"AWS": workloadURN},
-				"NotAction": []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"},
-				"Resource":  res,
-			},
-		},
-	}
-	b, _ := json.Marshal(doc)
-	return string(b)
+	return BuildIsolationPolicy(bucket, adminURN, workloadURN)
 }
 
 func newMinio(t *testing.T, endpoint string, ak AccessKey) *minio.Client {

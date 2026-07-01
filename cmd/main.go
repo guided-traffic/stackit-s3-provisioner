@@ -38,6 +38,8 @@ func main() {
 	var enableLeaderElection bool
 	var saKeyPath string
 	var region string
+	var adminSecretName string
+	var operatorNamespace string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -49,6 +51,12 @@ func main() {
 			"When empty the operator runs in skeleton mode and does not provision.")
 	flag.StringVar(&region, "stackit-region", envOrDefault("STACKIT_REGION", stackit.RegionEU01),
 		"StackIT region the operator provisions in. Can also be set via STACKIT_REGION.")
+	flag.StringVar(&adminSecretName, "admin-credentials-secret-name",
+		envOrDefault("ADMIN_CREDENTIALS_SECRET_NAME", "stackit-s3-provisioner-admin"),
+		"Name of the operator-owned Secret holding the bootstrap S3 admin credentials used to set bucket policies.")
+	flag.StringVar(&operatorNamespace, "operator-namespace", os.Getenv("POD_NAMESPACE"),
+		"Namespace the operator runs in; used to store the bootstrap S3 admin credentials Secret. "+
+			"Defaults to POD_NAMESPACE.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -88,16 +96,24 @@ func main() {
 			setupLog.Error(err, "unable to build StackIT client")
 			os.Exit(1)
 		}
+		// Provisioning persists the bootstrap S3 admin credentials in a Secret in
+		// the operator's own namespace, so that namespace must be known.
+		if operatorNamespace == "" {
+			setupLog.Error(nil, "operator namespace unknown; set POD_NAMESPACE (or --operator-namespace) when a StackIT key is configured")
+			os.Exit(1)
+		}
 		setupLog.Info("StackIT client configured", "project", acc.ProjectID, "region", region)
 	} else {
 		setupLog.Info("no StackIT service-account key configured; running in skeleton mode")
 	}
 
 	if err = (&controller.BucketReconciler{
-		Client:          mgr.GetClient(),
-		Scheme:          mgr.GetScheme(),
-		Stackit:         stackitClient,
-		OperatorVersion: version,
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Stackit:              stackitClient,
+		OperatorVersion:      version,
+		AdminSecretName:      adminSecretName,
+		AdminSecretNamespace: operatorNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Bucket")
 		os.Exit(1)
