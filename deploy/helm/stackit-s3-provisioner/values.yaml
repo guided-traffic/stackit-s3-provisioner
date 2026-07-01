@@ -1,5 +1,15 @@
 # Default values for stackit-s3-provisioner.
 
+# crds controls how the operator's CustomResourceDefinition (Bucket) is shipped.
+# The CRD lives in templates/, so it is applied on every install AND upgrade.
+# It carries helm.sh/resource-policy: keep, so `helm uninstall` leaves the CRD
+# and all existing Bucket resources intact (no finalizer bypass / leaked cloud
+# resources); remove it manually with `kubectl delete crd` if truly desired.
+crds:
+  # install renders the CRD as part of the chart. Set to false when CRDs are
+  # managed out-of-band (e.g. GitOps / a separate cluster-admin pipeline).
+  install: true
+
 replicaCount: 1
 
 image:

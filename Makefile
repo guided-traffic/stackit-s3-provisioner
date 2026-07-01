@@ -119,12 +119,14 @@ CRD_HELM_TARGET = $(HELM_CHART_DIR)/templates/crd.yaml
 sync-helm-crd: ## Sync generated CRDs into Helm chart (single source of truth: config/crd/bases/).
 	@echo "Syncing CRDs to Helm chart..."
 	@echo "# Generated - do not edit manually. Use 'make sync-helm-crd'." > $(CRD_HELM_TARGET)
+	@echo '{{- if .Values.crds.install }}' >> $(CRD_HELM_TARGET)
 	@for crd in config/crd/bases/*.yaml; do \
 		if [ -f "$$crd" ]; then \
 			echo "---" >> $(CRD_HELM_TARGET); \
-			cat "$$crd" >> $(CRD_HELM_TARGET); \
+			awk '{print} /^  annotations:$$/{print "    helm.sh/resource-policy: keep"}' "$$crd" >> $(CRD_HELM_TARGET); \
 		fi; \
 	done
+	@echo '{{- end }}' >> $(CRD_HELM_TARGET)
 	@echo "CRDs synced to $(CRD_HELM_TARGET)"
 
 ##@ Build
