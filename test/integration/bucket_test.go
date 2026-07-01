@@ -52,6 +52,8 @@ func TestBucketReconcile_SkeletonFlow(t *testing.T) {
 	require.NotNil(t, ready)
 	assert.Equal(t, metav1.ConditionFalse, ready.Status)
 	assert.Equal(t, s3v1.ReasonNotImplemented, ready.Reason)
+	assert.Equal(t, s3v1.PhasePending, got.Status.Phase)
+	assert.NotEmpty(t, got.Status.Message)
 	assert.Equal(t, got.Generation, got.Status.ObservedGeneration)
 	assert.Equal(t, "test", got.Status.OperatorVersion)
 }

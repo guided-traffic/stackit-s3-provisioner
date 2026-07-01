@@ -25,6 +25,29 @@ const (
 	ReasonNotImplemented = "NotImplemented"
 )
 
+// BucketPhase is a coarse, human-readable summary of where a Bucket is in its
+// reconcile lifecycle, surfaced as a printer column for at-a-glance status
+// (e.g. in Lens). It complements the Ready condition: the condition carries the
+// machine-readable truth, the phase is the friendly one-word state that pairs
+// with status.message (the current provisioning step or a short failure reason).
+type BucketPhase string
+
+const (
+	// PhasePending is the initial state before provisioning starts, and the state
+	// of a bucket handled by the operator skeleton (no service-account key).
+	PhasePending BucketPhase = "Pending"
+	// PhaseProvisioning means the operator is actively creating or reconciling the
+	// bucket, credentials and isolation policy.
+	PhaseProvisioning BucketPhase = "Provisioning"
+	// PhaseReady means the bucket, credentials and policy are fully provisioned.
+	PhaseReady BucketPhase = "Ready"
+	// PhaseFailed means the last reconcile (or teardown) attempt failed;
+	// status.message carries the short reason.
+	PhaseFailed BucketPhase = "Failed"
+	// PhaseDeleting means the finalizer teardown is in progress.
+	PhaseDeleting BucketPhase = "Deleting"
+)
+
 // BucketFinalizer guards Bucket deletion so the operator can release the StackIT
 // resources (access key, credentials group, bucket) before the CR is removed.
 const BucketFinalizer = "stackit-bucket.gtrfc.com/finalizer"
@@ -246,6 +269,19 @@ type BucketSpec struct {
 
 // BucketStatus defines the observed state of Bucket.
 type BucketStatus struct {
+	// Phase is a coarse, human-readable lifecycle summary (Pending, Provisioning,
+	// Ready, Failed, Deleting) for at-a-glance display in tools like Lens. The
+	// authoritative, machine-readable state stays in Conditions.
+	// +kubebuilder:validation:Enum=Pending;Provisioning;Ready;Failed;Deleting
+	// +optional
+	Phase BucketPhase `json:"phase,omitempty"`
+
+	// Message is a short, human-readable description of the current reconcile
+	// state: the provisioning step in progress, or a concise reason the last
+	// attempt failed.
+	// +optional
+	Message string `json:"message,omitempty"`
+
 	// ObservedGeneration is the .metadata.generation the operator last reconciled.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
@@ -291,9 +327,11 @@ type BucketStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=bkt
 // +kubebuilder:printcolumn:name="Bucket",type="string",JSONPath=".spec.bucketName",description="Requested bucket name"
-// +kubebuilder:printcolumn:name="Resolved",type="string",JSONPath=".status.resolvedBucketName",description="Physical bucket name in StackIT Object Storage",priority=1
-// +kubebuilder:printcolumn:name="Region",type="string",JSONPath=".spec.region",description="StackIT region"
+// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="Coarse reconcile lifecycle state"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Whether the bucket is fully provisioned"
+// +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.message",description="Current provisioning step or short failure reason"
+// +kubebuilder:printcolumn:name="Region",type="string",JSONPath=".spec.region",description="StackIT region"
+// +kubebuilder:printcolumn:name="Resolved",type="string",JSONPath=".status.resolvedBucketName",description="Physical bucket name in StackIT Object Storage",priority=1
 // +kubebuilder:printcolumn:name="Secret",type="string",JSONPath=".spec.secretRef.name",description="Secret holding the workload credentials",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 

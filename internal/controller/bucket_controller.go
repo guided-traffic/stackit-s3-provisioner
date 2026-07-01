@@ -129,6 +129,18 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			return ctrl.Result{}, nil
 		}
 		if r.Stackit != nil {
+			// Surface that teardown is in progress (visible while a blocked delete —
+			// e.g. a non-empty bucket — keeps the finalizer). Skip re-writing once
+			// already Deleting or once a Failed teardown reason is recorded, so a
+			// blocked delete does not flip-flop Deleting<->Failed and self-trigger
+			// reconciles via the status watch.
+			if bucket.Status.Phase != s3v1.PhaseDeleting && bucket.Status.Phase != s3v1.PhaseFailed {
+				bucket.Status.Phase = s3v1.PhaseDeleting
+				bucket.Status.Message = "releasing StackIT resources"
+				if err := r.Status().Update(ctx, &bucket); err != nil {
+					return ctrl.Result{}, client.IgnoreNotFound(err)
+				}
+			}
 			if err := r.teardown(ctx, &bucket); err != nil {
 				logger.Error(err, "teardown failed; keeping finalizer", "bucket", bucket.EffectiveBucketName())
 				// Keep the finalizer and surface the reason; a non-empty bucket
@@ -163,6 +175,8 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			Reason:  s3v1.ReasonNotImplemented,
 			Message: "operator skeleton: no StackIT service-account key configured",
 		})
+		bucket.Status.Phase = s3v1.PhasePending
+		bucket.Status.Message = "operator skeleton: no StackIT service-account key configured"
 		bucket.Status.ObservedGeneration = bucket.Generation
 		bucket.Status.OperatorVersion = r.OperatorVersion
 		if err := r.Status().Update(ctx, &bucket); err != nil {
@@ -219,6 +233,8 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("persist resolved bucket name: %w", err))
 	}
 
+	r.markProvisioning(ctx, b)
+
 	admin, err := r.ensureAdmin(ctx)
 	if err != nil {
 		return r.fail(ctx, b, fmt.Errorf("bootstrap admin credentials: %w", err))
@@ -259,6 +275,8 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	b.Status.AccessKeyID = accessKeyID
 	b.Status.ObservedGeneration = b.Generation
 	b.Status.OperatorVersion = r.OperatorVersion
+	b.Status.Phase = s3v1.PhaseReady
+	b.Status.Message = fmt.Sprintf("bucket %q provisioned with isolated workload credentials", name)
 	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{
 		Type:    s3v1.ConditionReady,
 		Status:  metav1.ConditionTrue,
@@ -770,6 +788,8 @@ func (r *BucketReconciler) markFailed(ctx context.Context, b *s3v1.Bucket, err e
 		Reason:  s3v1.ReasonFailed,
 		Message: err.Error(),
 	})
+	b.Status.Phase = s3v1.PhaseFailed
+	b.Status.Message = err.Error()
 	b.Status.ObservedGeneration = b.Generation
 	b.Status.OperatorVersion = r.OperatorVersion
 	r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed, err.Error())
@@ -838,6 +858,35 @@ func (r *BucketReconciler) bucketsForSecret(ctx context.Context, obj client.Obje
 		}
 	}
 	return reqs
+}
+
+// markProvisioning flips the coarse phase to Provisioning exactly once per spec
+// change (and on first reconcile / recovery from Failed) so the slow cloud steps
+// are visible in status without a per-step write. It is a best-effort progress
+// hint: a failed status write is logged and ignored, because the terminal
+// Ready/Failed write at the end of the reconcile sets the authoritative state.
+// The settled-for-generation guard stops a converged Ready/Failed object being
+// flipped back to Provisioning, which would self-trigger an endless reconcile via
+// the Bucket status watch.
+func (r *BucketReconciler) markProvisioning(ctx context.Context, b *s3v1.Bucket) {
+	if provisioningSettled(b) || b.Status.Phase == s3v1.PhaseProvisioning {
+		return
+	}
+	b.Status.Phase = s3v1.PhaseProvisioning
+	b.Status.Message = "provisioning bucket and workload credentials"
+	if err := r.Status().Update(ctx, b); err != nil {
+		log.FromContext(ctx).V(1).Info("provisioning status update did not apply", "error", err.Error())
+	}
+}
+
+// provisioningSettled reports whether the operator has already driven the current
+// spec generation to a terminal phase (Ready or Failed). The Provisioning marker
+// is skipped in that case so a re-reconcile that observes no spec change — e.g.
+// the echo of our own status write, or a watched Secret event — does not flip the
+// phase back to Provisioning and self-trigger an endless reconcile loop.
+func provisioningSettled(b *s3v1.Bucket) bool {
+	return b.Status.ObservedGeneration == b.Generation &&
+		(b.Status.Phase == s3v1.PhaseReady || b.Status.Phase == s3v1.PhaseFailed)
 }
 
 // decideBucketName selects the physical StackIT bucket name for a CR without any

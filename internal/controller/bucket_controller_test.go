@@ -66,6 +66,39 @@ func TestDecideBucketName(t *testing.T) {
 	})
 }
 
+func TestProvisioningSettled(t *testing.T) {
+	// The guard must be false whenever a Provisioning marker is warranted (so the
+	// step is shown) and true only for a converged object of the current
+	// generation, so re-reconciles do not flip Ready/Failed back to Provisioning
+	// and self-trigger an endless loop via the status watch.
+	cases := []struct {
+		name     string
+		gen      int64
+		observed int64
+		phase    s3v1.BucketPhase
+		want     bool
+	}{
+		{"first reconcile, nothing observed", 1, 0, "", false},
+		{"ready and current generation", 3, 3, s3v1.PhaseReady, true},
+		{"failed and current generation", 3, 3, s3v1.PhaseFailed, true},
+		{"ready but spec changed", 4, 3, s3v1.PhaseReady, false},
+		{"failed but spec changed", 4, 3, s3v1.PhaseFailed, false},
+		{"mid-provisioning is not settled", 3, 2, s3v1.PhaseProvisioning, false},
+		{"pending current generation is not settled", 3, 3, s3v1.PhasePending, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newBucket("ns", "b", "uid")
+			b.Generation = tc.gen
+			b.Status.ObservedGeneration = tc.observed
+			b.Status.Phase = tc.phase
+			if got := provisioningSettled(b); got != tc.want {
+				t.Fatalf("provisioningSettled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPersistResolvedName(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := s3v1.AddToScheme(scheme); err != nil {

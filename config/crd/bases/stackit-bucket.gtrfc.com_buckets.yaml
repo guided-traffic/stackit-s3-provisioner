@@ -21,18 +21,26 @@ spec:
       jsonPath: .spec.bucketName
       name: Bucket
       type: string
-    - description: Physical bucket name in StackIT Object Storage
-      jsonPath: .status.resolvedBucketName
-      name: Resolved
-      priority: 1
+    - description: Coarse reconcile lifecycle state
+      jsonPath: .status.phase
+      name: Phase
+      type: string
+    - description: Whether the bucket is fully provisioned
+      jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - description: Current provisioning step or short failure reason
+      jsonPath: .status.message
+      name: Status
       type: string
     - description: StackIT region
       jsonPath: .spec.region
       name: Region
       type: string
-    - description: Whether the bucket is fully provisioned
-      jsonPath: .status.conditions[?(@.type=='Ready')].status
-      name: Ready
+    - description: Physical bucket name in StackIT Object Storage
+      jsonPath: .status.resolvedBucketName
+      name: Resolved
+      priority: 1
       type: string
     - description: Secret holding the workload credentials
       jsonPath: .spec.secretRef.name
@@ -234,6 +242,12 @@ spec:
                   CredentialsGroupURN is the credentials-group URN used as the bucket-policy
                   principal for workload isolation (INIT-SETUP.md §4.1).
                 type: string
+              message:
+                description: |-
+                  Message is a short, human-readable description of the current reconcile
+                  state: the provisioning step in progress, or a concise reason the last
+                  attempt failed.
+                type: string
               observedGeneration:
                 description: ObservedGeneration is the .metadata.generation the operator
                   last reconciled.
@@ -242,6 +256,18 @@ spec:
               operatorVersion:
                 description: OperatorVersion is the version of the operator that last
                   reconciled this Bucket.
+                type: string
+              phase:
+                description: |-
+                  Phase is a coarse, human-readable lifecycle summary (Pending, Provisioning,
+                  Ready, Failed, Deleting) for at-a-glance display in tools like Lens. The
+                  authoritative, machine-readable state stays in Conditions.
+                enum:
+                - Pending
+                - Provisioning
+                - Ready
+                - Failed
+                - Deleting
                 type: string
               resolvedBucketName:
                 description: |-
