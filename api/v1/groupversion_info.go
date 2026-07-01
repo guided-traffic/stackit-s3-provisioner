@@ -1,6 +1,6 @@
-// Package v1 contains API Schema definitions for the s3 v1 API group.
+// Package v1 contains API Schema definitions for the stackit-bucket v1 API group.
 // +kubebuilder:object:generate=true
-// +groupName=s3.gtrfc.com
+// +groupName=stackit-bucket.gtrfc.com
 package v1
 
 import (
@@ -11,7 +11,7 @@ import (
 
 var (
 	// GroupVersion is group version used to register these objects.
-	GroupVersion = schema.GroupVersion{Group: "s3.gtrfc.com", Version: "v1"}
+	GroupVersion = schema.GroupVersion{Group: "stackit-bucket.gtrfc.com", Version: "v1"}
 
 	// SchemeBuilder is used to add go types to the GroupVersionResource scheme.
 	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)

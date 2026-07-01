@@ -86,6 +86,69 @@ func TestBucketReconcile_DeletionRemovesFinalizer(t *testing.T) {
 	}, 30*time.Second, 250*time.Millisecond, "bucket should be fully removed after finalizer is dropped")
 }
 
+// TestBucketReconcile_CustomSecretKeys verifies the CRD accepts a Bucket with
+// per-key Secret name overrides and that they survive a round-trip through the
+// API server, while the reconciler still wires the skeleton path.
+func TestBucketReconcile_CustomSecretKeys(t *testing.T) {
+	bucket := &s3v1.Bucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "it-bucket-keys", Namespace: "default"},
+		Spec: s3v1.BucketSpec{
+			BucketName: "it-test-bucket-keys",
+			Region:     "eu01",
+			SecretRef: s3v1.SecretReference{
+				Name: "it-bucket-keys-s3",
+				Keys: s3v1.SecretKeys{
+					AccessKeyID:     "ACCESS_KEY",
+					SecretAccessKey: "SECRET_KEY",
+					BucketName:      "BUCKET",
+					Region:          "REGION",
+					Endpoint:        "ENDPOINT",
+					BucketURL:       "BUCKET_URL",
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClient.Create(testCtx, bucket))
+	t.Cleanup(func() { _ = k8sClient.Delete(testCtx, bucket) })
+
+	key := types.NamespacedName{Name: "it-bucket-keys", Namespace: "default"}
+	require.Eventually(t, func() bool {
+		var got s3v1.Bucket
+		if err := k8sClient.Get(testCtx, key, &got); err != nil {
+			return false
+		}
+		return controllerHasFinalizer(&got)
+	}, 30*time.Second, 250*time.Millisecond, "bucket with custom keys should be reconciled")
+
+	var got s3v1.Bucket
+	require.NoError(t, k8sClient.Get(testCtx, key, &got))
+	assert.Equal(t, "ACCESS_KEY", got.Spec.SecretRef.Keys.AccessKeyID)
+	assert.Equal(t, "BUCKET_URL", got.Spec.SecretRef.Keys.BucketURL)
+	assert.NoError(t, got.ValidateSecretKeys())
+	// The resolver/builder must round-trip with the overrides applied.
+	data := got.SecretData(s3v1.SecretValues{AccessKeyID: "AKIA", SecretAccessKey: "s"})
+	assert.Equal(t, []byte("AKIA"), data["ACCESS_KEY"])
+	assert.Equal(t, []byte("it-test-bucket-keys"), data["BUCKET"])
+}
+
+// TestBucket_RejectsInvalidSecretKey verifies the generated CRD pattern rejects a
+// Secret data key with illegal characters (e.g. a space) at admission time.
+func TestBucket_RejectsInvalidSecretKey(t *testing.T) {
+	bucket := &s3v1.Bucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "it-bucket-badkey", Namespace: "default"},
+		Spec: s3v1.BucketSpec{
+			BucketName: "it-test-bucket-badkey",
+			SecretRef: s3v1.SecretReference{
+				Name: "it-bucket-badkey-s3",
+				Keys: s3v1.SecretKeys{AccessKeyID: "bad key"}, // space is illegal
+			},
+		},
+	}
+	err := k8sClient.Create(testCtx, bucket)
+	require.Error(t, err, "API server should reject an invalid Secret data key")
+	t.Cleanup(func() { _ = k8sClient.Delete(testCtx, bucket) })
+}
+
 func controllerHasFinalizer(b *s3v1.Bucket) bool {
 	for _, f := range b.Finalizers {
 		if f == s3v1.BucketFinalizer {
