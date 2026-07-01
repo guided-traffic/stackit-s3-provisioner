@@ -2,8 +2,33 @@ apiVersion: v1
 entries:
   stackit-s3-provisioner:
   - apiVersion: v2
+    appVersion: 1.3.1
+    created: "2026-07-01T10:20:13.236106748Z"
+    description: A Kubernetes operator that provisions StackIT Object Storage buckets,
+      workload credentials and isolation policies
+    digest: 534c8b321c46c81a8d00dfe0ef62cb3dfb1ce5f7e223d835ced2819ea176ea92
+    home: https://github.com/guided-traffic/stackit-s3-provisioner
+    keywords:
+    - stackit
+    - object-storage
+    - s3
+    - bucket
+    - provisioner
+    - operator
+    - kubernetes
+    maintainers:
+    - name: Guided Traffic
+      url: https://github.com/guided-traffic
+    name: stackit-s3-provisioner
+    sources:
+    - https://github.com/guided-traffic/stackit-s3-provisioner
+    type: application
+    urls:
+    - https://guided-traffic.github.io/stackit-s3-provisioner/stackit-s3-provisioner-1.3.1.tgz
+    version: 1.3.1
+  - apiVersion: v2
     appVersion: 1.3.0
-    created: "2026-07-01T09:50:03.017719989Z"
+    created: "2026-07-01T10:20:13.235686727Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 10a5cdd944ab203561a56ed2a1ac9a941925adbf0fd519b10164dd1cc0f9e505
@@ -28,7 +53,7 @@ entries:
     version: 1.3.0
   - apiVersion: v2
     appVersion: 1.2.1
-    created: "2026-07-01T09:50:03.017098413Z"
+    created: "2026-07-01T10:20:13.235271654Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 3e63a01f300a9d9f13a7919b4bfe8ea5035cf9ee6b29003a589812359c90a76a
@@ -53,7 +78,7 @@ entries:
     version: 1.2.1
   - apiVersion: v2
     appVersion: 1.2.0
-    created: "2026-07-01T09:50:03.016458464Z"
+    created: "2026-07-01T10:20:13.234853366Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 01ab18ec2e7bc7c5f98c22ff1882dc11083d9b6d9b46a5b5f0d3d457dfc3a737
@@ -78,7 +103,7 @@ entries:
     version: 1.2.0
   - apiVersion: v2
     appVersion: 1.1.1
-    created: "2026-07-01T09:50:03.015783838Z"
+    created: "2026-07-01T10:20:13.234437432Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 26482875f789a4389e84b02cfc2504a9f53ac82f32816558598e3f9ff6d02176
@@ -103,7 +128,7 @@ entries:
     version: 1.1.1
   - apiVersion: v2
     appVersion: 1.1.0
-    created: "2026-07-01T09:50:03.015156902Z"
+    created: "2026-07-01T10:20:13.234047047Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: d366d5d468789b3cefad6297e5203b5b8c6bce4924ad3084c3b723a072d4526e
@@ -128,7 +153,7 @@ entries:
     version: 1.1.0
   - apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-07-01T09:50:03.014604447Z"
+    created: "2026-07-01T10:20:13.233621274Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 9aeecb96afd03ed8c643807a076f2f0c98bd63099f2afe83e9fadad3a04afb58
@@ -151,4 +176,4 @@ entries:
     urls:
     - https://guided-traffic.github.io/stackit-s3-provisioner/stackit-s3-provisioner-1.0.0.tgz
     version: 1.0.0
-generated: "2026-07-01T09:50:03.013860611Z"
+generated: "2026-07-01T10:20:13.233053914Z"
