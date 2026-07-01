@@ -23,7 +23,7 @@ structurally guaranteed by StackIT itself. See [`CLAUDE.md`](CLAUDE.md) and
 [`INIT-SETUP.md`](INIT-SETUP.md) for the architecture and security invariants.
 
 ```yaml
-apiVersion: s3.gtrfc.com/v1
+apiVersion: stackit-bucket.gtrfc.com/v1
 kind: Bucket
 metadata:
   name: my-bucket
@@ -32,7 +32,39 @@ spec:
   bucketName: my-bucket
   region: eu01
   secretRef:
-    name: my-bucket-s3   # operator writes accessKeyID/secretAccessKey here
+    name: my-bucket-s3   # operator writes the credentials + connection info here
+```
+
+### Credentials Secret
+
+The operator writes the provisioned access key **and** the S3 connection
+parameters a workload needs into the referenced Secret. By default the data keys
+are env-var style, so the Secret can be consumed directly via `envFrom`:
+
+| Default key             | Value                                              |
+| ----------------------- | -------------------------------------------------- |
+| `AWS_ACCESS_KEY_ID`     | S3 access key id                                   |
+| `AWS_SECRET_ACCESS_KEY` | S3 secret access key                               |
+| `S3_BUCKET`             | bucket name                                        |
+| `S3_REGION`             | region (e.g. `eu01`)                               |
+| `S3_ENDPOINT`           | endpoint host (e.g. `object.storage.eu01.onstackit.cloud`) |
+| `S3_BUCKET_URL`         | full path-style bucket URL                         |
+
+Every data-key name is overridable per Bucket via `spec.secretRef.keys` — empty
+fields fall back to the defaults above:
+
+```yaml
+spec:
+  bucketName: my-bucket
+  secretRef:
+    name: my-bucket-s3
+    keys:                          # all optional
+      accessKeyID:     ACCESS_KEY  # default AWS_ACCESS_KEY_ID
+      secretAccessKey: SECRET_KEY  # default AWS_SECRET_ACCESS_KEY
+      bucketName:      BUCKET      # default S3_BUCKET
+      region:          REGION      # default S3_REGION
+      endpoint:        ENDPOINT    # default S3_ENDPOINT
+      bucketURL:       BUCKET_URL  # default S3_BUCKET_URL
 ```
 
 ## Install (Helm)

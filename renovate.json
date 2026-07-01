@@ -16,7 +16,7 @@
   "ignoreTests": false,
   "prConcurrentLimit": 0,
   "prHourlyLimit": 0,
-  "branchConcurrentLimit": 0,
+  "branchConcurrentLimit": 3,
   "rebaseWhen": "conflicted",
   "postUpdateOptions": [
     "gomodTidy",
