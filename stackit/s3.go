@@ -10,6 +10,9 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
+// effectDeny is the S3 policy Effect used by both isolation statements.
+const effectDeny = "Deny"
+
 // BuildIsolationPolicy returns the validated per-bucket S3 bucket policy (see
 // INIT-SETUP.md §4.1). It confines the bucket to exactly two principals:
 //
@@ -30,14 +33,14 @@ func BuildIsolationPolicy(bucket, adminURN, workloadURN string) string {
 		"Statement": []any{
 			map[string]any{
 				"Sid":          "deny-all-except-admin-and-workload",
-				"Effect":       "Deny",
+				"Effect":       effectDeny,
 				"NotPrincipal": map[string]any{"AWS": []string{adminURN, workloadURN}},
 				"Action":       []string{"s3:*"},
 				"Resource":     res,
 			},
 			map[string]any{
 				"Sid":       "workload-objects-only",
-				"Effect":    "Deny",
+				"Effect":    effectDeny,
 				"Principal": map[string]any{"AWS": workloadURN},
 				"NotAction": []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"},
 				"Resource":  res,
