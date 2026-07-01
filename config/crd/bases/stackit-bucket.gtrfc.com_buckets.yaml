@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: buckets.s3.gtrfc.com
+  name: buckets.stackit-bucket.gtrfc.com
 spec:
-  group: s3.gtrfc.com
+  group: stackit-bucket.gtrfc.com
   names:
     kind: Bucket
     listKind: BucketList
@@ -89,6 +89,48 @@ spec:
                   SecretRef selects the Secret that receives the provisioned S3 access key and
                   secret. The operator writes accessKeyID and secretAccessKey into this Secret.
                 properties:
+                  keys:
+                    description: |-
+                      Keys overrides the data-key names written into the Secret. All fields are
+                      optional and default to env-var-style names (see SecretKeys).
+                    properties:
+                      accessKeyID:
+                        description: |-
+                          AccessKeyID overrides the key holding the S3 access key id.
+                          Defaults to AWS_ACCESS_KEY_ID.
+                        pattern: ^[-._a-zA-Z0-9]+$
+                        type: string
+                      bucketName:
+                        description: |-
+                          BucketName overrides the key holding the bucket name.
+                          Defaults to S3_BUCKET.
+                        pattern: ^[-._a-zA-Z0-9]+$
+                        type: string
+                      bucketURL:
+                        description: |-
+                          BucketURL overrides the key holding the full path-style bucket URL.
+                          Defaults to S3_BUCKET_URL.
+                        pattern: ^[-._a-zA-Z0-9]+$
+                        type: string
+                      endpoint:
+                        description: |-
+                          Endpoint overrides the key holding the S3 endpoint host (no scheme).
+                          Defaults to S3_ENDPOINT.
+                        pattern: ^[-._a-zA-Z0-9]+$
+                        type: string
+                      region:
+                        description: |-
+                          Region overrides the key holding the StackIT region.
+                          Defaults to S3_REGION.
+                        pattern: ^[-._a-zA-Z0-9]+$
+                        type: string
+                      secretAccessKey:
+                        description: |-
+                          SecretAccessKey overrides the key holding the S3 secret.
+                          Defaults to AWS_SECRET_ACCESS_KEY.
+                        pattern: ^[-._a-zA-Z0-9]+$
+                        type: string
+                    type: object
                   name:
                     description: Name of the Secret to write the S3 credentials to.
                     minLength: 1
