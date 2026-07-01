@@ -30,10 +30,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Self-hosted Renovate
-        uses: renovatebot/github-action@v46.1.13
+        uses: renovatebot/github-action@v46.1.17
         with:
           token: ${{ secrets.BOT_PAT }}
           configurationFile: renovate.json
