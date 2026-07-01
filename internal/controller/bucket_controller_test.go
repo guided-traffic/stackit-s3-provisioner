@@ -1,12 +1,15 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	s3v1 "github.com/guided-traffic/stackit-s3-provisioner/api/v1"
 )
@@ -18,6 +21,85 @@ func newBucket(namespace, name, uid string) *s3v1.Bucket {
 			BucketName: "bkt",
 			SecretRef:  s3v1.SecretReference{Name: "creds"},
 		},
+	}
+}
+
+func TestDecideBucketName(t *testing.T) {
+	naming := s3v1.BucketNaming{Prefix: "my-cluster", IncludeNamespace: true}
+
+	t.Run("fresh CR composes from policy", func(t *testing.T) {
+		b := newBucket("monitoring", "my-bucket", "uid")
+		b.Spec.BucketName = "my-bucket"
+		name, fresh := decideBucketName(naming, b)
+		if name != "my-cluster-monitoring-my-bucket" || !fresh {
+			t.Fatalf("got (%q, %v), want (my-cluster-monitoring-my-bucket, true)", name, fresh)
+		}
+	})
+
+	t.Run("status wins and is not fresh", func(t *testing.T) {
+		b := newBucket("monitoring", "my-bucket", "uid")
+		b.Status.ResolvedBucketName = "frozen-name"
+		name, fresh := decideBucketName(naming, b)
+		if name != "frozen-name" || fresh {
+			t.Fatalf("got (%q, %v), want (frozen-name, false)", name, fresh)
+		}
+	})
+
+	t.Run("annotation backup wins when status lost", func(t *testing.T) {
+		b := newBucket("monitoring", "my-bucket", "uid")
+		b.Annotations = map[string]string{s3v1.ResolvedBucketNameAnnotation: "anno-name"}
+		name, fresh := decideBucketName(naming, b)
+		if name != "anno-name" || fresh {
+			t.Fatalf("got (%q, %v), want (anno-name, false)", name, fresh)
+		}
+	})
+
+	t.Run("pre-feature bucket keeps raw spec name", func(t *testing.T) {
+		// Provisioned before the naming feature: bucketURL set, no frozen name.
+		b := newBucket("monitoring", "my-bucket", "uid")
+		b.Spec.BucketName = "legacy-bucket"
+		b.Status.BucketURL = "https://host/legacy-bucket"
+		name, fresh := decideBucketName(naming, b)
+		if name != "legacy-bucket" || fresh {
+			t.Fatalf("got (%q, %v), want (legacy-bucket, false)", name, fresh)
+		}
+	})
+}
+
+func TestPersistResolvedName(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := s3v1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	seed := newBucket("monitoring", "my-bucket", "uid")
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(seed).Build()
+	r := &BucketReconciler{Client: cl}
+	ctx := context.Background()
+	key := types.NamespacedName{Namespace: "monitoring", Name: "my-bucket"}
+
+	var b s3v1.Bucket
+	if err := cl.Get(ctx, key, &b); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	// First call freezes the name into the durable annotation, in memory and in the cluster.
+	if err := r.persistResolvedName(ctx, &b, "frozen-name"); err != nil {
+		t.Fatalf("persistResolvedName: %v", err)
+	}
+	if b.Annotations[s3v1.ResolvedBucketNameAnnotation] != "frozen-name" {
+		t.Errorf("in-memory annotation = %q, want frozen-name", b.Annotations[s3v1.ResolvedBucketNameAnnotation])
+	}
+	var stored s3v1.Bucket
+	if err := cl.Get(ctx, key, &stored); err != nil {
+		t.Fatalf("get after persist: %v", err)
+	}
+	if got := stored.Annotations[s3v1.ResolvedBucketNameAnnotation]; got != "frozen-name" {
+		t.Errorf("persisted annotation = %q, want frozen-name", got)
+	}
+
+	// Second call with the same name is an idempotent no-op (annotation already set).
+	if err := r.persistResolvedName(ctx, &b, "frozen-name"); err != nil {
+		t.Fatalf("idempotent persistResolvedName: %v", err)
 	}
 }
 

@@ -46,6 +46,12 @@ spec:
             {{- if .Values.stackit.serviceAccountKey.secretName }}
             - --stackit-sa-key-path=/etc/stackit/{{ .Values.stackit.serviceAccountKey.secretKey }}
             {{- end }}
+            {{- if .Values.bucketNaming.prefix }}
+            - --bucket-name-prefix={{ .Values.bucketNaming.prefix }}
+            {{- end }}
+            {{- if .Values.bucketNaming.includeNamespace }}
+            - --bucket-name-include-namespace
+            {{- end }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

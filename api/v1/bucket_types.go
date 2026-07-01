@@ -2,6 +2,8 @@ package v1
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -26,6 +28,91 @@ const (
 // BucketFinalizer guards Bucket deletion so the operator can release the StackIT
 // resources (access key, credentials group, bucket) before the CR is removed.
 const BucketFinalizer = "stackit-bucket.gtrfc.com/finalizer"
+
+// ResolvedBucketNameAnnotation records the physical StackIT bucket name that was
+// frozen for a Bucket CR at first provisioning. It is the crash- and
+// restore-durable backup of status.resolvedBucketName: the operator writes it
+// before creating the bucket and reads it back when status has been lost, so a
+// later change to the operator's naming policy never re-maps an existing bucket.
+const ResolvedBucketNameAnnotation = "stackit-bucket.gtrfc.com/resolved-bucket-name"
+
+// Bucket-name constraints enforced by StackIT Object Storage (DNS-style, S3
+// path-compatible). Mirrors the CRD validation on spec.bucketName, but is also
+// applied to the *composed* physical name, which the CRD cannot validate because
+// the prefix/namespace parts come from the operator's configuration.
+const (
+	minBucketNameLen = 3
+	maxBucketNameLen = 63
+)
+
+// bucketNameRe matches a DNS-compliant, S3 path-style bucket name.
+var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
+
+// bucketNamePrefixRe matches a valid name prefix component: a lowercase DNS-1123
+// label (no dots, no leading/trailing dash), so it composes cleanly with a '-'
+// separator into a valid bucket name.
+var bucketNamePrefixRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// BucketNaming is the operator-wide policy for composing the physical StackIT
+// bucket name from a Bucket CR. It is configured once per operator deployment
+// (Helm/flags), not per CR. The composed name is frozen per CR at first
+// provisioning, so changing this policy only affects buckets created afterwards.
+type BucketNaming struct {
+	// Prefix is prepended to every composed bucket name (e.g. a cluster id).
+	// Empty disables the prefix.
+	Prefix string
+	// IncludeNamespace appends the Bucket's namespace after the prefix.
+	IncludeNamespace bool
+}
+
+// ComposeBucketName builds the physical bucket name for a Bucket CR under this
+// naming policy: <prefix>-<namespace>-<spec.bucketName>, dropping any empty part
+// and joining the rest with '-'. All inputs are already lowercase (prefix is
+// validated, namespace is a DNS-1123 label, spec.bucketName is CRD-validated), so
+// no case folding is required.
+func (n BucketNaming) ComposeBucketName(b *Bucket) string {
+	parts := make([]string, 0, 3)
+	if n.Prefix != "" {
+		parts = append(parts, n.Prefix)
+	}
+	if n.IncludeNamespace {
+		parts = append(parts, b.Namespace)
+	}
+	parts = append(parts, b.Spec.BucketName)
+	return strings.Join(parts, "-")
+}
+
+// Validate reports whether the naming policy's prefix is usable. An empty prefix
+// is valid (it is simply omitted); a non-empty prefix must be a lowercase
+// DNS-1123 label so composed names stay DNS-compliant.
+func (n BucketNaming) Validate() error {
+	if n.Prefix == "" {
+		return nil
+	}
+	if len(n.Prefix) > maxBucketNameLen || !bucketNamePrefixRe.MatchString(n.Prefix) {
+		return fmt.Errorf(
+			"bucket name prefix %q is invalid: must be a lowercase DNS-1123 label "+
+				"(letters, digits and '-'; no leading/trailing '-'; max %d chars)",
+			n.Prefix, maxBucketNameLen)
+	}
+	return nil
+}
+
+// ValidateBucketName checks a composed physical bucket name against StackIT's
+// length and DNS constraints. The reconciler calls it on freshly composed names
+// and fails the CR (without a requeue hammer) when the prefix/namespace push the
+// name out of range — a configuration fault a retry cannot fix.
+func ValidateBucketName(name string) error {
+	if len(name) < minBucketNameLen || len(name) > maxBucketNameLen {
+		return fmt.Errorf("bucket name %q must be %d-%d characters long (got %d)",
+			name, minBucketNameLen, maxBucketNameLen, len(name))
+	}
+	if !bucketNameRe.MatchString(name) {
+		return fmt.Errorf("bucket name %q is not DNS-compliant "+
+			"(allowed: lowercase letters, digits, '.', '-'; must start and end alphanumeric)", name)
+	}
+	return nil
+}
 
 // Default data-key names used inside the workload credentials Secret when the
 // user does not override them via spec.secretRef.keys. They are uppercase
@@ -163,6 +250,13 @@ type BucketStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// ResolvedBucketName is the physical StackIT bucket name the operator froze for
+	// this CR at first provisioning (spec.bucketName composed with the operator's
+	// naming policy). Once set it is authoritative and never recomputed, so a later
+	// change to the operator's prefix/namespace policy leaves this bucket untouched.
+	// +optional
+	ResolvedBucketName string `json:"resolvedBucketName,omitempty"`
+
 	// BucketURL is the path-style S3 endpoint URL of the provisioned bucket.
 	// +optional
 	BucketURL string `json:"bucketURL,omitempty"`
@@ -196,7 +290,8 @@ type BucketStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=bkt
-// +kubebuilder:printcolumn:name="Bucket",type="string",JSONPath=".spec.bucketName",description="Bucket name in StackIT Object Storage"
+// +kubebuilder:printcolumn:name="Bucket",type="string",JSONPath=".spec.bucketName",description="Requested bucket name"
+// +kubebuilder:printcolumn:name="Resolved",type="string",JSONPath=".status.resolvedBucketName",description="Physical bucket name in StackIT Object Storage",priority=1
 // +kubebuilder:printcolumn:name="Region",type="string",JSONPath=".spec.region",description="StackIT region"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Whether the bucket is fully provisioned"
 // +kubebuilder:printcolumn:name="Secret",type="string",JSONPath=".spec.secretRef.name",description="Secret holding the workload credentials",priority=1
@@ -238,6 +333,21 @@ func (b *Bucket) GetRegion() string {
 	return "eu01"
 }
 
+// EffectiveBucketName returns the physical StackIT bucket name for this CR: the
+// frozen status value if present, else the annotation backup (used when status
+// was lost), else the raw spec.bucketName. It is the single accessor every
+// consumer (Secret contents, teardown) must use so a name, once frozen, stays
+// stable regardless of the operator's current naming policy.
+func (b *Bucket) EffectiveBucketName() string {
+	if b.Status.ResolvedBucketName != "" {
+		return b.Status.ResolvedBucketName
+	}
+	if v := b.Annotations[ResolvedBucketNameAnnotation]; v != "" {
+		return v
+	}
+	return b.Spec.BucketName
+}
+
 // SecretValues carries the provisioned values that only the operator knows at
 // reconcile time. The bucket name and region are taken from the Bucket spec, so
 // they are not part of this struct.
@@ -261,7 +371,7 @@ func (b *Bucket) SecretData(v SecretValues) map[string][]byte {
 	data := map[string][]byte{
 		keys.AccessKeyIDKey():     []byte(v.AccessKeyID),
 		keys.SecretAccessKeyKey(): []byte(v.SecretAccessKey),
-		keys.BucketNameKey():      []byte(b.Spec.BucketName),
+		keys.BucketNameKey():      []byte(b.EffectiveBucketName()),
 		keys.RegionKey():          []byte(b.GetRegion()),
 	}
 	if v.Endpoint != "" {

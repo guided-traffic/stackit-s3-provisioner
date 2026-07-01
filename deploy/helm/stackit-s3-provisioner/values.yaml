@@ -51,6 +51,23 @@ affinity: {}
 leaderElection:
   enabled: false
 
+# bucketNaming controls how the operator composes the physical StackIT bucket
+# name from a Bucket CR. The rule is applied when a bucket is first provisioned
+# and then frozen per CR (recorded in status + an annotation): changing prefix or
+# includeNamespace later only affects buckets created afterwards; existing buckets
+# keep their original name.
+#
+# Example: prefix "my-cluster" + includeNamespace true turns a Bucket "my-bucket"
+# in namespace "monitoring" into the physical bucket "my-cluster-monitoring-my-bucket".
+bucketNaming:
+  # prefix is prepended to every bucket name (e.g. a cluster identifier). Empty
+  # disables the prefix. Must be a lowercase DNS-1123 label (letters, digits, '-';
+  # no leading/trailing '-'). The composed name must stay within 63 characters or
+  # the Bucket is rejected (Ready=Failed).
+  prefix: ""
+  # includeNamespace appends the Bucket's namespace to the name after the prefix.
+  includeNamespace: false
+
 # stackit configures the operator's binding to a StackIT project.
 stackit:
   # region is the StackIT region the operator provisions buckets in.

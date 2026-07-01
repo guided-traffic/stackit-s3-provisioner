@@ -17,9 +17,14 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - description: Bucket name in StackIT Object Storage
+    - description: Requested bucket name
       jsonPath: .spec.bucketName
       name: Bucket
+      type: string
+    - description: Physical bucket name in StackIT Object Storage
+      jsonPath: .status.resolvedBucketName
+      name: Resolved
+      priority: 1
       type: string
     - description: StackIT region
       jsonPath: .spec.region
@@ -237,6 +242,13 @@ spec:
               operatorVersion:
                 description: OperatorVersion is the version of the operator that last
                   reconciled this Bucket.
+                type: string
+              resolvedBucketName:
+                description: |-
+                  ResolvedBucketName is the physical StackIT bucket name the operator froze for
+                  this CR at first provisioning (spec.bucketName composed with the operator's
+                  naming policy). Once set it is authoritative and never recomputed, so a later
+                  change to the operator's prefix/namespace policy leaves this bucket untouched.
                 type: string
             type: object
         type: object

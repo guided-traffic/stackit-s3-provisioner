@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -97,6 +98,83 @@ func TestDeepCopyRoundTrips(t *testing.T) {
 	assert.Nil(t, (*BucketStatus)(nil).DeepCopy())
 	assert.Nil(t, (*SecretReference)(nil).DeepCopy())
 	assert.Nil(t, (*SecretKeys)(nil).DeepCopy())
+}
+
+// TestComposeBucketName verifies the physical name is assembled from the enabled
+// parts, joined by '-', with empty parts dropped.
+func TestComposeBucketName(t *testing.T) {
+	b := newBucket("monitoring") // spec.bucketName = my-bucket
+	tests := []struct {
+		name             string
+		prefix           string
+		includeNamespace bool
+		want             string
+	}{
+		{"prefix and namespace", "my-cluster", true, "my-cluster-monitoring-my-bucket"},
+		{"prefix only", "my-cluster", false, "my-cluster-my-bucket"},
+		{"namespace only", "", true, "monitoring-my-bucket"},
+		{"neither (legacy default)", "", false, "my-bucket"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			n := BucketNaming{Prefix: tc.prefix, IncludeNamespace: tc.includeNamespace}
+			assert.Equal(t, tc.want, n.ComposeBucketName(b))
+		})
+	}
+}
+
+// TestValidateBucketName covers the length and DNS constraints applied to the
+// composed physical name.
+func TestValidateBucketName(t *testing.T) {
+	assert.NoError(t, ValidateBucketName("my-cluster-monitoring-my-bucket"))
+	assert.NoError(t, ValidateBucketName("abc"))                   // exactly min length
+	assert.NoError(t, ValidateBucketName(strings.Repeat("a", 63))) // exactly max length
+
+	assert.Error(t, ValidateBucketName("ab"), "below min length")
+	assert.Error(t, ValidateBucketName(strings.Repeat("a", 64)), "above max length")
+	assert.Error(t, ValidateBucketName("My-Bucket"), "uppercase not allowed")
+	assert.Error(t, ValidateBucketName("-leading"), "leading dash not allowed")
+	assert.Error(t, ValidateBucketName("trailing-"), "trailing dash not allowed")
+	assert.Error(t, ValidateBucketName("has_underscore"), "underscore not allowed")
+}
+
+// TestBucketNamingValidate verifies prefix validation: empty is allowed, a
+// non-empty prefix must be a lowercase DNS-1123 label.
+func TestBucketNamingValidate(t *testing.T) {
+	assert.NoError(t, BucketNaming{Prefix: ""}.Validate(), "empty prefix is valid")
+	assert.NoError(t, BucketNaming{Prefix: "my-cluster"}.Validate())
+	assert.NoError(t, BucketNaming{Prefix: "c1"}.Validate())
+
+	assert.Error(t, BucketNaming{Prefix: "My"}.Validate(), "uppercase")
+	assert.Error(t, BucketNaming{Prefix: "-x"}.Validate(), "leading dash")
+	assert.Error(t, BucketNaming{Prefix: "x-"}.Validate(), "trailing dash")
+	assert.Error(t, BucketNaming{Prefix: "a.b"}.Validate(), "dot is not a label char")
+	assert.Error(t, BucketNaming{Prefix: strings.Repeat("a", 64)}.Validate(), "too long")
+}
+
+// TestEffectiveBucketName verifies the precedence status > annotation > spec.
+func TestEffectiveBucketName(t *testing.T) {
+	// spec only
+	b := newBucket("monitoring")
+	assert.Equal(t, "my-bucket", b.EffectiveBucketName())
+
+	// annotation backup wins over spec
+	b.Annotations = map[string]string{ResolvedBucketNameAnnotation: "anno-name"}
+	assert.Equal(t, "anno-name", b.EffectiveBucketName())
+
+	// status wins over annotation
+	b.Status.ResolvedBucketName = "status-name"
+	assert.Equal(t, "status-name", b.EffectiveBucketName())
+}
+
+// TestSecretDataUsesEffectiveName verifies the workload Secret advertises the
+// physical (resolved) bucket name, not the raw spec name.
+func TestSecretDataUsesEffectiveName(t *testing.T) {
+	b := newBucket("monitoring")
+	b.Status.ResolvedBucketName = "my-cluster-monitoring-my-bucket"
+
+	data := b.SecretData(SecretValues{AccessKeyID: "AKIA", SecretAccessKey: "s"})
+	assert.Equal(t, []byte("my-cluster-monitoring-my-bucket"), data["S3_BUCKET"])
 }
 
 // TestGroupIdentity guards the project-wide API group and finalizer against an

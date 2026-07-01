@@ -4,6 +4,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strconv"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -40,6 +41,8 @@ func main() {
 	var region string
 	var adminSecretName string
 	var operatorNamespace string
+	var bucketNamePrefix string
+	var bucketNameIncludeNamespace bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -57,6 +60,13 @@ func main() {
 	flag.StringVar(&operatorNamespace, "operator-namespace", os.Getenv("POD_NAMESPACE"),
 		"Namespace the operator runs in; used to store the bootstrap S3 admin credentials Secret. "+
 			"Defaults to POD_NAMESPACE.")
+	flag.StringVar(&bucketNamePrefix, "bucket-name-prefix", os.Getenv("BUCKET_NAME_PREFIX"),
+		"Prefix prepended to every provisioned bucket name (e.g. a cluster id). Can also be set via "+
+			"BUCKET_NAME_PREFIX. Empty disables the prefix. Must be a lowercase DNS-1123 label.")
+	flag.BoolVar(&bucketNameIncludeNamespace, "bucket-name-include-namespace",
+		envBoolOrDefault("BUCKET_NAME_INCLUDE_NAMESPACE", false),
+		"Append the Bucket's namespace to the composed bucket name (after the prefix). "+
+			"Can also be set via BUCKET_NAME_INCLUDE_NAMESPACE.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -64,11 +74,19 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	naming := s3v1.BucketNaming{Prefix: bucketNamePrefix, IncludeNamespace: bucketNameIncludeNamespace}
+	if err := naming.Validate(); err != nil {
+		setupLog.Error(err, "invalid bucket naming configuration")
+		os.Exit(1)
+	}
+
 	setupLog.Info("starting stackit-s3-provisioner",
 		"version", version,
 		"commit", commit,
 		"buildTime", buildTime,
 		"region", region,
+		"bucketNamePrefix", bucketNamePrefix,
+		"bucketNameIncludeNamespace", bucketNameIncludeNamespace,
 	)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -112,6 +130,7 @@ func main() {
 		Scheme:               mgr.GetScheme(),
 		Stackit:              stackitClient,
 		OperatorVersion:      version,
+		Naming:               naming,
 		AdminSecretName:      adminSecretName,
 		AdminSecretNamespace: operatorNamespace,
 	}).SetupWithManager(mgr); err != nil {
@@ -138,6 +157,15 @@ func main() {
 // envOrDefault returns the value of the environment variable key, or def when unset.
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// envBoolOrDefault parses the environment variable key as a bool, returning def
+// when it is unset or unparseable.
+func envBoolOrDefault(key string, def bool) bool {
+	if v, err := strconv.ParseBool(os.Getenv(key)); err == nil {
 		return v
 	}
 	return def

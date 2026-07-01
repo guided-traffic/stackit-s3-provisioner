@@ -78,6 +78,11 @@ type BucketReconciler struct {
 	// OperatorVersion is stamped into Bucket status for observability.
 	OperatorVersion string
 
+	// Naming is the operator-wide policy for composing the physical bucket name
+	// from a Bucket CR. The composed name is frozen per CR at first provisioning,
+	// so changing this policy only affects buckets created afterwards.
+	Naming s3v1.BucketNaming
+
 	// AdminSecretName / AdminSecretNamespace locate the operator-owned Secret that
 	// persists the bootstrap S3 admin credentials. The namespace is the operator's
 	// own namespace (POD_NAMESPACE).
@@ -111,13 +116,13 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		if r.Stackit != nil {
 			if err := r.teardown(ctx, &bucket); err != nil {
-				logger.Error(err, "teardown failed; keeping finalizer", "bucket", bucket.Spec.BucketName)
+				logger.Error(err, "teardown failed; keeping finalizer", "bucket", bucket.EffectiveBucketName())
 				// Keep the finalizer and surface the reason; a non-empty bucket
 				// must not be deleted (data-loss guard, INIT-SETUP.md §0).
 				return r.fail(ctx, &bucket, err)
 			}
 		} else {
-			logger.Info("deleting bucket (skeleton mode: no StackIT teardown)", "bucket", bucket.Spec.BucketName)
+			logger.Info("deleting bucket (skeleton mode: no StackIT teardown)", "bucket", bucket.EffectiveBucketName())
 		}
 		controllerutil.RemoveFinalizer(&bucket, s3v1.BucketFinalizer)
 		if err := r.Update(ctx, &bucket); err != nil {
@@ -186,6 +191,20 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 			b.GetRegion(), r.Stackit.Region(), r.Stackit.Region()))
 	}
 
+	// Resolve the physical bucket name once and freeze it (annotation now, status
+	// at the end). A freshly composed name is validated here; if the prefix or
+	// namespace push it out of the DNS/length range, that is a configuration fault
+	// a retry cannot fix, so fail without a requeue hammer.
+	name, fresh := decideBucketName(r.Naming, b)
+	if fresh {
+		if err := s3v1.ValidateBucketName(name); err != nil {
+			return r.failNoRequeue(ctx, b, fmt.Errorf("composed bucket name is invalid: %w", err))
+		}
+	}
+	if err := r.persistResolvedName(ctx, b, name); err != nil {
+		return r.fail(ctx, b, fmt.Errorf("persist resolved bucket name: %w", err))
+	}
+
 	admin, err := r.ensureAdmin(ctx)
 	if err != nil {
 		return r.fail(ctx, b, fmt.Errorf("bootstrap admin credentials: %w", err))
@@ -195,11 +214,11 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("enable object storage: %w", err))
 	}
 
-	if err := r.ensureBucket(ctx, b); err != nil {
+	if err := r.ensureBucket(ctx, name); err != nil {
 		return r.fail(ctx, b, fmt.Errorf("ensure bucket: %w", err))
 	}
 
-	host, bucketURL, err := r.Stackit.BucketConnInfo(ctx, b.Spec.BucketName)
+	host, bucketURL, err := r.Stackit.BucketConnInfo(ctx, name)
 	if err != nil {
 		return r.fail(ctx, b, fmt.Errorf("bucket connection info: %w", err))
 	}
@@ -214,11 +233,12 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("ensure workload credentials: %w", err))
 	}
 
-	if err := r.ensureBucketPolicy(ctx, b, host, admin, urn); err != nil {
+	if err := r.ensureBucketPolicy(ctx, name, host, admin, urn); err != nil {
 		return r.fail(ctx, b, fmt.Errorf("ensure bucket policy: %w", err))
 	}
 
 	// Success: record observed state and mark Ready.
+	b.Status.ResolvedBucketName = name
 	b.Status.BucketURL = bucketURL
 	b.Status.CredentialsGroupID = gid
 	b.Status.CredentialsGroupURN = urn
@@ -229,33 +249,34 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		Type:    s3v1.ConditionReady,
 		Status:  metav1.ConditionTrue,
 		Reason:  s3v1.ReasonProvisioned,
-		Message: fmt.Sprintf("bucket %q provisioned with isolated workload credentials", b.Spec.BucketName),
+		Message: fmt.Sprintf("bucket %q provisioned with isolated workload credentials", name),
 	})
 	if err := r.Status().Update(ctx, b); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	logger.Info("bucket provisioned", "bucket", b.Spec.BucketName, "credentialsGroup", gid)
+	logger.Info("bucket provisioned", "bucket", name, "requested", b.Spec.BucketName, "credentialsGroup", gid)
 	r.event(b, corev1.EventTypeNormal, s3v1.ReasonProvisioned, "bucket and isolated workload credentials provisioned")
 	return ctrl.Result{}, nil
 }
 
 // ensureBucket creates the bucket if it does not already exist and waits until it
-// is visible. Existence is checked by name, so the step is idempotent.
-func (r *BucketReconciler) ensureBucket(ctx context.Context, b *s3v1.Bucket) error {
-	ok, err := r.Stackit.HasBucket(ctx, r.Stackit.ProjectID(), b.Spec.BucketName)
+// is visible. Existence is checked by name, so the step is idempotent. The name
+// is the resolved physical bucket name (see decideBucketName).
+func (r *BucketReconciler) ensureBucket(ctx context.Context, name string) error {
+	ok, err := r.Stackit.HasBucket(ctx, r.Stackit.ProjectID(), name)
 	if err != nil {
 		return err
 	}
 	if ok {
 		return nil
 	}
-	if err := r.Stackit.CreateBucket(ctx, b.Spec.BucketName); err != nil {
+	if err := r.Stackit.CreateBucket(ctx, name); err != nil {
 		// Tolerate a create race (bucket appeared between the check and the create).
 		if code := stackit.StatusCode(err); code != 409 {
 			return err
 		}
 	}
-	return r.Stackit.WaitBucketVisible(ctx, b.Spec.BucketName, bucketVisibleTimeout)
+	return r.Stackit.WaitBucketVisible(ctx, name, bucketVisibleTimeout)
 }
 
 // ensureAccessKeyAndSecret guarantees that the workload credentials group holds
@@ -315,16 +336,16 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 
 // ensureBucketPolicy applies the isolation policy (INIT-SETUP.md §4.1) via the
 // admin S3 key, re-writing it only when it drifts from the desired document.
-func (r *BucketReconciler) ensureBucketPolicy(ctx context.Context, b *s3v1.Bucket, host string, admin *adminCreds, workloadURN string) error {
+func (r *BucketReconciler) ensureBucketPolicy(ctx context.Context, name, host string, admin *adminCreds, workloadURN string) error {
 	s3admin, err := stackit.NewS3Admin(host, admin.accessKeyID, admin.secretAccessKey, r.Stackit.Region())
 	if err != nil {
 		return err
 	}
-	desired := stackit.BuildIsolationPolicy(b.Spec.BucketName, admin.urn, workloadURN)
-	if current, err := s3admin.GetBucketPolicy(ctx, b.Spec.BucketName); err == nil && stackit.PoliciesEquivalent(current, desired) {
+	desired := stackit.BuildIsolationPolicy(name, admin.urn, workloadURN)
+	if current, err := s3admin.GetBucketPolicy(ctx, name); err == nil && stackit.PoliciesEquivalent(current, desired) {
 		return nil
 	}
-	return s3admin.SetBucketPolicy(ctx, b.Spec.BucketName, desired)
+	return s3admin.SetBucketPolicy(ctx, name, desired)
 }
 
 // teardown releases the StackIT resources backing a Bucket during finalization,
@@ -332,7 +353,7 @@ func (r *BucketReconciler) ensureBucketPolicy(ctx context.Context, b *s3v1.Bucke
 // empty-check → workload keys → workload group → bucket → Secret. The shared
 // admin group is never touched.
 func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
-	name := b.Spec.BucketName
+	name := b.EffectiveBucketName()
 
 	bucketExists, err := r.Stackit.HasBucket(ctx, r.Stackit.ProjectID(), name)
 	if err != nil {
@@ -590,6 +611,47 @@ func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&s3v1.Bucket{}).
 		Named("bucket").
 		Complete(r)
+}
+
+// decideBucketName selects the physical StackIT bucket name for a CR without any
+// I/O, in priority order:
+//  1. status.resolvedBucketName — already frozen; authoritative.
+//  2. the resolved-name annotation — the durable backup, used when status was
+//     lost (CR restored from backup, status wiped).
+//  3. a pre-feature bucket (status.bucketURL set but no frozen name) — keep the
+//     raw spec.bucketName so an upgrade never re-maps an existing bucket.
+//  4. otherwise compose a fresh name from the operator's current naming policy.
+//
+// The bool reports whether the name was freshly composed (case 4) and therefore
+// still needs length/DNS validation before it is frozen.
+func decideBucketName(naming s3v1.BucketNaming, b *s3v1.Bucket) (name string, fresh bool) {
+	switch {
+	case b.Status.ResolvedBucketName != "":
+		return b.Status.ResolvedBucketName, false
+	case b.Annotations[s3v1.ResolvedBucketNameAnnotation] != "":
+		return b.Annotations[s3v1.ResolvedBucketNameAnnotation], false
+	case b.Status.BucketURL != "":
+		return b.Spec.BucketName, false
+	default:
+		return naming.ComposeBucketName(b), true
+	}
+}
+
+// persistResolvedName freezes the resolved bucket name into the durable
+// annotation before any cloud resource is created. Writing it here (rather than
+// only into status at the end) means a crash between bucket creation and the
+// final status write cannot lose the name: the next reconcile reads it back from
+// the annotation instead of recomposing from a possibly-changed policy. It is a
+// no-op once the annotation already carries the name.
+func (r *BucketReconciler) persistResolvedName(ctx context.Context, b *s3v1.Bucket, name string) error {
+	if b.Annotations[s3v1.ResolvedBucketNameAnnotation] == name {
+		return nil
+	}
+	if b.Annotations == nil {
+		b.Annotations = map[string]string{}
+	}
+	b.Annotations[s3v1.ResolvedBucketNameAnnotation] = name
+	return r.Update(ctx, b)
 }
 
 // workloadGroupName derives the deterministic display name of a Bucket's
