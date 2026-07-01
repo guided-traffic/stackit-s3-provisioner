@@ -113,8 +113,8 @@ func TestWorkloadGroupName(t *testing.T) {
 	if !strings.HasPrefix(got, "s3op-team-a-reports-") {
 		t.Errorf("unexpected name %q", got)
 	}
-	if len(got) > 63 {
-		t.Errorf("name exceeds 63 chars: %d (%q)", len(got), got)
+	if len(got) > maxGroupNameLen {
+		t.Errorf("name exceeds %d chars: %d (%q)", maxGroupNameLen, len(got), got)
 	}
 
 	// Different UID -> different suffix (avoids collisions after truncation).
@@ -133,7 +133,7 @@ func TestWorkloadGroupName_LongInputsTruncatedButUnique(t *testing.T) {
 	long := strings.Repeat("x", 200)
 	a := workloadGroupName(newBucket(long, long, "uid-a"))
 	b := workloadGroupName(newBucket(long, long, "uid-b"))
-	if len(a) > 63 || len(b) > 63 {
+	if len(a) > maxGroupNameLen || len(b) > maxGroupNameLen {
 		t.Fatalf("truncation failed: len(a)=%d len(b)=%d", len(a), len(b))
 	}
 	if a == b {

@@ -98,6 +98,7 @@ type BucketReconciler struct {
 // +kubebuilder:rbac:groups=stackit-bucket.gtrfc.com,resources=buckets/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile drives a Bucket towards its desired state.
 func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -654,14 +655,17 @@ func (r *BucketReconciler) persistResolvedName(ctx context.Context, b *s3v1.Buck
 	return r.Update(ctx, b)
 }
 
+// maxGroupNameLen is the maximum length StackIT's Object Storage API accepts for
+// a credentials-group displayName. Exceeding it yields a 422 string_too_long.
+const maxGroupNameLen = 32
+
 // workloadGroupName derives the deterministic display name of a Bucket's
 // dedicated credentials group. The UID-derived suffix keeps the name unique even
 // when the namespace/name portion is truncated to the length budget.
 func workloadGroupName(b *s3v1.Bucket) string {
-	const maxLen = 63
 	suffix := shortHash(string(b.UID))
 	base := fmt.Sprintf("s3op-%s-%s", b.Namespace, b.Name)
-	if keep := maxLen - len(suffix) - 1; len(base) > keep {
+	if keep := maxGroupNameLen - len(suffix) - 1; len(base) > keep {
 		base = base[:keep]
 	}
 	return base + "-" + suffix

@@ -45,7 +45,7 @@ are env-var style, so the Secret can be consumed directly via `envFrom`:
 | ----------------------- | -------------------------------------------------- |
 | `AWS_ACCESS_KEY_ID`     | S3 access key id                                   |
 | `AWS_SECRET_ACCESS_KEY` | S3 secret access key                               |
-| `S3_BUCKET`             | bucket name                                        |
+| `S3_BUCKET`             | physical bucket name (see [Bucket naming](#bucket-naming)) |
 | `S3_REGION`             | region (e.g. `eu01`)                               |
 | `S3_ENDPOINT`           | endpoint host (e.g. `object.storage.eu01.onstackit.cloud`) |
 | `S3_BUCKET_URL`         | full path-style bucket URL                         |
@@ -86,6 +86,45 @@ helm install stackit-s3-provisioner stackit-s3-provisioner/stackit-s3-provisione
 
 Without `stackit.serviceAccountKey.secretName` the operator runs in **skeleton
 mode**: it reconciles `Bucket` resources but does not touch the cloud.
+
+## Bucket naming
+
+By default the physical StackIT bucket name equals `spec.bucketName`. The operator
+can prepend a fixed **prefix** (e.g. a cluster identifier) and optionally the
+Bucket's **namespace**, so bucket names stay unique and traceable across clusters
+or teams that share one StackIT project. It is an operator-wide policy configured
+at install time:
+
+```yaml
+# values.yaml
+bucketNaming:
+  prefix: my-cluster        # prepended to every bucket name (empty = disabled)
+  includeNamespace: true    # append the Bucket's namespace after the prefix
+```
+
+With the above, a `Bucket` named `my-bucket` in namespace `monitoring` is
+provisioned as the physical bucket **`my-cluster-monitoring-my-bucket`**. The name
+is composed as `<prefix>-<namespace>-<spec.bucketName>`, dropping any disabled
+part; the defaults (`prefix: ""`, `includeNamespace: false`) reproduce the legacy
+behaviour where the physical name equals `spec.bucketName`.
+
+The composed name is what workloads connect to: it is written to the `S3_BUCKET`
+and `S3_BUCKET_URL` keys of the credentials Secret and shown as the `RESOLVED`
+column in `kubectl get bucket`.
+
+**Stable across policy changes.** The physical name is frozen per Bucket the first
+time it is provisioned — recorded in `status.resolvedBucketName` and a durable
+annotation (`stackit-bucket.gtrfc.com/resolved-bucket-name`) that survives status
+loss (e.g. a CR restored from backup). Changing `prefix` or `includeNamespace`
+later therefore only affects **newly created** buckets; existing buckets keep their
+original name and stay reachable. Buckets provisioned before this feature existed
+keep their raw `spec.bucketName`.
+
+**Constraints.** `prefix` must be a lowercase DNS-1123 label (letters, digits and
+`-`, no leading/trailing `-`); an invalid prefix stops the operator at startup. The
+composed name must be 3–63 characters and DNS-compliant — if the prefix and
+namespace push it out of range the Bucket is rejected (`Ready=Failed`) rather than
+silently truncated.
 
 ## Development
 

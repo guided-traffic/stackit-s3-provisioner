@@ -45,9 +45,10 @@ rules:
       - patch
       - update
       - watch
-  # Events for status reporting
+  # Events for status reporting (core + events.k8s.io broadcaster API)
   - apiGroups:
       - ""
+      - events.k8s.io
     resources:
       - events
     verbs:
