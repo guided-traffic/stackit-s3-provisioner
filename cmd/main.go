@@ -67,7 +67,7 @@ func main() {
 		Scheme:                 scheme,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "stackit-s3-provisioner.s3.gtrfc.com",
+		LeaderElectionID:       "stackit-s3-provisioner.stackit-bucket.gtrfc.com",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
