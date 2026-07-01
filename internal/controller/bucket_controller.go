@@ -16,9 +16,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	s3v1 "github.com/guided-traffic/stackit-s3-provisioner/api/v1"
 	"github.com/guided-traffic/stackit-s3-provisioner/stackit"
@@ -604,6 +607,14 @@ func (r *BucketReconciler) event(b *s3v1.Bucket, eventtype, reason, note string)
 }
 
 // SetupWithManager registers the reconciler with the manager.
+//
+// Besides owning Bucket objects, it watches the workload credentials Secrets it
+// provisions: if such a Secret is deleted or altered out from under the
+// operator, the owning Bucket is re-queued and ensureAccessKeyAndSecret mints a
+// fresh key and re-writes the Secret. The mapping matches on the resolved secret
+// name+namespace, so it covers cross-namespace secretRefs too (where an owner
+// reference cannot exist). The predicate limits the watch to operator-managed
+// Secrets so unrelated Secret churn does not wake the controller.
 func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("bucket-controller")
@@ -611,7 +622,41 @@ func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&s3v1.Bucket{}).
 		Named("bucket").
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.bucketsForSecret),
+			builder.WithPredicates(predicate.NewPredicateFuncs(isManagedSecret)),
+		).
 		Complete(r)
+}
+
+// isManagedSecret reports whether a Secret was provisioned by this operator
+// (it carries the managed-by label). Used to scope the Secret watch.
+func isManagedSecret(obj client.Object) bool {
+	return obj.GetLabels()[managedByLabel] == managedByValue
+}
+
+// bucketsForSecret maps a Secret event to the Bucket(s) whose resolved
+// secretRef targets that Secret, so a deleted or mutated credentials Secret
+// re-triggers reconcile. Matching by name+namespace (rather than owner
+// reference) also covers cross-namespace secretRefs.
+func (r *BucketReconciler) bucketsForSecret(ctx context.Context, obj client.Object) []ctrl.Request {
+	var buckets s3v1.BucketList
+	if err := r.List(ctx, &buckets); err != nil {
+		log.FromContext(ctx).Error(err, "listing buckets for secret-triggered reconcile",
+			"secret", client.ObjectKeyFromObject(obj))
+		return nil
+	}
+	var reqs []ctrl.Request
+	for i := range buckets.Items {
+		b := &buckets.Items[i]
+		if b.Spec.SecretRef.Name == obj.GetName() && b.SecretNamespace() == obj.GetNamespace() {
+			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
+				Namespace: b.Namespace, Name: b.Name,
+			}})
+		}
+	}
+	return reqs
 }
 
 // decideBucketName selects the physical StackIT bucket name for a CR without any
@@ -660,10 +705,15 @@ func (r *BucketReconciler) persistResolvedName(ctx context.Context, b *s3v1.Buck
 const maxGroupNameLen = 32
 
 // workloadGroupName derives the deterministic display name of a Bucket's
-// dedicated credentials group. The UID-derived suffix keeps the name unique even
-// when the namespace/name portion is truncated to the length budget.
+// dedicated credentials group. The suffix hashes the Bucket's namespace/name
+// identity (not its metadata.uid), so the name is stable across a
+// disaster-recovery restore that re-creates the CR with a fresh UID: the
+// operator then re-uses the surviving cloud group by name instead of creating a
+// duplicate and orphaning the old one (which would keep a live, un-invalidated
+// access key). The suffix also keeps the name unique when the namespace/name
+// portion is truncated to the length budget.
 func workloadGroupName(b *s3v1.Bucket) string {
-	suffix := shortHash(string(b.UID))
+	suffix := shortHash(b.Namespace + "/" + b.Name)
 	base := fmt.Sprintf("s3op-%s-%s", b.Namespace, b.Name)
 	if keep := maxGroupNameLen - len(suffix) - 1; len(base) > keep {
 		base = base[:keep]

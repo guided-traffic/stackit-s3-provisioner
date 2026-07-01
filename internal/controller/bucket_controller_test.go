@@ -117,10 +117,12 @@ func TestWorkloadGroupName(t *testing.T) {
 		t.Errorf("name exceeds %d chars: %d (%q)", maxGroupNameLen, len(got), got)
 	}
 
-	// Different UID -> different suffix (avoids collisions after truncation).
-	other := newBucket("team-a", "reports", "def-456")
-	if workloadGroupName(other) == got {
-		t.Error("different UIDs must yield different group names")
+	// Restore stability: the name must NOT depend on metadata.uid, so a CR
+	// re-created from backup with a fresh UID re-uses the same cloud group
+	// instead of orphaning it.
+	reborn := newBucket("team-a", "reports", "def-456")
+	if workloadGroupName(reborn) != got {
+		t.Error("same namespace/name with a different UID must yield the same group name")
 	}
 
 	// Different CR identity -> different name.
@@ -130,14 +132,77 @@ func TestWorkloadGroupName(t *testing.T) {
 }
 
 func TestWorkloadGroupName_LongInputsTruncatedButUnique(t *testing.T) {
+	// Two distinct namespace/name identities, long enough that the
+	// "s3op-<ns>-<name>" base truncates to the same prefix; the namespace/name
+	// hash suffix must still keep them apart.
 	long := strings.Repeat("x", 200)
-	a := workloadGroupName(newBucket(long, long, "uid-a"))
-	b := workloadGroupName(newBucket(long, long, "uid-b"))
+	a := workloadGroupName(newBucket(long, long+"-a", "uid"))
+	b := workloadGroupName(newBucket(long, long+"-b", "uid"))
 	if len(a) > maxGroupNameLen || len(b) > maxGroupNameLen {
 		t.Fatalf("truncation failed: len(a)=%d len(b)=%d", len(a), len(b))
 	}
 	if a == b {
-		t.Error("truncated names collided despite different UIDs")
+		t.Error("distinct identities collided after truncation")
+	}
+}
+
+func TestBucketsForSecret(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := s3v1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+
+	// Default: secret lives in the Bucket's own namespace.
+	sameNS := newBucket("app", "data", "uid-1")
+	sameNS.Spec.SecretRef = s3v1.SecretReference{Name: "app-creds"}
+	// Cross-namespace secretRef (no owner reference possible).
+	crossNS := newBucket("app", "logs", "uid-2")
+	crossNS.Spec.SecretRef = s3v1.SecretReference{Name: "shared-creds", Namespace: "platform"}
+	// Unrelated bucket.
+	other := newBucket("app", "misc", "uid-3")
+	other.Spec.SecretRef = s3v1.SecretReference{Name: "misc-creds"}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sameNS, crossNS, other).Build()
+	r := &BucketReconciler{Client: cl}
+	ctx := context.Background()
+
+	secret := func(ns, name string) *corev1.Secret {
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}
+	}
+	cases := []struct {
+		name string
+		obj  *corev1.Secret
+		want []types.NamespacedName
+	}{
+		{"same namespace", secret("app", "app-creds"), []types.NamespacedName{{Namespace: "app", Name: "data"}}},
+		{"cross namespace", secret("platform", "shared-creds"), []types.NamespacedName{{Namespace: "app", Name: "logs"}}},
+		{"name matches but namespace differs", secret("app", "shared-creds"), nil},
+		{"no match", secret("app", "nobody"), nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := r.bucketsForSecret(ctx, tc.obj)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d requests %v, want %d", len(got), got, len(tc.want))
+			}
+			for i := range tc.want {
+				if got[i].NamespacedName != tc.want[i] {
+					t.Errorf("req[%d] = %v, want %v", i, got[i].NamespacedName, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestIsManagedSecret(t *testing.T) {
+	managed := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Labels: map[string]string{managedByLabel: managedByValue},
+	}}
+	if !isManagedSecret(managed) {
+		t.Error("labeled secret should be recognised as managed")
+	}
+	if isManagedSecret(&corev1.Secret{}) {
+		t.Error("unlabeled secret should not be recognised as managed")
 	}
 }
 
