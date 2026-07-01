@@ -8,6 +8,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/tags"
 )
 
 // effectDeny is the S3 policy Effect used by both isolation statements.
@@ -120,6 +121,34 @@ func (s *S3Admin) SetBucketPolicy(ctx context.Context, bucket, policy string) er
 // be set".
 func (s *S3Admin) GetBucketPolicy(ctx context.Context, bucket string) (string, error) {
 	return s.mc.GetBucketPolicy(ctx, bucket)
+}
+
+// SetBucketTags replaces the bucket's tag set with the given key/value pairs.
+// STACKIT/StorageGRID supports S3 bucket tagging (verified by the tagging
+// integration test), so a bucket tag can carry the operator's ownership marker.
+func (s *S3Admin) SetBucketTags(ctx context.Context, bucket string, kv map[string]string) error {
+	t, err := tags.MapToBucketTags(kv)
+	if err != nil {
+		return fmt.Errorf("build bucket tags for %q: %w", bucket, err)
+	}
+	if err := s.mc.SetBucketTagging(ctx, bucket, t); err != nil {
+		return fmt.Errorf("set bucket tagging on %q: %w", bucket, err)
+	}
+	return nil
+}
+
+// BucketTags returns the bucket's current tag set as a map. A bucket with no tag
+// set returns an empty map (not an error), so callers can treat "untagged" and
+// "tagged" uniformly when deciding ownership.
+func (s *S3Admin) BucketTags(ctx context.Context, bucket string) (map[string]string, error) {
+	t, err := s.mc.GetBucketTagging(ctx, bucket)
+	if err != nil {
+		if r := minio.ToErrorResponse(err); r.Code == "NoSuchTagSet" || r.StatusCode == 404 {
+			return map[string]string{}, nil
+		}
+		return nil, fmt.Errorf("get bucket tagging on %q: %w", bucket, err)
+	}
+	return t.ToMap(), nil
 }
 
 // BucketEmpty reports whether the bucket holds no objects. It is used to enforce

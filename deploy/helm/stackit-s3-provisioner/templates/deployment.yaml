@@ -52,6 +52,9 @@ spec:
             {{- if .Values.bucketNaming.includeNamespace }}
             - --bucket-name-include-namespace
             {{- end }}
+            {{- if .Values.ownership.name }}
+            - --ownership-name={{ .Values.ownership.name }}
+            {{- end }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

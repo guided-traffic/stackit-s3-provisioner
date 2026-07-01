@@ -68,6 +68,25 @@ bucketNaming:
   # includeNamespace appends the Bucket's namespace to the name after the prefix.
   includeNamespace: false
 
+# ownership controls the marker the operator writes into every provisioned
+# bucket's tags to prove it owns them, so it never adopts or deletes a bucket that
+# was created elsewhere (collision detection). STACKIT has no native bucket tags,
+# so this rides on S3 bucket tagging.
+ownership:
+  # name is the operator/fleet identity written into each bucket's "managed-by"
+  # tag. The operator only adopts or deletes a pre-existing bucket whose managed-by
+  # matches this value AND whose "owner" tag matches the Bucket CR's namespace/name.
+  #
+  # WARNING: this value is part of the bucket ownership key. Changing it after
+  # buckets exist makes the operator treat its own buckets as foreign (Ready=Failed
+  # collision) until they are re-tagged. On a disaster-recovery restore into a new
+  # cluster, set the SAME value so the operator re-adopts its buckets.
+  #
+  # Run two operators against the same StackIT project only with DISTINCT values
+  # (otherwise they fight over the same buckets). Allowed characters follow S3 tag
+  # values: letters, digits and + - = . _ : / @ and spaces.
+  name: stackit-s3-provisioner
+
 # stackit configures the operator's binding to a StackIT project.
 stackit:
   # region is the StackIT region the operator provisions buckets in.

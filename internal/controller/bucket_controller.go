@@ -3,6 +3,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"sync"
@@ -91,6 +92,15 @@ type BucketReconciler struct {
 	// own namespace (POD_NAMESPACE).
 	AdminSecretName      string
 	AdminSecretNamespace string
+
+	// OwnershipName is the value written into every provisioned bucket's
+	// "managed-by" tag and required to match before the operator adopts or deletes
+	// a pre-existing bucket. It is the operator/fleet identity (configurable via
+	// Helm), NOT a per-CR identity. Empty falls back to defaultOwnershipName.
+	//
+	// Because it is part of the bucket ownership key, changing it after buckets
+	// exist makes the operator treat its own buckets as foreign (collision).
+	OwnershipName string
 
 	adminMu sync.Mutex
 	admin   *adminCreds // cached after the first successful bootstrap
@@ -218,7 +228,13 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("enable object storage: %w", err))
 	}
 
-	if err := r.ensureBucket(ctx, name); err != nil {
+	if err := r.ensureBucket(ctx, b, name, admin); err != nil {
+		var collision *ownershipCollisionError
+		if errors.As(err, &collision) {
+			r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed,
+				"bucket ownership collision: a bucket with this name exists but was not provisioned by this operator")
+			return r.failNoRequeue(ctx, b, err)
+		}
 		return r.fail(ctx, b, fmt.Errorf("ensure bucket: %w", err))
 	}
 
@@ -263,24 +279,145 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	return ctrl.Result{}, nil
 }
 
-// ensureBucket creates the bucket if it does not already exist and waits until it
-// is visible. Existence is checked by name, so the step is idempotent. The name
-// is the resolved physical bucket name (see decideBucketName).
-func (r *BucketReconciler) ensureBucket(ctx context.Context, name string) error {
+// ensureBucket makes the bucket exist, is idempotent, and enforces ownership.
+// STACKIT has no native bucket tags, so ownership is recorded as an S3 bucket tag
+// (managed-by + owner) via the admin data-plane key:
+//
+//   - A bucket this operator creates is stamped with its ownership tags.
+//   - A pre-existing bucket is only adopted when its tags match this operator; a
+//     mismatch is a collision (ownershipCollisionError) so the operator never
+//     manages a bucket it did not provision.
+//   - An untagged pre-existing bucket is claimed only when empty (a crash between
+//     create and tag-write leaves exactly this state); a non-empty untagged bucket
+//     is treated as foreign and refused.
+func (r *BucketReconciler) ensureBucket(ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds) error {
 	ok, err := r.Stackit.HasBucket(ctx, r.Stackit.ProjectID(), name)
 	if err != nil {
 		return err
 	}
 	if ok {
-		return nil
+		return r.adoptOrCollide(ctx, b, name, admin)
 	}
 	if err := r.Stackit.CreateBucket(ctx, name); err != nil {
-		// Tolerate a create race (bucket appeared between the check and the create).
-		if code := stackit.StatusCode(err); code != 409 {
+		// Tolerate a create race (bucket appeared between the check and the create):
+		// fall through to the ownership check rather than blindly stamping our tags.
+		if stackit.StatusCode(err) != 409 {
 			return err
 		}
+		if err := r.Stackit.WaitBucketVisible(ctx, name, bucketVisibleTimeout); err != nil {
+			return err
+		}
+		return r.adoptOrCollide(ctx, b, name, admin)
 	}
-	return r.Stackit.WaitBucketVisible(ctx, name, bucketVisibleTimeout)
+	if err := r.Stackit.WaitBucketVisible(ctx, name, bucketVisibleTimeout); err != nil {
+		return err
+	}
+	// Freshly created by us: stamp ownership so later reconciles (and other
+	// operators/fleets) recognize it.
+	s3admin, err := r.newS3Admin(ctx, name, admin)
+	if err != nil {
+		return err
+	}
+	return s3admin.SetBucketTags(ctx, name, r.ownershipTags(b))
+}
+
+// adoptOrCollide inspects a pre-existing bucket's ownership tags and decides
+// whether this operator may adopt it. It returns an *ownershipCollisionError when
+// the bucket belongs to someone else (a non-requeuing, human-actionable fault).
+func (r *BucketReconciler) adoptOrCollide(ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds) error {
+	s3admin, err := r.newS3Admin(ctx, name, admin)
+	if err != nil {
+		return err
+	}
+	tagSet, err := s3admin.BucketTags(ctx, name)
+	if err != nil {
+		return err
+	}
+	if len(tagSet) == 0 {
+		// Untagged: either our own crash between create and tag-write, or a foreign
+		// bucket sharing this name. Claim it only if empty (no data to endanger).
+		empty, err := s3admin.BucketEmpty(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !empty {
+			return &ownershipCollisionError{name: name, detail: "pre-existing non-empty bucket carries no ownership tags"}
+		}
+		return s3admin.SetBucketTags(ctx, name, r.ownershipTags(b))
+	}
+	if r.isOwnedByUs(tagSet, b) {
+		return nil
+	}
+	return &ownershipCollisionError{
+		name:   name,
+		detail: fmt.Sprintf("owned by managed-by=%q owner=%q", tagSet[tagOwnershipManagedBy], tagSet[tagOwnershipOwner]),
+	}
+}
+
+// newS3Admin builds an admin data-plane client for the bucket's region-uniform
+// endpoint host. The bucket must already exist (the host is derived from it).
+func (r *BucketReconciler) newS3Admin(ctx context.Context, name string, admin *adminCreds) (*stackit.S3Admin, error) {
+	host, err := r.Stackit.BucketEndpointHost(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	return stackit.NewS3Admin(host, admin.accessKeyID, admin.secretAccessKey, r.Stackit.Region())
+}
+
+// defaultOwnershipName is the fallback managed-by value when OwnershipName is
+// unset (e.g. tests constructing the reconciler directly). Production sets it via
+// the --ownership-name flag / Helm value.
+const defaultOwnershipName = "stackit-s3-provisioner"
+
+// Ownership tag keys attached to every provisioned bucket. managed-by is the
+// operator/fleet identity (configurable); owner is the DR-stable per-CR identity.
+const (
+	tagOwnershipManagedBy = "managed-by"
+	tagOwnershipOwner     = "owner"
+)
+
+// ownershipName returns the effective managed-by value.
+func (r *BucketReconciler) ownershipName() string {
+	if r.OwnershipName != "" {
+		return r.OwnershipName
+	}
+	return defaultOwnershipName
+}
+
+// ownerTagValue is the DR-stable owner identity of a Bucket CR: its
+// namespace/name. It deliberately excludes metadata.uid, which is reassigned when
+// the CR is restored into a fresh cluster, so a disaster-recovery restore that
+// re-applies the same manifests still recognizes its own buckets. This mirrors
+// workloadGroupName's stable-identity choice.
+func ownerTagValue(b *s3v1.Bucket) string {
+	return b.Namespace + "/" + b.Name
+}
+
+// ownershipTags is the tag set this operator stamps on buckets it owns.
+func (r *BucketReconciler) ownershipTags(b *s3v1.Bucket) map[string]string {
+	return map[string]string{
+		tagOwnershipManagedBy: r.ownershipName(),
+		tagOwnershipOwner:     ownerTagValue(b),
+	}
+}
+
+// isOwnedByUs reports whether an existing bucket's tag set proves this operator
+// provisioned it for this CR (both managed-by and owner must match).
+func (r *BucketReconciler) isOwnedByUs(tagSet map[string]string, b *s3v1.Bucket) bool {
+	return tagSet[tagOwnershipManagedBy] == r.ownershipName() &&
+		tagSet[tagOwnershipOwner] == ownerTagValue(b)
+}
+
+// ownershipCollisionError signals that a bucket with the target name already
+// exists but is not owned by this operator, so it must not be adopted or deleted.
+// It is a configuration/operational fault a requeue cannot fix.
+type ownershipCollisionError struct {
+	name   string
+	detail string
+}
+
+func (e *ownershipCollisionError) Error() string {
+	return fmt.Sprintf("bucket %q already exists and is not owned by this operator (%s); refusing to adopt", e.name, e.detail)
 }
 
 // ensureAccessKeyAndSecret guarantees that the workload credentials group holds
@@ -387,8 +524,22 @@ func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
 	}
 
 	if bucketExists {
-		if err := r.Stackit.DeleteBucket(ctx, name); err != nil && stackit.StatusCode(err) != 404 {
+		// Ownership guard (defense in depth on top of the empty-check): never delete
+		// a bucket this operator does not own. A foreign bucket that shares this
+		// name, or one we created but crashed before tagging, is left in place and
+		// surfaced rather than removed.
+		owned, err := r.bucketOwnedByUs(ctx, b, name)
+		if err != nil {
 			return err
+		}
+		if owned {
+			if err := r.Stackit.DeleteBucket(ctx, name); err != nil && stackit.StatusCode(err) != 404 {
+				return err
+			}
+		} else {
+			log.FromContext(ctx).Info("skipping bucket deletion: bucket is not owned by this operator", "bucket", name)
+			r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed,
+				"not deleting bucket: it is not owned by this operator (no matching ownership tags)")
 		}
 	}
 
@@ -414,11 +565,7 @@ func (r *BucketReconciler) assertBucketEmpty(ctx context.Context, b *s3v1.Bucket
 	if err != nil {
 		return err
 	}
-	host, err := r.Stackit.BucketEndpointHost(ctx, name)
-	if err != nil {
-		return err
-	}
-	s3admin, err := stackit.NewS3Admin(host, admin.accessKeyID, admin.secretAccessKey, r.Stackit.Region())
+	s3admin, err := r.newS3Admin(ctx, name, admin)
 	if err != nil {
 		return err
 	}
@@ -431,6 +578,25 @@ func (r *BucketReconciler) assertBucketEmpty(ctx context.Context, b *s3v1.Bucket
 		return fmt.Errorf("bucket %q is not empty; refusing to delete (data-loss guard)", name)
 	}
 	return nil
+}
+
+// bucketOwnedByUs reports whether the existing bucket's ownership tags prove this
+// operator provisioned it for this CR. An untagged bucket returns false, so the
+// teardown guard leaves it in place rather than deleting a bucket it cannot claim.
+func (r *BucketReconciler) bucketOwnedByUs(ctx context.Context, b *s3v1.Bucket, name string) (bool, error) {
+	admin, err := r.ensureAdmin(ctx)
+	if err != nil {
+		return false, err
+	}
+	s3admin, err := r.newS3Admin(ctx, name, admin)
+	if err != nil {
+		return false, err
+	}
+	tagSet, err := s3admin.BucketTags(ctx, name)
+	if err != nil {
+		return false, err
+	}
+	return r.isOwnedByUs(tagSet, b), nil
 }
 
 // resolveWorkloadGroupID returns the workload credentials-group id for teardown,

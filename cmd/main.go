@@ -43,6 +43,7 @@ func main() {
 	var operatorNamespace string
 	var bucketNamePrefix string
 	var bucketNameIncludeNamespace bool
+	var ownershipName string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -67,6 +68,13 @@ func main() {
 		envBoolOrDefault("BUCKET_NAME_INCLUDE_NAMESPACE", false),
 		"Append the Bucket's namespace to the composed bucket name (after the prefix). "+
 			"Can also be set via BUCKET_NAME_INCLUDE_NAMESPACE.")
+	flag.StringVar(&ownershipName, "ownership-name",
+		envOrDefault("OWNERSHIP_NAME", "stackit-s3-provisioner"),
+		"Operator/fleet identity written into every provisioned bucket's managed-by tag "+
+			"and required to match before the operator adopts or deletes a pre-existing bucket. "+
+			"Can also be set via OWNERSHIP_NAME. WARNING: it is part of the bucket ownership key — "+
+			"changing it after buckets exist makes the operator treat its own buckets as foreign. "+
+			"On disaster-recovery restore into a new cluster, keep the same value.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -87,6 +95,7 @@ func main() {
 		"region", region,
 		"bucketNamePrefix", bucketNamePrefix,
 		"bucketNameIncludeNamespace", bucketNameIncludeNamespace,
+		"ownershipName", ownershipName,
 	)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -133,6 +142,7 @@ func main() {
 		Naming:               naming,
 		AdminSecretName:      adminSecretName,
 		AdminSecretNamespace: operatorNamespace,
+		OwnershipName:        ownershipName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Bucket")
 		os.Exit(1)
