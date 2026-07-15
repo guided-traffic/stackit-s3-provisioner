@@ -93,17 +93,27 @@ type S3Admin struct {
 	mc *minio.Client
 }
 
-// NewS3Admin builds an S3 admin client for the given endpoint host (no scheme)
-// using SigV4 path-style addressing, matching STACKIT eu01.
-func NewS3Admin(endpointHost, accessKeyID, secretAccessKey, region string) (*S3Admin, error) {
-	mc, err := minio.New(endpointHost, &minio.Options{
+// NewS3Admin builds an S3 admin client for the given endpoint using SigV4
+// path-style addressing, matching STACKIT eu01. The endpoint is either a bare
+// host (TLS is assumed, the production case) or a scheme-qualified URL — an
+// explicit http:// endpoint (a local test fake) disables TLS.
+func NewS3Admin(endpoint, accessKeyID, secretAccessKey, region string) (*S3Admin, error) {
+	host := endpoint
+	secure := true
+	switch {
+	case strings.HasPrefix(endpoint, "http://"):
+		host, secure = strings.TrimPrefix(endpoint, "http://"), false
+	case strings.HasPrefix(endpoint, "https://"):
+		host = strings.TrimPrefix(endpoint, "https://")
+	}
+	mc, err := minio.New(host, &minio.Options{
 		Creds:        credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
-		Secure:       true,
+		Secure:       secure,
 		Region:       region,
 		BucketLookup: minio.BucketLookupPath,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("init s3 admin client for %s: %w", endpointHost, err)
+		return nil, fmt.Errorf("init s3 admin client for %s: %w", endpoint, err)
 	}
 	return &S3Admin{mc: mc}, nil
 }

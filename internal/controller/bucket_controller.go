@@ -269,7 +269,7 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("ensure workload credentials: %w", err))
 	}
 
-	if err := r.ensureBucketPolicy(ctx, name, host, admin, urn); err != nil {
+	if err := r.ensureBucketPolicy(ctx, name, admin, urn); err != nil {
 		return r.fail(ctx, b, fmt.Errorf("ensure bucket policy: %w", err))
 	}
 
@@ -386,13 +386,13 @@ func (r *BucketReconciler) adoptOrCollide(ctx context.Context, b *s3v1.Bucket, n
 }
 
 // newS3Admin builds an admin data-plane client for the bucket's region-uniform
-// endpoint host. The bucket must already exist (the host is derived from it).
+// endpoint. The bucket must already exist (the endpoint is derived from it).
 func (r *BucketReconciler) newS3Admin(ctx context.Context, name string, admin *adminCreds) (*stackit.S3Admin, error) {
-	host, err := r.Stackit.BucketEndpointHost(ctx, name)
+	endpoint, err := r.Stackit.BucketEndpoint(ctx, name)
 	if err != nil {
 		return nil, err
 	}
-	return stackit.NewS3Admin(host, admin.accessKeyID, admin.secretAccessKey, r.Stackit.Region())
+	return stackit.NewS3Admin(endpoint, admin.accessKeyID, admin.secretAccessKey, r.Stackit.Region())
 }
 
 // defaultOwnershipName is the fallback managed-by value when OwnershipName is
@@ -508,8 +508,8 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 
 // ensureBucketPolicy applies the isolation policy (INIT-SETUP.md §4.1) via the
 // admin S3 key, re-writing it only when it drifts from the desired document.
-func (r *BucketReconciler) ensureBucketPolicy(ctx context.Context, name, host string, admin *adminCreds, workloadURN string) error {
-	s3admin, err := stackit.NewS3Admin(host, admin.accessKeyID, admin.secretAccessKey, r.Stackit.Region())
+func (r *BucketReconciler) ensureBucketPolicy(ctx context.Context, name string, admin *adminCreds, workloadURN string) error {
+	s3admin, err := r.newS3Admin(ctx, name, admin)
 	if err != nil {
 		return err
 	}

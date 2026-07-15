@@ -58,7 +58,7 @@ func TestIntegrationBucketTaggingSupported(t *testing.T) {
 		}
 	})
 
-	endpoint, err := c1.BucketEndpointHost(ctx, bucket)
+	endpoint, err := c1.BucketEndpoint(ctx, bucket)
 	if err != nil {
 		t.Fatalf("endpoint: %v", err)
 	}

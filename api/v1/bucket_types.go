@@ -52,6 +52,10 @@ const (
 // resources (access key, credentials group, bucket) before the CR is removed.
 const BucketFinalizer = "stackit-bucket.gtrfc.com/finalizer"
 
+// DefaultRegion is the StackIT region used when spec.region is empty (mirrors
+// the CRD default on the field).
+const DefaultRegion = "eu01"
+
 // ResolvedBucketNameAnnotation records the physical StackIT bucket name that was
 // frozen for a Bucket CR at first provisioning. It is the crash- and
 // restore-durable backup of status.resolvedBucketName: the operator writes it
@@ -381,7 +385,7 @@ func (b *Bucket) GetRegion() string {
 	if b.Spec.Region != "" {
 		return b.Spec.Region
 	}
-	return "eu01"
+	return DefaultRegion
 }
 
 // EffectiveBucketName returns the physical StackIT bucket name for this CR: the
