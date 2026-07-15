@@ -93,17 +93,27 @@ type S3Admin struct {
 	mc *minio.Client
 }
 
-// NewS3Admin builds an S3 admin client for the given endpoint host (no scheme)
-// using SigV4 path-style addressing, matching STACKIT eu01.
-func NewS3Admin(endpointHost, accessKeyID, secretAccessKey, region string) (*S3Admin, error) {
-	mc, err := minio.New(endpointHost, &minio.Options{
+// NewS3Admin builds an S3 admin client for the given endpoint using SigV4
+// path-style addressing, matching STACKIT eu01. The endpoint is either a bare
+// host (TLS is assumed, the production case) or a scheme-qualified URL — an
+// explicit http:// endpoint (a local test fake) disables TLS.
+func NewS3Admin(endpoint, accessKeyID, secretAccessKey, region string) (*S3Admin, error) {
+	host := endpoint
+	secure := true
+	switch {
+	case strings.HasPrefix(endpoint, "http://"):
+		host, secure = strings.TrimPrefix(endpoint, "http://"), false
+	case strings.HasPrefix(endpoint, "https://"):
+		host = strings.TrimPrefix(endpoint, "https://")
+	}
+	mc, err := minio.New(host, &minio.Options{
 		Creds:        credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
-		Secure:       true,
+		Secure:       secure,
 		Region:       region,
 		BucketLookup: minio.BucketLookupPath,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("init s3 admin client for %s: %w", endpointHost, err)
+		return nil, fmt.Errorf("init s3 admin client for %s: %w", endpoint, err)
 	}
 	return &S3Admin{mc: mc}, nil
 }
@@ -149,6 +159,51 @@ func (s *S3Admin) BucketTags(ctx context.Context, bucket string) (map[string]str
 		return nil, fmt.Errorf("get bucket tagging on %q: %w", bucket, err)
 	}
 	return t.ToMap(), nil
+}
+
+// WipeBucket deletes every object in the bucket, including all object versions
+// and delete markers, so the bucket can subsequently be removed. It is only
+// called during finalizer teardown when the Bucket CR explicitly requested a
+// wipe (spec.wipeOnDelete) AND the operator-wide wipe feature gate is enabled;
+// it must never run on a bucket this operator does not own. Idempotent: an
+// already-empty bucket is a no-op.
+func (s *S3Admin) WipeBucket(ctx context.Context, bucket string) error {
+	// Cancel the listing on early return so minio's producer goroutine and our
+	// forwarder never block on unread channels.
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	listCh := s.mc.ListObjects(lctx, bucket, minio.ListObjectsOptions{Recursive: true, WithVersions: true})
+
+	// Forward listed objects to the deleter, stopping at the first listing
+	// error. listErr is read only after RemoveObjects' result channel closed,
+	// which happens after objCh closed, so the access is ordered.
+	objCh := make(chan minio.ObjectInfo)
+	var listErr error
+	go func() {
+		defer close(objCh)
+		for obj := range listCh {
+			if obj.Err != nil {
+				listErr = obj.Err
+				return
+			}
+			select {
+			case objCh <- obj:
+			case <-lctx.Done():
+				return
+			}
+		}
+	}()
+
+	for rmErr := range s.mc.RemoveObjects(lctx, bucket, objCh, minio.RemoveObjectsOptions{}) {
+		if rmErr.Err != nil {
+			return fmt.Errorf("wipe bucket %q: delete object %q: %w", bucket, rmErr.ObjectName, rmErr.Err)
+		}
+	}
+	if listErr != nil {
+		return fmt.Errorf("wipe bucket %q: list objects: %w", bucket, listErr)
+	}
+	return nil
 }
 
 // BucketEmpty reports whether the bucket holds no objects. It is used to enforce

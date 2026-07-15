@@ -52,6 +52,10 @@ const (
 // resources (access key, credentials group, bucket) before the CR is removed.
 const BucketFinalizer = "stackit-bucket.gtrfc.com/finalizer"
 
+// DefaultRegion is the StackIT region used when spec.region is empty (mirrors
+// the CRD default on the field).
+const DefaultRegion = "eu01"
+
 // ResolvedBucketNameAnnotation records the physical StackIT bucket name that was
 // frozen for a Bucket CR at first provisioning. It is the crash- and
 // restore-durable backup of status.resolvedBucketName: the operator writes it
@@ -265,6 +269,19 @@ type BucketSpec struct {
 	// +kubebuilder:default=eu01
 	// +optional
 	Region string `json:"region,omitempty"`
+
+	// WipeOnDelete requests that the operator deletes ALL objects (including
+	// object versions and delete markers) from the bucket before removing it
+	// when this CR is deleted. Without it, deletion of a non-empty bucket is
+	// blocked (data-loss guard). The field is mutable, so it can be set right
+	// before deleting the CR.
+	//
+	// It is only honored when the operator is deployed with the wipe feature
+	// enabled (Helm value wipeOnDelete.enabled / --enable-wipe-on-delete);
+	// otherwise it degrades to the safe empty-only behavior and a warning
+	// event is emitted.
+	// +optional
+	WipeOnDelete bool `json:"wipeOnDelete,omitempty"`
 }
 
 // BucketStatus defines the observed state of Bucket.
@@ -368,7 +385,7 @@ func (b *Bucket) GetRegion() string {
 	if b.Spec.Region != "" {
 		return b.Spec.Region
 	}
-	return "eu01"
+	return DefaultRegion
 }
 
 // EffectiveBucketName returns the physical StackIT bucket name for this CR: the

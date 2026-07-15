@@ -78,7 +78,7 @@ test-unit: ## Run unit tests only.
 test-unit-coverage: ## Run unit tests with coverage.
 	@echo "Running unit tests with coverage..."
 	@mkdir -p $(COVERAGE_DIR)
-	$(GOTEST) -v -short -coverprofile=$(COVERAGE_DIR)/unit.out -covermode=atomic ./...
+	$(GOTEST) -v -short -coverprofile=$(COVERAGE_DIR)/unit.out -covermode=atomic -coverpkg=./... ./...
 
 .PHONY: test-integration
 test-integration: envtest ## Run integration tests (envtest) only.

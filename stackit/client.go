@@ -80,6 +80,22 @@ func NewClient(acc Account, region string) (*Client, error) {
 	return &Client{api: api, account: acc, region: region}, nil
 }
 
+// NewClientWithEndpoint builds a client against a custom API base endpoint with
+// static token auth. It exists for tests that run against a local in-memory
+// fake of the StackIT API; production always uses NewClient (key-flow auth
+// against the real endpoint).
+func NewClientWithEndpoint(projectID, region, endpoint string) (*Client, error) {
+	api, err := objectstorage.NewAPIClient(
+		config.WithEndpoint(endpoint),
+		config.WithToken("test-token"),
+		config.WithRegion(region),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("init object storage client for endpoint %s: %w", endpoint, err)
+	}
+	return &Client{api: api, account: Account{ProjectID: projectID}, region: region}, nil
+}
+
 // ProjectID returns the project this client is bound to.
 func (c *Client) ProjectID() string { return c.account.ProjectID }
 
@@ -346,11 +362,16 @@ func (c *Client) BucketConnInfo(ctx context.Context, name string) (host, pathSty
 	return u.Host, raw, nil
 }
 
-// BucketEndpointHost returns the S3 endpoint host (no scheme, no bucket) for a
+// BucketEndpoint returns the S3 endpoint (scheme + host, no bucket) for a
 // bucket, derived from its path-style URL — used to configure an S3 client.
-func (c *Client) BucketEndpointHost(ctx context.Context, name string) (string, error) {
-	host, _, err := c.BucketConnInfo(ctx, name)
-	return host, err
+// The scheme is preserved so a plain-HTTP test endpoint works as well.
+func (c *Client) BucketEndpoint(ctx context.Context, name string) (string, error) {
+	_, raw, err := c.BucketConnInfo(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	u, _ := url.Parse(raw) // BucketConnInfo already validated the URL
+	return u.Scheme + "://" + u.Host, nil
 }
 
 // StatusCode extracts the HTTP status code from a STACKIT API error, or 0 if the

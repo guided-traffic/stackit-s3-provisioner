@@ -55,6 +55,9 @@ spec:
             {{- if .Values.ownership.name }}
             - --ownership-name={{ .Values.ownership.name }}
             {{- end }}
+            {{- if .Values.wipeOnDelete.enabled }}
+            - --enable-wipe-on-delete
+            {{- end }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

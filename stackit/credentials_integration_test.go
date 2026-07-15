@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,7 +30,7 @@ func bucketIsolationPolicy(bucket, adminURN, workloadURN string) string {
 
 func newMinio(t *testing.T, endpoint string, ak AccessKey) *minio.Client {
 	t.Helper()
-	mc, err := minio.New(endpoint, &minio.Options{
+	mc, err := minio.New(strings.TrimPrefix(endpoint, "https://"), &minio.Options{
 		Creds:        credentials.NewStaticV4(ak.AccessKeyID, ak.SecretAccessKey, ""),
 		Secure:       true,
 		Region:       RegionEU01,
@@ -197,7 +198,7 @@ func TestIntegrationWorkloadCredentials(t *testing.T) {
 	keys = append(keys, keyRef{gB, akB.KeyID})
 
 	// --- S3 clients ---
-	endpoint, err := c1.BucketEndpointHost(ctx, bucketA)
+	endpoint, err := c1.BucketEndpoint(ctx, bucketA)
 	if err != nil {
 		t.Fatalf("endpoint: %v", err)
 	}

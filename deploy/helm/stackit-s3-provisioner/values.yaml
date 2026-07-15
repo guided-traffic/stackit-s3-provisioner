@@ -87,6 +87,15 @@ ownership:
   # values: letters, digits and + - = . _ : / @ and spaces.
   name: stackit-s3-provisioner
 
+# wipeOnDelete globally gates the destructive wipe feature (spec.wipeOnDelete on
+# a Bucket CR: delete ALL objects, including versions and delete markers, before
+# removing the bucket on CR deletion). When disabled, a Bucket requesting a wipe
+# is degraded to the safe default (delete only if empty) and a warning event is
+# emitted — the CR field is effectively ignored.
+wipeOnDelete:
+  # enabled turns the feature gate on. Opt-in, default off.
+  enabled: false
+
 # stackit configures the operator's binding to a StackIT project.
 stackit:
   # region is the StackIT region the operator provisions buckets in.

@@ -8,12 +8,6 @@ A Kubernetes operator that provisions **StackIT Object Storage** buckets, worklo
 credentials and isolation policies through Custom Resources. One operator
 deployment per cluster, bound to a single StackIT project via a service-account key.
 
-> **Status:** operator **skeleton**. The controller wiring, CRD, Helm chart and CI
-> pipeline are in place and green; the StackIT provisioning flow itself
-> (`CreateBucket` → credentials group → access key → bucket policy) is the next
-> step. Feasibility is verified end to end against the real StackIT API — see
-> [`INIT-SETUP.md`](INIT-SETUP.md) and the integration tests in [`stackit/`](stackit/).
-
 ## What it does
 
 A `Bucket` custom resource maps to one isolated workload: a StackIT bucket, a
@@ -66,6 +60,61 @@ spec:
       endpoint:        ENDPOINT    # default S3_ENDPOINT
       bucketURL:       BUCKET_URL  # default S3_BUCKET_URL
 ```
+
+## Status
+
+The operator reports progress on the `Bucket` status subresource, so `kubectl get
+bucket` (short name `bkt`) shows the live state:
+
+```
+NAME        BUCKET      PHASE   READY   STATUS               REGION   AGE
+my-bucket   my-bucket   Ready   True    provisioned          eu01     2m
+```
+
+- **`status.phase`** — `Pending` → `Provisioning` → `Ready`, or `Failed` /
+  `Deleting`.
+- **`Ready` condition** — reasons `Provisioned`, `Provisioning`, `Failed`, or
+  `NotImplemented` (skeleton mode). `status.message` carries the current step or
+  failure reason.
+- Config faults (a `secretRef` pointing at the operator admin Secret, a
+  `spec.region` that differs from the operator's region, a bucket-name/secret-key
+  collision, or a bucket owned by someone else) set `Ready=Failed` **without**
+  requeue-hammering — fix the CR and the next generation reconciles.
+- Other status fields: `resolvedBucketName`, `bucketURL`, `credentialsGroupID`,
+  `credentialsGroupURN`, `accessKeyID` (never the secret), `observedGeneration`,
+  `operatorVersion`.
+
+Each `Bucket` is stamped with S3 ownership tags (`managed-by` + `owner=<ns>/<name>`)
+so the operator adopts only buckets it owns and refuses to clobber a pre-existing
+foreign or non-empty bucket. On bootstrap the operator creates a shared
+`operator-admin` credentials group + S3 key (persisted in its own admin Secret,
+default `stackit-s3-provisioner-admin`); that group's URN sits in every bucket
+policy's exemption list as a lockout safeguard.
+
+## Deletion behavior
+
+Deleting a `Bucket` CR tears down the access key, credentials group, bucket and
+credentials Secret — but only when the bucket is **empty**. A non-empty bucket
+blocks deletion (data-loss guard) until its objects are removed.
+
+A Bucket can opt into an automatic wipe instead: with `spec.wipeOnDelete: true`
+the operator deletes **all objects (including versions and delete markers)**
+before removing the bucket. The field is mutable, so it can be set right before
+deleting the CR.
+
+```yaml
+spec:
+  bucketName: my-bucket
+  wipeOnDelete: true   # default false: deletion is blocked while data exists
+  secretRef:
+    name: my-bucket-s3
+```
+
+The feature is gated operator-wide by the Helm value `wipeOnDelete.enabled`
+(default `false`). While the gate is off, a requested wipe is ignored: deletion
+degrades to the safe empty-only guard and a warning event
+(`WipeOnDeleteSkipped`) is emitted. A wipe also never runs on a bucket whose
+ownership tags do not prove this operator provisioned it.
 
 ## Install (Helm)
 

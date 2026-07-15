@@ -22,9 +22,13 @@ stackit/client_test.go                   Offline-Unit-Tests (Key-Parsing)
 stackit/s3_test.go                       Offline-Unit-Tests (Policy-Builder + Drift-Vergleich)
 stackit/integration_test.go              //go:build integration — Layer-1 (Cross-Projekt-Isolation)
 stackit/credentials_integration_test.go  //go:build integration — Layer-2 (Workload-Creds + echtes S3)
+stackit/client_fake_test.go              Offline-Tests Control-Plane-Wrapper (gegen stackitfake)
+stackit/s3_fake_test.go                  Offline-Tests Data-Plane inkl. WipeBucket (gegen stackitfake)
 api/v1/bucket_types.go                    CRD `Bucket` (stackit-bucket.gtrfc.com/v1) + Helper, +kubebuilder-Marker
 cmd/main.go                              controller-runtime Manager (stackit.Client + Admin-Secret-Name/-Namespace)
 internal/controller/bucket_controller.go Reconciler (VOLL: §8-Provisioning + Admin-Bootstrap + Finalizer-Teardown)
+internal/controller/reconciler_*_test.go Offline-Reconciler-Tests (fake k8s-Client + stackitfake, inkl. Fehlerpfade)
+internal/stackitfake/                    In-Memory-Fake der StackIT-API (Control-Plane REST + S3-XML) für Offline-Tests
 config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
 deploy/helm/stackit-s3-provisioner/      Helm-Chart (CRD via `make sync-helm-crd` synchronisiert)
 test/integration/                        //go:build integration — envtest gegen echten API-Server
@@ -146,7 +150,10 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
 - **Policy (`ensureBucketPolicy`):** `BuildIsolationPolicy` (§4.1), nur bei Drift neu setzen
   (`PoliciesEquivalent`). Self-healing gegen manuelle Änderungen.
 - **Finalizer-Teardown:** Empty-Check **zuerst** (Admin-S3, Data-Loss-Guard) → dann Keys → Group →
-  Bucket → Secret. Shared Admin-Group wird **nie** angefasst.
+  Bucket → Secret. Shared Admin-Group wird **nie** angefasst. Opt-in-Wipe: `spec.wipeOnDelete`
+  löscht vorher alle Objekte (inkl. Versions/Delete-Markers, `S3Admin.WipeBucket`) — nur wenn
+  Feature-Gate an (`--enable-wipe-on-delete` / Helm `wipeOnDelete.enabled`, Default aus) **und**
+  Ownership-Tags passen; sonst Degradierung auf Empty-Only + Warning-Event `WipeOnDeleteSkipped`.
 - **Guards (produktionssicher):** CR darf `secretRef` **nicht** aufs Admin-Secret zeigen (sonst
   Pollution + Admin-Lockout beim Delete); `spec.region` muss = Operator-Region sein (Single-Region v1).
   Beides → `Ready=Failed` ohne Requeue-Hammer.

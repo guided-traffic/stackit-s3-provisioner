@@ -44,6 +44,7 @@ func main() {
 	var bucketNamePrefix string
 	var bucketNameIncludeNamespace bool
 	var ownershipName string
+	var enableWipeOnDelete bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -75,6 +76,12 @@ func main() {
 			"Can also be set via OWNERSHIP_NAME. WARNING: it is part of the bucket ownership key — "+
 			"changing it after buckets exist makes the operator treat its own buckets as foreign. "+
 			"On disaster-recovery restore into a new cluster, keep the same value.")
+	flag.BoolVar(&enableWipeOnDelete, "enable-wipe-on-delete",
+		envBoolOrDefault("ENABLE_WIPE_ON_DELETE", false),
+		"Operator-wide feature gate for spec.wipeOnDelete: allow Buckets to request that all objects "+
+			"are deleted before the bucket is removed on CR deletion. Can also be set via "+
+			"ENABLE_WIPE_ON_DELETE. When disabled, a requested wipe degrades to the safe "+
+			"empty-only delete guard and a warning event is emitted.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -96,6 +103,7 @@ func main() {
 		"bucketNamePrefix", bucketNamePrefix,
 		"bucketNameIncludeNamespace", bucketNameIncludeNamespace,
 		"ownershipName", ownershipName,
+		"enableWipeOnDelete", enableWipeOnDelete,
 	)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -143,6 +151,7 @@ func main() {
 		AdminSecretName:      adminSecretName,
 		AdminSecretNamespace: operatorNamespace,
 		OwnershipName:        ownershipName,
+		EnableWipeOnDelete:   enableWipeOnDelete,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Bucket")
 		os.Exit(1)
