@@ -151,6 +151,51 @@ func (s *S3Admin) BucketTags(ctx context.Context, bucket string) (map[string]str
 	return t.ToMap(), nil
 }
 
+// WipeBucket deletes every object in the bucket, including all object versions
+// and delete markers, so the bucket can subsequently be removed. It is only
+// called during finalizer teardown when the Bucket CR explicitly requested a
+// wipe (spec.wipeOnDelete) AND the operator-wide wipe feature gate is enabled;
+// it must never run on a bucket this operator does not own. Idempotent: an
+// already-empty bucket is a no-op.
+func (s *S3Admin) WipeBucket(ctx context.Context, bucket string) error {
+	// Cancel the listing on early return so minio's producer goroutine and our
+	// forwarder never block on unread channels.
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	listCh := s.mc.ListObjects(lctx, bucket, minio.ListObjectsOptions{Recursive: true, WithVersions: true})
+
+	// Forward listed objects to the deleter, stopping at the first listing
+	// error. listErr is read only after RemoveObjects' result channel closed,
+	// which happens after objCh closed, so the access is ordered.
+	objCh := make(chan minio.ObjectInfo)
+	var listErr error
+	go func() {
+		defer close(objCh)
+		for obj := range listCh {
+			if obj.Err != nil {
+				listErr = obj.Err
+				return
+			}
+			select {
+			case objCh <- obj:
+			case <-lctx.Done():
+				return
+			}
+		}
+	}()
+
+	for rmErr := range s.mc.RemoveObjects(lctx, bucket, objCh, minio.RemoveObjectsOptions{}) {
+		if rmErr.Err != nil {
+			return fmt.Errorf("wipe bucket %q: delete object %q: %w", bucket, rmErr.ObjectName, rmErr.Err)
+		}
+	}
+	if listErr != nil {
+		return fmt.Errorf("wipe bucket %q: list objects: %w", bucket, listErr)
+	}
+	return nil
+}
+
 // BucketEmpty reports whether the bucket holds no objects. It is used to enforce
 // the empty-only delete guard (INIT-SETUP.md §0) before any teardown, so a
 // non-empty bucket never loses its credentials or data.

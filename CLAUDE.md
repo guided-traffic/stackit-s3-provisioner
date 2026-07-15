@@ -146,7 +146,10 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
 - **Policy (`ensureBucketPolicy`):** `BuildIsolationPolicy` (§4.1), nur bei Drift neu setzen
   (`PoliciesEquivalent`). Self-healing gegen manuelle Änderungen.
 - **Finalizer-Teardown:** Empty-Check **zuerst** (Admin-S3, Data-Loss-Guard) → dann Keys → Group →
-  Bucket → Secret. Shared Admin-Group wird **nie** angefasst.
+  Bucket → Secret. Shared Admin-Group wird **nie** angefasst. Opt-in-Wipe: `spec.wipeOnDelete`
+  löscht vorher alle Objekte (inkl. Versions/Delete-Markers, `S3Admin.WipeBucket`) — nur wenn
+  Feature-Gate an (`--enable-wipe-on-delete` / Helm `wipeOnDelete.enabled`, Default aus) **und**
+  Ownership-Tags passen; sonst Degradierung auf Empty-Only + Warning-Event `WipeOnDeleteSkipped`.
 - **Guards (produktionssicher):** CR darf `secretRef` **nicht** aufs Admin-Secret zeigen (sonst
   Pollution + Admin-Lockout beim Delete); `spec.region` muss = Operator-Region sein (Single-Region v1).
   Beides → `Ready=Failed` ohne Requeue-Hammer.

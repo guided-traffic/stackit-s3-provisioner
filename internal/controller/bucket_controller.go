@@ -102,6 +102,12 @@ type BucketReconciler struct {
 	// exist makes the operator treat its own buckets as foreign (collision).
 	OwnershipName string
 
+	// EnableWipeOnDelete is the operator-wide feature gate for spec.wipeOnDelete
+	// (Helm value wipeOnDelete.enabled). When false, a CR requesting a wipe
+	// degrades to the safe empty-only delete guard and a warning event is
+	// emitted instead of destroying data.
+	EnableWipeOnDelete bool
+
 	adminMu sync.Mutex
 	admin   *adminCreds // cached after the first successful bootstrap
 }
@@ -526,11 +532,12 @@ func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
 		return err
 	}
 
-	// Empty-only guard (INIT-SETUP.md §0): refuse deletion while the bucket holds
-	// data. Done first, before any credential is removed, so a blocked delete
-	// leaves the workload fully functional.
+	// Empty-only guard (INIT-SETUP.md §0), optionally preceded by a requested
+	// wipe: refuse deletion while the bucket holds data. Done first, before any
+	// credential is removed, so a blocked delete leaves the workload fully
+	// functional.
 	if bucketExists {
-		if err := r.assertBucketEmpty(ctx, b, name); err != nil {
+		if err := r.prepareBucketForDelete(ctx, b, name); err != nil {
 			return err
 		}
 	}
@@ -567,6 +574,63 @@ func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
 // operator-owned bootstrap admin Secret.
 func (r *BucketReconciler) isAdminSecret(b *s3v1.Bucket) bool {
 	return b.Spec.SecretRef.Name == r.AdminSecretName && b.SecretNamespace() == r.AdminSecretNamespace
+}
+
+// prepareBucketForDelete enforces the data-loss guard before teardown removes
+// anything. Default is the empty-only guard: a non-empty bucket blocks
+// deletion. When the CR requests a wipe (spec.wipeOnDelete) AND the operator's
+// wipe feature gate is enabled AND the ownership tags prove this operator
+// provisioned the bucket, all objects are deleted first instead. A requested
+// wipe that the gate disables, or that ownership cannot authorize, degrades to
+// the empty-only guard with a warning event — never to silent data loss.
+func (r *BucketReconciler) prepareBucketForDelete(ctx context.Context, b *s3v1.Bucket, name string) error {
+	if b.Spec.WipeOnDelete {
+		switch {
+		case !r.EnableWipeOnDelete:
+			r.event(b, corev1.EventTypeWarning, reasonWipeDisabled,
+				"spec.wipeOnDelete requested but the wipe feature is disabled by operator config (wipeOnDelete.enabled); falling back to empty-only delete guard")
+		default:
+			owned, err := r.bucketOwnedByUs(ctx, b, name)
+			if err != nil {
+				return err
+			}
+			if !owned {
+				r.event(b, corev1.EventTypeWarning, reasonWipeDisabled,
+					"refusing to wipe: bucket is not owned by this operator (no matching ownership tags); falling back to empty-only delete guard")
+				break
+			}
+			return r.wipeBucket(ctx, b, name)
+		}
+	}
+	return r.assertBucketEmpty(ctx, b, name)
+}
+
+// reasonWipeDisabled is the event reason for a requested wipe that was degraded
+// to the empty-only delete guard (feature gate off, or ownership not proven).
+const reasonWipeDisabled = "WipeOnDeleteSkipped"
+
+// reasonWiping is the event reason emitted when a wipe starts.
+const reasonWiping = "WipingBucket"
+
+// wipeBucket deletes all objects (including versions and delete markers) from
+// an owned bucket during teardown, as explicitly requested via spec.wipeOnDelete.
+func (r *BucketReconciler) wipeBucket(ctx context.Context, b *s3v1.Bucket, name string) error {
+	admin, err := r.ensureAdmin(ctx)
+	if err != nil {
+		return err
+	}
+	s3admin, err := r.newS3Admin(ctx, name, admin)
+	if err != nil {
+		return err
+	}
+	log.FromContext(ctx).Info("wiping bucket contents before deletion (spec.wipeOnDelete)", "bucket", name)
+	r.event(b, corev1.EventTypeNormal, reasonWiping, "deleting all objects before bucket removal (spec.wipeOnDelete)")
+	// Best-effort progress hint; the wipe can take a while on large buckets.
+	b.Status.Message = fmt.Sprintf("wiping bucket %q before deletion", name)
+	if err := r.Status().Update(ctx, b); err != nil {
+		log.FromContext(ctx).V(1).Info("wipe status update did not apply", "error", err.Error())
+	}
+	return s3admin.WipeBucket(ctx, name)
 }
 
 // assertBucketEmpty returns an error (blocking deletion) unless the bucket holds
