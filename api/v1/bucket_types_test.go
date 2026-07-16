@@ -341,3 +341,28 @@ func TestValidateSecretKeysCollision(t *testing.T) {
 		})
 	}
 }
+
+func TestPendingRotationTrigger(t *testing.T) {
+	tests := []struct {
+		name       string
+		annotation string
+		recorded   string
+		want       string
+	}{
+		{name: "no annotation", annotation: "", recorded: "", want: ""},
+		{name: "fresh trigger", annotation: "2026-07-16T10:00:00Z", recorded: "", want: "2026-07-16T10:00:00Z"},
+		{name: "already handled", annotation: "2026-07-16T10:00:00Z", recorded: "2026-07-16T10:00:00Z", want: ""},
+		{name: "changed trigger", annotation: "2026-07-17T10:00:00Z", recorded: "2026-07-16T10:00:00Z", want: "2026-07-17T10:00:00Z"},
+		{name: "annotation removed after rotation", annotation: "", recorded: "2026-07-16T10:00:00Z", want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newBucket("team-a")
+			if tc.annotation != "" {
+				b.Annotations = map[string]string{RotateCredentialsAtAnnotation: tc.annotation}
+			}
+			b.Status.LastRotationTrigger = tc.recorded
+			assert.Equal(t, tc.want, b.PendingRotationTrigger())
+		})
+	}
+}

@@ -147,6 +147,10 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
 - **AccessKey/Secret:** Secret ist Source-of-Truth. Hat Secret Creds **und** Group ≥1 Key → skip.
   Sonst: **erst alle Group-Keys löschen, dann neuen Key + Secret schreiben** (leak-frei, da Clear
   vor Create); scheitert Secret-Write → neuen Key sofort löschen (Secret unrecoverable).
+- **Key-Rotation (Annotation):** `stackit-bucket.gtrfc.com/rotate-credentials-at: "<RFC3339>"` —
+  Wert ≠ `status.lastRotationTrigger` → harte Rotation (Skip-Pfad übersteuert, alter Key sofort tot,
+  Workloads müssen Secret neu lesen). Handled-Wert + Zeit in Status (level-triggered, GitOps-safe:
+  Operator mutiert Annotation nie), Event `CredentialsRotated`.
 - **Policy (`ensureBucketPolicy`):** `BuildIsolationPolicy` (§4.1), nur bei Drift neu setzen
   (`PoliciesEquivalent`). Self-healing gegen manuelle Änderungen.
 - **Finalizer-Teardown:** Empty-Check **zuerst** (Admin-S3, Data-Loss-Guard) → dann Keys → Group →

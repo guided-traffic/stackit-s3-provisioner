@@ -56,6 +56,16 @@ const BucketFinalizer = "stackit-bucket.gtrfc.com/finalizer"
 // the CRD default on the field).
 const DefaultRegion = "eu01"
 
+// RotateCredentialsAtAnnotation requests a hard rotation of the workload access
+// key. Its value is an opaque trigger (by convention an RFC3339 timestamp, like
+// kubectl.kubernetes.io/restartedAt): whenever it differs from
+// status.lastRotationTrigger, the operator replaces the workload access key and
+// re-writes the credentials Secret, then records the value in status. The old
+// key is invalidated immediately, so consuming workloads must re-read the
+// Secret (e.g. via pod restart). Removing the annotation never triggers
+// anything; re-adding the last recorded value does not re-rotate.
+const RotateCredentialsAtAnnotation = "stackit-bucket.gtrfc.com/rotate-credentials-at"
+
 // ResolvedBucketNameAnnotation records the physical StackIT bucket name that was
 // frozen for a Bucket CR at first provisioning. It is the crash- and
 // restore-durable backup of status.resolvedBucketName: the operator writes it
@@ -329,6 +339,17 @@ type BucketStatus struct {
 	// +optional
 	AccessKeyID string `json:"accessKeyID,omitempty"`
 
+	// LastRotationTrigger is the rotate-credentials-at annotation value the
+	// operator last acted upon. A differing (non-empty) annotation value requests
+	// a new rotation; recording it here makes the trigger level-based and
+	// GitOps-safe (the operator never mutates the annotation itself).
+	// +optional
+	LastRotationTrigger string `json:"lastRotationTrigger,omitempty"`
+
+	// LastRotationTime is when the last credentials rotation completed.
+	// +optional
+	LastRotationTime *metav1.Time `json:"lastRotationTime,omitempty"`
+
 	// OperatorVersion is the version of the operator that last reconciled this Bucket.
 	// +optional
 	OperatorVersion string `json:"operatorVersion,omitempty"`
@@ -401,6 +422,17 @@ func (b *Bucket) EffectiveBucketName() string {
 		return v
 	}
 	return b.Spec.BucketName
+}
+
+// PendingRotationTrigger returns the rotate-credentials-at annotation value
+// when it requests a rotation that has not been performed yet, and "" when no
+// rotation is pending (annotation absent/empty, or already recorded in status).
+func (b *Bucket) PendingRotationTrigger() string {
+	v := b.Annotations[RotateCredentialsAtAnnotation]
+	if v == "" || v == b.Status.LastRotationTrigger {
+		return ""
+	}
+	return v
 }
 
 // SecretValues carries the provisioned values that only the operator knows at

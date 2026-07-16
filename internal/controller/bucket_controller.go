@@ -273,6 +273,8 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("ensure bucket policy: %w", err))
 	}
 
+	r.recordPendingRotation(ctx, b, name)
+
 	// Success: record observed state and mark Ready.
 	b.Status.ResolvedBucketName = name
 	b.Status.BucketURL = bucketURL
@@ -475,8 +477,9 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 		return "", err
 	}
 
-	if getErr == nil && secretHasCreds(&sec, b) && len(keyIDs) > 0 {
-		// Already provisioned and the group still backs the credential.
+	if getErr == nil && secretHasCreds(&sec, b) && len(keyIDs) > 0 && b.PendingRotationTrigger() == "" {
+		// Already provisioned, the group still backs the credential and no
+		// rotation is requested.
 		return secretAccessKeyID(&sec, b), nil
 	}
 
@@ -504,6 +507,25 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 		return "", fmt.Errorf("write credentials secret %s: %w", secretKey, err)
 	}
 	return ak.AccessKeyID, nil
+}
+
+// recordPendingRotation stamps a just-performed annotation-triggered rotation
+// into status (in-memory; persisted by the caller's terminal status write). A
+// pending trigger at this point means ensureAccessKeyAndSecret has already
+// rotated (its skip path is disabled while a rotation is pending); recording
+// the handled value turns the annotation back into a level-triggered no-op. A
+// crash before the status write simply rotates again on the next reconcile
+// (harmless: hard rotation). No-op when no rotation is pending.
+func (r *BucketReconciler) recordPendingRotation(ctx context.Context, b *s3v1.Bucket, name string) {
+	trigger := b.PendingRotationTrigger()
+	if trigger == "" {
+		return
+	}
+	b.Status.LastRotationTrigger = trigger
+	now := metav1.Now()
+	b.Status.LastRotationTime = &now
+	log.FromContext(ctx).Info("workload credentials rotated", "bucket", name, "trigger", trigger)
+	r.event(b, corev1.EventTypeNormal, reasonRotated, "workload access key rotated (rotate-credentials-at annotation)")
 }
 
 // ensureBucketPolicy applies the isolation policy (INIT-SETUP.md §4.1) via the
@@ -611,6 +633,10 @@ const reasonWipeDisabled = "WipeOnDeleteSkipped"
 
 // reasonWiping is the event reason emitted when a wipe starts.
 const reasonWiping = "WipingBucket"
+
+// reasonRotated is the event reason emitted after an annotation-triggered
+// credentials rotation completed.
+const reasonRotated = "CredentialsRotated"
 
 // wipeBucket deletes all objects (including versions and delete markers) from
 // an owned bucket during teardown, as explicitly requested via spec.wipeOnDelete.
