@@ -91,6 +91,53 @@ foreign or non-empty bucket. On bootstrap the operator creates a shared
 default `stackit-s3-provisioner-admin`); that group's URN sits in every bucket
 policy's exemption list as a lockout safeguard.
 
+## Credentials rotation
+
+The workload access key can be rotated on demand via an annotation on the
+`Bucket` CR — no spec change required:
+
+```yaml
+metadata:
+  annotations:
+    stackit-bucket.gtrfc.com/rotate-credentials-at: "2026-07-16T10:00:00Z"
+```
+
+The value is an opaque trigger (by convention an RFC3339 timestamp, mirroring
+`kubectl rollout restart`'s `restartedAt`). Whenever it differs from
+`status.lastRotationTrigger`, the operator replaces the access key — all keys in
+the bucket's credentials group are deleted first, then a single fresh key is
+created and written to the credentials Secret — and records the handled value
+and time in `status.lastRotationTrigger` / `status.lastRotationTime`, emitting
+a `CredentialsRotated` event.
+
+The trigger is level-based and GitOps-safe: the operator never mutates the
+annotation, an unchanged value is a no-op, and removing the annotation triggers
+nothing. Rotation is **hard**: the old key stops working immediately, so
+workloads must re-read the Secret (e.g. restart their pods) to pick up the new
+credentials.
+
+Rotate a specific Bucket:
+
+```bash
+kubectl annotate bucket my-bucket \
+  stackit-bucket.gtrfc.com/rotate-credentials-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --overwrite
+```
+
+Rotate all Buckets matching a label selector (e.g. everything labelled
+`team=payments`):
+
+```bash
+kubectl annotate buckets -l team=payments \
+  stackit-bucket.gtrfc.com/rotate-credentials-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --overwrite
+```
+
+`--overwrite` is required on re-rotation (the annotation already exists then).
+Both commands operate on the current namespace; add `-n <namespace>` or
+`--all-namespaces` (with `kubectl annotate buckets --all-namespaces -l …`) as
+needed.
+
 ## Deletion behavior
 
 Deleting a `Bucket` CR tears down the access key, credentials group, bucket and

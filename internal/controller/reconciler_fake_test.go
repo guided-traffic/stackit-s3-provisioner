@@ -677,3 +677,67 @@ func TestEnsureAdminRebootstrap(t *testing.T) {
 		}
 	})
 }
+
+func TestReconcileRotateCredentials(t *testing.T) {
+	ctx := context.Background()
+	e := newTestEnv(t)
+	b := e.provision(t, newBucketCR("team-a", "app-data"))
+	keyBefore := b.Status.AccessKeyID
+
+	setTrigger := func(v string) {
+		b = e.getBucket(t, "team-a", "app-data")
+		if b.Annotations == nil {
+			b.Annotations = map[string]string{}
+		}
+		b.Annotations[s3v1.RotateCredentialsAtAnnotation] = v
+		if err := e.k8s.Update(ctx, b); err != nil {
+			t.Fatalf("set rotation annotation: %v", err)
+		}
+	}
+
+	// New trigger value rotates: fresh key, secret rewritten, trigger recorded.
+	setTrigger("2026-07-16T10:00:00Z")
+	e.reconcileN(t, "team-a", "app-data", 1)
+	b = e.getBucket(t, "team-a", "app-data")
+	if b.Status.AccessKeyID == keyBefore {
+		t.Error("access key not rotated on new trigger")
+	}
+	if b.Status.LastRotationTrigger != "2026-07-16T10:00:00Z" {
+		t.Errorf("lastRotationTrigger = %q, want the annotation value", b.Status.LastRotationTrigger)
+	}
+	if b.Status.LastRotationTime == nil {
+		t.Error("lastRotationTime not set")
+	}
+	if got := e.fake.KeyCount(workloadGroupName(b)); got != 1 {
+		t.Errorf("workload group key count = %d, want exactly 1 (old key cleared)", got)
+	}
+	var sec corev1.Secret
+	if err := e.k8s.Get(ctx, types.NamespacedName{Namespace: "team-a", Name: "app-data-s3"}, &sec); err != nil {
+		t.Fatalf("get workload secret: %v", err)
+	}
+	if got := string(sec.Data[s3v1.DefaultAccessKeyIDKey]); got != b.Status.AccessKeyID {
+		t.Errorf("secret access key id = %q, want rotated %q", got, b.Status.AccessKeyID)
+	}
+	if !e.rec.hasReason(reasonRotated) {
+		t.Errorf("missing %s event; events: %+v", reasonRotated, e.rec.events)
+	}
+
+	// Unchanged trigger is level-triggered: no re-rotation.
+	keyRotated := b.Status.AccessKeyID
+	e.reconcileN(t, "team-a", "app-data", 2)
+	b = e.getBucket(t, "team-a", "app-data")
+	if b.Status.AccessKeyID != keyRotated {
+		t.Errorf("access key re-rotated on unchanged trigger: %q -> %q", keyRotated, b.Status.AccessKeyID)
+	}
+
+	// Changed trigger value rotates again.
+	setTrigger("2026-07-17T10:00:00Z")
+	e.reconcileN(t, "team-a", "app-data", 1)
+	b = e.getBucket(t, "team-a", "app-data")
+	if b.Status.AccessKeyID == keyRotated {
+		t.Error("access key not rotated on changed trigger")
+	}
+	if b.Status.LastRotationTrigger != "2026-07-17T10:00:00Z" {
+		t.Errorf("lastRotationTrigger = %q, want the new annotation value", b.Status.LastRotationTrigger)
+	}
+}
