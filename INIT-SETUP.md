@@ -276,6 +276,10 @@ in den frisch provisionierten Bucket. Kern-Entscheidungen:
   (stabiler Prozent-Nenner). Helm-`NetworkPolicy` (`clone.networkPolicy.enabled`,
   Default an) beschränkt Ingress auf Port 5572 auf den Operator-Pod — die
   rc-API kann auch Kommandos ausführen, daher Passwort + Policy.
+- **Addressing-Style:** Quelle default **path-style** (`FORCE_PATH_STYLE=true`,
+  S3-kompatibler Standard); `cloneFrom.addressingStyle: virtual-hosted` schaltet
+  Quelle auf `bucket.endpoint` (AWS-Stil, minio `BucketLookupDNS` fürs Messen,
+  rclone `FORCE_PATH_STYLE=false`). Ziel (StackIT) bleibt immer path-style.
 - **Semantik:** Clone-once — `status.clone.phase=Completed` ist terminal, spätere
   `cloneFrom`-Änderungen wirkungslos. Fehlgeschlagene Jobs werden gelöscht und mit
   Reconcile-Backoff neu erzeugt (rclone `copy` resumed, überspringt vorhandene

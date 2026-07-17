@@ -106,6 +106,17 @@ spec:
                   into this bucket after provisioning. See CloneFrom for details; by default
                   the workload credentials Secret is only written once the copy succeeded.
                 properties:
+                  addressingStyle:
+                    default: path
+                    description: |-
+                      AddressingStyle selects how the source bucket is addressed: "path"
+                      (endpoint.host/bucket — the S3-compatible default, works for StackIT,
+                      MinIO, Ceph, …) or "virtual-hosted" (bucket.endpoint.host — AWS's
+                      preferred style). Defaults to path.
+                    enum:
+                    - path
+                    - virtual-hosted
+                    type: string
                   bucket:
                     description: Bucket is the name of the source bucket at the endpoint.
                     minLength: 1

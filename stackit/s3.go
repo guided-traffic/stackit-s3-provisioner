@@ -98,6 +98,18 @@ type S3Admin struct {
 // host (TLS is assumed, the production case) or a scheme-qualified URL — an
 // explicit http:// endpoint (a local test fake) disables TLS.
 func NewS3Admin(endpoint, accessKeyID, secretAccessKey, region string) (*S3Admin, error) {
+	return newS3Client(endpoint, accessKeyID, secretAccessKey, region, minio.BucketLookupPath)
+}
+
+// NewS3VirtualHosted builds an S3 client that addresses buckets
+// virtual-hosted style (bucket.endpoint.host, AWS's preferred style). Used for
+// clone sources that request it; StackIT itself stays path-style.
+func NewS3VirtualHosted(endpoint, accessKeyID, secretAccessKey, region string) (*S3Admin, error) {
+	return newS3Client(endpoint, accessKeyID, secretAccessKey, region, minio.BucketLookupDNS)
+}
+
+// newS3Client is the shared constructor behind both addressing styles.
+func newS3Client(endpoint, accessKeyID, secretAccessKey, region string, lookup minio.BucketLookupType) (*S3Admin, error) {
 	host := endpoint
 	secure := true
 	switch {
@@ -110,10 +122,10 @@ func NewS3Admin(endpoint, accessKeyID, secretAccessKey, region string) (*S3Admin
 		Creds:        credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
 		Secure:       secure,
 		Region:       region,
-		BucketLookup: minio.BucketLookupPath,
+		BucketLookup: lookup,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("init s3 admin client for %s: %w", endpoint, err)
+		return nil, fmt.Errorf("init s3 client for %s: %w", endpoint, err)
 	}
 	return &S3Admin{mc: mc}, nil
 }

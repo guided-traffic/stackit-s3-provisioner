@@ -148,6 +148,8 @@ spec:
     endpoint: object.storage.eu01.onstackit.cloud  # host or URL of the source
     bucket: seed-data                              # source bucket name
     region: eu01                                   # optional (SigV4 signing)
+    addressingStyle: path                          # optional: path (default) or
+                                                   # virtual-hosted (AWS style)
     secretRef:
       name: seed-data-creds     # Secret with read access to the source bucket;
       keys:                     # must live in the Bucket's own namespace
@@ -162,6 +164,13 @@ privileges is deliberately not possible). Its data-key names are configurable
 via `cloneFrom.secretRef.keys`, and the defaults match what this operator writes
 into its own credentials Secrets — so a Secret provisioned for another `Bucket`
 works as a clone source as-is.
+
+**Addressing style.** The source is addressed path-style by default
+(`endpoint/bucket` — the norm for S3-compatible services like StackIT, MinIO or
+Ceph). For sources that prefer or require virtual-hosted addressing
+(`bucket.endpoint` — AWS's recommended style), set
+`cloneFrom.addressingStyle: virtual-hosted`. The destination (StackIT) always
+stays path-style.
 
 **Secret gating.** By default (`holdSecretUntilCloned: true`) the workload
 credentials Secret is only written once the copy finished successfully, so

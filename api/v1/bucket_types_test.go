@@ -409,6 +409,17 @@ func TestCloneFromEndpoint(t *testing.T) {
 	}
 }
 
+func TestCloneFromAddressingStyle(t *testing.T) {
+	c := &CloneFrom{}
+	assert.False(t, c.VirtualHosted(), "empty style defaults to path")
+
+	c.AddressingStyle = CloneAddressingPath
+	assert.False(t, c.VirtualHosted())
+
+	c.AddressingStyle = CloneAddressingVirtualHosted
+	assert.True(t, c.VirtualHosted())
+}
+
 func TestCloneSourceSecretKeys(t *testing.T) {
 	var keys CloneSourceSecretKeys
 	assert.Equal(t, DefaultAccessKeyIDKey, keys.AccessKeyIDKey())

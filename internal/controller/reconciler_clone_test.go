@@ -416,6 +416,33 @@ func TestCloneGuards(t *testing.T) {
 		}
 	})
 
+	t.Run("virtual-hosted addressing style", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.seedCloneSource(1)
+		b := e.newCloneBucketCR(t)
+		b.Spec.CloneFrom.AddressingStyle = s3v1.CloneAddressingVirtualHosted
+		if err := e.k8s.Create(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+		e.reconcileN(t, "team-a", "app-data", 1) // finalizer
+		// The fake's S3 endpoint is an IP, which cannot serve virtual-hosted
+		// requests (bucket.<ip> does not resolve) — skip the size measurement by
+		// pre-seeding totalBytes and assert the job's addressing config instead.
+		fresh := e.getBucket(t, "team-a", "app-data")
+		fresh.Status.Clone = &s3v1.CloneStatus{TotalBytes: 1}
+		if err := e.k8s.Status().Update(ctx, fresh); err != nil {
+			t.Fatal(err)
+		}
+		e.reconcileN(t, "team-a", "app-data", 1)
+		job := e.getCloneJob(t, b)
+		if got := envValue(t, job, "RCLONE_CONFIG_SRC_FORCE_PATH_STYLE").Value; got != "false" {
+			t.Errorf("SRC_FORCE_PATH_STYLE = %q, want false for virtual-hosted source", got)
+		}
+		if got := envValue(t, job, "RCLONE_CONFIG_DST_FORCE_PATH_STYLE").Value; got != "true" {
+			t.Errorf("DST_FORCE_PATH_STYLE = %q, destination must stay path-style", got)
+		}
+	})
+
 	t.Run("self-clone is refused", func(t *testing.T) {
 		e := newTestEnv(t)
 		b := e.newCloneBucketCR(t)

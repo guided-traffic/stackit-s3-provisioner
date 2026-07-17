@@ -164,7 +164,8 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   Beides → `Ready=Failed` ohne Requeue-Hammer.
 - **Bucket-Clone (`spec.cloneFrom`, INIT-SETUP.md §8.1):** einmaliger Copy eines fremden S3-Buckets
   via rclone-**Job** im Operator-NS (Image Helm `clone.image`). Quell-Creds aus User-Secret (nur
-  CR-Namespace, Keys via `secretRef.keys` konfigurierbar), Ziel = Admin-Key. Default
+  CR-Namespace, Keys via `secretRef.keys` konfigurierbar), Ziel = Admin-Key. Quelle default
+  path-style, `addressingStyle: virtual-hosted` für AWS-Stil (Ziel bleibt path-style). Default
   `holdSecretUntilCloned: true`: Workload-Secret erst nach Clone-Erfolg (Flow: Bucket → Policy →
   Clone → Key+Secret); `Ready` wartet immer auf den Clone. Fortschritt via rclone-rc (`--rc`,
   Basic-Auth 32-Zeichen-Passwort im Staging-Secret `…-src`, Helm-NetworkPolicy auf Port 5572) →

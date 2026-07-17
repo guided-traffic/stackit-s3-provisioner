@@ -318,6 +318,15 @@ type CloneFrom struct {
 	// +optional
 	Region string `json:"region,omitempty"`
 
+	// AddressingStyle selects how the source bucket is addressed: "path"
+	// (endpoint.host/bucket — the S3-compatible default, works for StackIT,
+	// MinIO, Ceph, …) or "virtual-hosted" (bucket.endpoint.host — AWS's
+	// preferred style). Defaults to path.
+	// +kubebuilder:validation:Enum=path;virtual-hosted
+	// +kubebuilder:default=path
+	// +optional
+	AddressingStyle string `json:"addressingStyle,omitempty"`
+
 	// SecretRef selects the Secret (in the Bucket's namespace) holding the
 	// credentials that can read the source bucket.
 	SecretRef CloneSourceSecretRef `json:"secretRef"`
@@ -329,6 +338,21 @@ type CloneFrom struct {
 	// +kubebuilder:default=true
 	// +optional
 	HoldSecretUntilCloned *bool `json:"holdSecretUntilCloned,omitempty"`
+}
+
+// Values of CloneFrom.AddressingStyle.
+const (
+	// CloneAddressingPath addresses the source as endpoint.host/bucket.
+	CloneAddressingPath = "path"
+	// CloneAddressingVirtualHosted addresses the source as bucket.endpoint.host.
+	CloneAddressingVirtualHosted = "virtual-hosted"
+)
+
+// VirtualHosted reports whether the source bucket must be addressed
+// virtual-hosted style. An empty AddressingStyle means path style (the CRD
+// default; offline clients see the zero value).
+func (c *CloneFrom) VirtualHosted() bool {
+	return c.AddressingStyle == CloneAddressingVirtualHosted
 }
 
 // HoldSecret reports whether the workload Secret must be withheld until the

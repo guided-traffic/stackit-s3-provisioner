@@ -123,6 +123,16 @@ func validateCloneSource(b *s3v1.Bucket, name, destHost string) error {
 	return nil
 }
 
+// newCloneSourceClient builds the S3 client used to measure the clone source,
+// honoring the requested addressing style (path by default, virtual-hosted for
+// AWS-style endpoints).
+func newCloneSourceClient(src *s3v1.CloneFrom, accessKeyID, secretAccessKey string) (*stackit.S3Admin, error) {
+	if src.VirtualHosted() {
+		return stackit.NewS3VirtualHosted(src.EndpointURL(), accessKeyID, secretAccessKey, src.Region)
+	}
+	return stackit.NewS3Admin(src.EndpointURL(), accessKeyID, secretAccessKey, src.Region)
+}
+
 // cloneSourceCreds reads the clone-source S3 credentials from the Secret
 // referenced by spec.cloneFrom.secretRef, which must live in the Bucket's own
 // namespace (see CloneSourceSecretRef).
@@ -171,7 +181,7 @@ func (r *BucketReconciler) ensureClone(ctx context.Context, b *s3v1.Bucket, name
 	// percentage keeps a stable denominator (rclone's own totalBytes grows
 	// while it scans).
 	if b.Status.Clone.TotalBytes == 0 {
-		srcS3, err := stackit.NewS3Admin(src.EndpointURL(), srcAK, srcSK, src.Region)
+		srcS3, err := newCloneSourceClient(src, srcAK, srcSK)
 		if err != nil {
 			res, rerr := r.fail(ctx, b, fmt.Errorf("build clone source client: %w", err))
 			return false, res, rerr
@@ -366,7 +376,7 @@ func (r *BucketReconciler) buildCloneJob(b *s3v1.Bucket, destBucket, destEndpoin
 		{Name: "RCLONE_CONFIG_SRC_TYPE", Value: "s3"},
 		{Name: "RCLONE_CONFIG_SRC_PROVIDER", Value: "Other"},
 		{Name: "RCLONE_CONFIG_SRC_ENDPOINT", Value: src.EndpointURL()},
-		{Name: "RCLONE_CONFIG_SRC_FORCE_PATH_STYLE", Value: "true"},
+		{Name: "RCLONE_CONFIG_SRC_FORCE_PATH_STYLE", Value: strconv.FormatBool(!src.VirtualHosted())},
 		secretEnv("RCLONE_CONFIG_SRC_ACCESS_KEY_ID", stagingName, cloneSecretKeyAccessKeyID),
 		secretEnv("RCLONE_CONFIG_SRC_SECRET_ACCESS_KEY", stagingName, cloneSecretKeySecretAccessKey),
 		{Name: "RCLONE_CONFIG_DST_TYPE", Value: "s3"},
