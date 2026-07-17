@@ -182,16 +182,15 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, nil
 	}
 
-	// Ensure the finalizer is present before doing any provisioning work.
+	// Ensure the finalizer is present before doing any provisioning work, then
+	// continue in the same pass (the Update refreshed the in-memory object, and
+	// the Bucket watch filters on generation/annotation changes, so this
+	// metadata-only update would not re-trigger a reconcile by itself).
 	if !controllerutil.ContainsFinalizer(&bucket, s3v1.BucketFinalizer) {
 		controllerutil.AddFinalizer(&bucket, s3v1.BucketFinalizer)
 		if err := r.Update(ctx, &bucket); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Requeue explicitly to work on a fresh object: the Bucket watch filters
-		// on generation/annotation changes, so this metadata-only update does not
-		// re-trigger a reconcile by itself.
-		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Skeleton mode: no service-account key configured, so no cloud calls.

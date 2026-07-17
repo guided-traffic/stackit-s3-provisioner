@@ -62,12 +62,8 @@ func (e *testEnv) startClone(t *testing.T, b *s3v1.Bucket) *batchv1.Job {
 	if err := e.k8s.Create(context.Background(), b); err != nil {
 		t.Fatalf("create bucket CR: %v", err)
 	}
-	// 1st reconcile adds the finalizer, 2nd provisions up to the running clone.
+	// One reconcile adds the finalizer and provisions up to the running clone.
 	res, err := e.reconcile(t, b.Namespace, b.Name)
-	if err != nil || !res.Requeue {
-		t.Fatalf("finalizer reconcile = %+v, %v; want explicit requeue", res, err)
-	}
-	res, err = e.reconcile(t, b.Namespace, b.Name)
 	if err != nil {
 		t.Fatalf("clone-start reconcile: %v", err)
 	}
@@ -353,7 +349,6 @@ func TestCloneGuards(t *testing.T) {
 		if err := e.k8s.Create(ctx, b); err != nil {
 			t.Fatal(err)
 		}
-		e.reconcileN(t, "team-a", "app-data", 1)
 		if _, err := e.reconcile(t, "team-a", "app-data"); err == nil {
 			t.Fatal("reconcile without source secret succeeded, want error")
 		}
@@ -377,7 +372,6 @@ func TestCloneGuards(t *testing.T) {
 		if err := e.k8s.Create(ctx, b); err != nil {
 			t.Fatal(err)
 		}
-		e.reconcileN(t, "team-a", "app-data", 1)
 		if _, err := e.reconcile(t, "team-a", "app-data"); err == nil {
 			t.Fatal("reconcile with incomplete source secret succeeded, want error")
 		}
@@ -424,7 +418,6 @@ func TestCloneGuards(t *testing.T) {
 		if err := e.k8s.Create(ctx, b); err != nil {
 			t.Fatal(err)
 		}
-		e.reconcileN(t, "team-a", "app-data", 1) // finalizer
 		// The fake's S3 endpoint is an IP, which cannot serve virtual-hosted
 		// requests (bucket.<ip> does not resolve) — skip the size measurement by
 		// pre-seeding totalBytes and assert the job's addressing config instead.

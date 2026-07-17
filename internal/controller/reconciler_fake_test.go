@@ -155,7 +155,8 @@ func (e *testEnv) provision(t *testing.T, b *s3v1.Bucket) *s3v1.Bucket {
 	if err := e.k8s.Create(context.Background(), b); err != nil {
 		t.Fatalf("create bucket CR: %v", err)
 	}
-	// 1st reconcile adds the finalizer, 2nd provisions.
+	// One reconcile adds the finalizer and provisions; the second proves the
+	// result is stable (idempotent re-reconcile).
 	e.reconcileN(t, b.Namespace, b.Name, 2)
 	got := e.getBucket(t, b.Namespace, b.Name)
 	if got.Status.Phase != s3v1.PhaseReady {
@@ -404,7 +405,7 @@ func TestReconcileTransientCloudError(t *testing.T) {
 	if err := e.k8s.Create(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	e.reconcileN(t, "team-a", "app-data", 1) // finalizer
+	e.reconcileN(t, "team-a", "app-data", 1) // provisions successfully
 
 	e.fake.FailNext("ListBuckets", 500)
 	if _, err := e.reconcile(t, "team-a", "app-data"); err == nil {
@@ -671,7 +672,6 @@ func TestEnsureAdminRebootstrap(t *testing.T) {
 		if err := e.k8s.Create(ctx, b); err != nil {
 			t.Fatal(err)
 		}
-		e.reconcileN(t, "team-a", "app-data", 1) // finalizer
 		if _, err := e.reconcile(t, "team-a", "app-data"); err == nil {
 			t.Fatal("reconcile without operator namespace succeeded, want error")
 		}
