@@ -98,6 +98,18 @@ type S3Admin struct {
 // host (TLS is assumed, the production case) or a scheme-qualified URL — an
 // explicit http:// endpoint (a local test fake) disables TLS.
 func NewS3Admin(endpoint, accessKeyID, secretAccessKey, region string) (*S3Admin, error) {
+	return newS3Client(endpoint, accessKeyID, secretAccessKey, region, minio.BucketLookupPath)
+}
+
+// NewS3VirtualHosted builds an S3 client that addresses buckets
+// virtual-hosted style (bucket.endpoint.host, AWS's preferred style). Used for
+// clone sources that request it; StackIT itself stays path-style.
+func NewS3VirtualHosted(endpoint, accessKeyID, secretAccessKey, region string) (*S3Admin, error) {
+	return newS3Client(endpoint, accessKeyID, secretAccessKey, region, minio.BucketLookupDNS)
+}
+
+// newS3Client is the shared constructor behind both addressing styles.
+func newS3Client(endpoint, accessKeyID, secretAccessKey, region string, lookup minio.BucketLookupType) (*S3Admin, error) {
 	host := endpoint
 	secure := true
 	switch {
@@ -110,10 +122,10 @@ func NewS3Admin(endpoint, accessKeyID, secretAccessKey, region string) (*S3Admin
 		Creds:        credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
 		Secure:       secure,
 		Region:       region,
-		BucketLookup: minio.BucketLookupPath,
+		BucketLookup: lookup,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("init s3 admin client for %s: %w", endpoint, err)
+		return nil, fmt.Errorf("init s3 client for %s: %w", endpoint, err)
 	}
 	return &S3Admin{mc: mc}, nil
 }
@@ -204,6 +216,27 @@ func (s *S3Admin) WipeBucket(ctx context.Context, bucket string) error {
 		return fmt.Errorf("wipe bucket %q: list objects: %w", bucket, listErr)
 	}
 	return nil
+}
+
+// BucketUsage returns the total size in bytes of all current objects in the
+// bucket (one recursive listing pass). The clone feature measures the source
+// bucket once before copying so the progress percentage has a stable
+// denominator; S3Admin doubles as the client for arbitrary S3-compatible
+// clone-source endpoints here.
+func (s *S3Admin) BucketUsage(ctx context.Context, bucket string) (int64, error) {
+	// Cancel the listing on early return so minio's producer goroutine does not
+	// block on an unread channel.
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var total int64
+	for obj := range s.mc.ListObjects(lctx, bucket, minio.ListObjectsOptions{Recursive: true}) {
+		if obj.Err != nil {
+			return 0, fmt.Errorf("list objects in %q: %w", bucket, obj.Err)
+		}
+		total += obj.Size
+	}
+	return total, nil
 }
 
 // BucketEmpty reports whether the bucket holds no objects. It is used to enforce

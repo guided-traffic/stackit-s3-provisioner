@@ -248,6 +248,52 @@ Das hält Layer-2-Isolation pro CR zusammen und vermeidet verwaiste Groups.
 **Idempotenz/Drift:** Jeder Reconcile gleicht Ist (List/Get) gegen Soll ab; Policy wird
 bei Abweichung neu gesetzt (Self-Healing gegen manuelle Änderungen).
 
+### 8.1 Bucket-Clone via rclone-Job (`spec.cloneFrom`) — implementiert (2026-07-17)
+
+Einmaliger Copy eines existierenden S3-Buckets (beliebiger S3-kompatibler Endpoint)
+in den frisch provisionierten Bucket. Kern-Entscheidungen:
+
+- **Ausführung als Kubernetes Job** (Image `rclone/rclone`, Helm `clone.image`,
+  Renovate-getrackt) im **Operator-Namespace** — überlebt Operator-Restarts,
+  resource-limitiert (`clone.resources` → `CLONE_JOB_RESOURCES`), Credentials
+  bleiben aus Workload-Namespaces raus.
+- **Credentials-Handhabung:** Ziel-Seite authentifiziert mit dem **Admin-S3-Key**
+  (direkt per `secretKeyRef` aufs Admin-Secret — kein zusätzliches Staging, kein
+  Escalation-Gewinn, da Job im Operator-NS läuft). Quell-Credentials liest der
+  Operator aus dem User-Secret (**nur CR-Namespace**, bewusst kein
+  `namespace`-Feld — sonst könnte ein CR-Autor fremde Secrets exfiltrieren) und
+  staged sie in ein Secret `s3op-clone-…-src` im Operator-NS.
+- **Secret-Gating:** Default `holdSecretUntilCloned: true` — das Workload-Secret
+  wird erst nach erfolgreichem Clone geschrieben (reine Flow-Reihenfolge:
+  Bucket → Policy → Clone → Key+Secret). Bei `false` kommt das Secret sofort,
+  `Ready` wartet trotzdem auf den Clone.
+- **Fortschritt via rclone Remote-Control:** Job läuft mit
+  `--rc --rc-addr=:5572`, Basic-Auth (User `operator`, 32-Zeichen-Zufallspasswort
+  im Staging-Secret). Operator pollt alle 15s `POST /core/stats` auf der Pod-IP
+  und schreibt `status.clone` (`bytesCopied`, `totalBytes`, `progress` à la
+  „2.0 GiB / 18.0 GiB (11%)“, `rate`, `eta`; Printer-Column `Clone`).
+  Gesamtgröße wird **einmal vor Job-Start** vom Operator per List gemessen
+  (stabiler Prozent-Nenner). Helm-`NetworkPolicy` (`clone.networkPolicy.enabled`,
+  Default an) beschränkt Ingress auf Port 5572 auf den Operator-Pod — die
+  rc-API kann auch Kommandos ausführen, daher Passwort + Policy.
+- **Addressing-Style:** Quelle default **path-style** (`FORCE_PATH_STYLE=true`,
+  S3-kompatibler Standard); `cloneFrom.addressingStyle: virtual-hosted` schaltet
+  Quelle auf `bucket.endpoint` (AWS-Stil, minio `BucketLookupDNS` fürs Messen,
+  rclone `FORCE_PATH_STYLE=false`). Ziel (StackIT) bleibt immer path-style.
+- **Semantik:** Clone-once — `status.clone.phase=Completed` ist terminal, spätere
+  `cloneFrom`-Änderungen wirkungslos. Fehlgeschlagene Jobs werden gelöscht und mit
+  Reconcile-Backoff neu erzeugt (rclone `copy` resumed, überspringt vorhandene
+  Objekte; merged, löscht nie). Self-Clone (gleicher Endpoint + Bucket) wird als
+  Config-Fehler abgewiesen. Completed-Status wird **vor** dem Aufräumen von
+  Job/Staging-Secret persistiert (crash-safe, kein Doppel-Clone); Job-TTL 1h als
+  Backstop, Teardown räumt laufende Clones mit ab.
+- **Watch-Hygiene:** Bucket-Watch filtert auf Generation-/Annotation-Änderungen
+  (`predicate.Or(GenerationChanged, AnnotationChanged)`) — sonst würde jedes
+  Progress-Status-Update sofort re-reconcilen (Hot-Loop). Finalizer-Add requeued
+  deshalb explizit. Job-Events mappen über Annotations (`bucket-namespace`/`-name`)
+  zurück auf die CR (Cross-Namespace-OwnerRef nicht erlaubt).
+- **RBAC neu:** `batch/jobs` CRUD + `pods` get/list/watch (Pod-IP für rc-Polling).
+
 ## 9. Machbarkeits-Smoke-Test — VERIFIZIERT (2026-06-30)
 
 Minimaler Go-Code gegen die **echte** StackIT-API, mit beiden Service-Account-Keys

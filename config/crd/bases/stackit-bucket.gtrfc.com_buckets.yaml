@@ -37,6 +37,11 @@ spec:
       jsonPath: .spec.region
       name: Region
       type: string
+    - description: Clone transfer progress
+      jsonPath: .status.clone.progress
+      name: Clone
+      priority: 1
+      type: string
     - description: Physical bucket name in StackIT Object Storage
       jsonPath: .status.resolvedBucketName
       name: Resolved
@@ -91,6 +96,83 @@ spec:
                 x-kubernetes-validations:
                 - message: bucketName is immutable
                   rule: self == oldSelf
+              cloneFrom:
+                description: |-
+                  CloneFrom requests a one-shot copy of an existing S3 bucket's contents
+                  into this bucket after provisioning. See CloneFrom for details; by default
+                  the workload credentials Secret is only written once the copy succeeded.
+                properties:
+                  addressingStyle:
+                    default: path
+                    description: |-
+                      AddressingStyle selects how the source bucket is addressed: "path"
+                      (endpoint.host/bucket — the S3-compatible default, works for StackIT,
+                      MinIO, Ceph, …) or "virtual-hosted" (bucket.endpoint.host — AWS's
+                      preferred style). Defaults to path.
+                    enum:
+                    - path
+                    - virtual-hosted
+                    type: string
+                  bucket:
+                    description: Bucket is the name of the source bucket at the endpoint.
+                    minLength: 1
+                    type: string
+                  endpoint:
+                    description: |-
+                      Endpoint is the S3 endpoint of the source bucket, as a bare host
+                      (TLS assumed, e.g. object.storage.eu01.onstackit.cloud) or a
+                      scheme-qualified URL.
+                    minLength: 1
+                    type: string
+                  holdSecretUntilCloned:
+                    default: true
+                    description: |-
+                      HoldSecretUntilCloned delays writing the workload credentials Secret until
+                      the clone completed successfully, so consuming workloads never start
+                      against a partially copied bucket. Disable to publish the credentials
+                      immediately; the Ready condition still waits for the clone either way.
+                    type: boolean
+                  region:
+                    description: |-
+                      Region is the region of the source endpoint, when it requires one for
+                      SigV4 signing (e.g. eu01 for StackIT, eu-central-1 for AWS).
+                    type: string
+                  secretRef:
+                    description: |-
+                      SecretRef selects the Secret (in the Bucket's namespace) holding the
+                      credentials that can read the source bucket.
+                    properties:
+                      keys:
+                        description: Keys overrides the data-key names the credentials
+                          are read from.
+                        properties:
+                          accessKeyID:
+                            description: |-
+                              AccessKeyID overrides the key holding the source S3 access key id.
+                              Defaults to AWS_ACCESS_KEY_ID.
+                            pattern: ^[-._a-zA-Z0-9]+$
+                            type: string
+                          secretAccessKey:
+                            description: |-
+                              SecretAccessKey overrides the key holding the source S3 secret.
+                              Defaults to AWS_SECRET_ACCESS_KEY.
+                            pattern: ^[-._a-zA-Z0-9]+$
+                            type: string
+                        type: object
+                      name:
+                        description: |-
+                          Name of the Secret (in the Bucket's namespace) holding the source
+                          credentials.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - bucket
+                - endpoint
+                - secretRef
+                type: object
               region:
                 default: eu01
                 description: Region is the StackIT region the bucket is provisioned
@@ -184,6 +266,55 @@ spec:
                 description: BucketURL is the path-style S3 endpoint URL of the provisioned
                   bucket.
                 type: string
+              clone:
+                description: |-
+                  Clone is the observed state of the spec.cloneFrom operation. It is only
+                  set on Buckets that request a clone; once Phase is Completed it is
+                  terminal and the clone never runs again.
+                properties:
+                  bytesCopied:
+                    description: |-
+                      BytesCopied is the number of bytes transferred so far (from rclone's
+                      remote-control stats, refreshed while the clone runs).
+                    format: int64
+                    type: integer
+                  completedAt:
+                    description: CompletedAt is when the clone finished successfully.
+                    format: date-time
+                    type: string
+                  eta:
+                    description: ETA is rclone's estimated time to completion, e.g.
+                      "6m30s".
+                    type: string
+                  message:
+                    description: Message carries a short failure reason while Phase
+                      is Failed.
+                    type: string
+                  phase:
+                    description: Phase is the coarse clone lifecycle state.
+                    enum:
+                    - Running
+                    - Completed
+                    - Failed
+                    type: string
+                  progress:
+                    description: Progress is a human-readable transfer summary, e.g.
+                      "2.0 GiB / 18.0 GiB (11%)".
+                    type: string
+                  rate:
+                    description: Rate is the current transfer rate, e.g. "42.0 MiB/s".
+                    type: string
+                  startedAt:
+                    description: StartedAt is when the first clone job was created.
+                    format: date-time
+                    type: string
+                  totalBytes:
+                    description: |-
+                      TotalBytes is the total size of the source bucket, measured once before
+                      the copy starts so the progress percentage has a stable denominator.
+                    format: int64
+                    type: integer
+                type: object
               conditions:
                 description: Conditions represent the latest available observations
                   of the bucket's state.

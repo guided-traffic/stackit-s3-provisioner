@@ -2,10 +2,12 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"os"
 	"strconv"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -45,6 +47,7 @@ func main() {
 	var bucketNameIncludeNamespace bool
 	var ownershipName string
 	var enableWipeOnDelete bool
+	var cloneImage string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -82,6 +85,10 @@ func main() {
 			"are deleted before the bucket is removed on CR deletion. Can also be set via "+
 			"ENABLE_WIPE_ON_DELETE. When disabled, a requested wipe degrades to the safe "+
 			"empty-only delete guard and a warning event is emitted.")
+	flag.StringVar(&cloneImage, "clone-image",
+		envOrDefault("CLONE_IMAGE", controller.DefaultCloneImage),
+		"Container image run by clone Jobs (spec.cloneFrom); an rclone image. "+
+			"Can also be set via CLONE_IMAGE.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -142,6 +149,17 @@ func main() {
 		setupLog.Info("no StackIT service-account key configured; running in skeleton mode")
 	}
 
+	// Clone Job pod resources are passed as a JSON-encoded
+	// corev1.ResourceRequirements (Helm renders clone.resources into
+	// CLONE_JOB_RESOURCES); empty applies none.
+	var cloneResources corev1.ResourceRequirements
+	if v := os.Getenv("CLONE_JOB_RESOURCES"); v != "" {
+		if err := json.Unmarshal([]byte(v), &cloneResources); err != nil {
+			setupLog.Error(err, "invalid CLONE_JOB_RESOURCES JSON")
+			os.Exit(1)
+		}
+	}
+
 	if err = (&controller.BucketReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
@@ -152,6 +170,8 @@ func main() {
 		AdminSecretNamespace: operatorNamespace,
 		OwnershipName:        ownershipName,
 		EnableWipeOnDelete:   enableWipeOnDelete,
+		CloneImage:           cloneImage,
+		CloneJobResources:    cloneResources,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Bucket")
 		os.Exit(1)

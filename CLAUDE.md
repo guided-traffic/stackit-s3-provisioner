@@ -27,6 +27,7 @@ stackit/s3_fake_test.go                  Offline-Tests Data-Plane inkl. WipeBuck
 api/v1/bucket_types.go                    CRD `Bucket` (stackit-bucket.gtrfc.com/v1) + Helper, +kubebuilder-Marker
 cmd/main.go                              controller-runtime Manager (stackit.Client + Admin-Secret-Name/-Namespace)
 internal/controller/bucket_controller.go Reconciler (VOLL: §8-Provisioning + Admin-Bootstrap + Finalizer-Teardown)
+internal/controller/clone.go             Bucket-Clone (spec.cloneFrom): rclone-Job, Staging-Secret, rc-Progress-Polling
 internal/controller/reconciler_*_test.go Offline-Reconciler-Tests (fake k8s-Client + stackitfake, inkl. Fehlerpfade)
 internal/stackitfake/                    In-Memory-Fake der StackIT-API (Control-Plane REST + S3-XML) für Offline-Tests
 config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
@@ -161,12 +162,23 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
 - **Guards (produktionssicher):** CR darf `secretRef` **nicht** aufs Admin-Secret zeigen (sonst
   Pollution + Admin-Lockout beim Delete); `spec.region` muss = Operator-Region sein (Single-Region v1).
   Beides → `Ready=Failed` ohne Requeue-Hammer.
+- **Bucket-Clone (`spec.cloneFrom`, INIT-SETUP.md §8.1):** einmaliger Copy eines fremden S3-Buckets
+  via rclone-**Job** im Operator-NS (Image Helm `clone.image`). Quell-Creds aus User-Secret (nur
+  CR-Namespace, Keys via `secretRef.keys` konfigurierbar), Ziel = Admin-Key. Quelle default
+  path-style, `addressingStyle: virtual-hosted` für AWS-Stil (Ziel bleibt path-style). Default
+  `holdSecretUntilCloned: true`: Workload-Secret erst nach Clone-Erfolg (Flow: Bucket → Policy →
+  Clone → Key+Secret); `Ready` wartet immer auf den Clone. Fortschritt via rclone-rc (`--rc`,
+  Basic-Auth 32-Zeichen-Passwort im Staging-Secret `…-src`, Helm-NetworkPolicy auf Port 5572) →
+  `status.clone.progress` („2.0 GiB / 18.0 GiB (11%)“), Poll alle 15s. Clone-once (`Completed`
+  terminal), Failed-Job → Delete + Backoff-Retry (rclone resumed). **Bucket-Watch filtert auf
+  Generation/Annotation** (sonst Hot-Loop durch Progress-Writes) — Finalizer-Add requeued explizit.
 
 ## Nächster Schritt
 
 Reconciler steht + alle Offline/lint/envtest-Checks grün. **Offen:** (1) End-to-End-Provisioning gegen
 die **echte** StackIT-API testen (analog `stackit/credentials_integration_test.go`, aber über den
-Reconciler); (2) e2e-Smoke (`make e2e-local`) mit echtem SA-Key gegen Kind; (3) Q2 (Minimal-Rolle),
+Reconciler); (2) e2e-Smoke (`make e2e-local`) mit echtem SA-Key gegen Kind — inkl. Clone-Feature mit
+echtem rclone-Image (offline nur mit Fake-Job-Lifecycle getestet); (3) Q2 (Minimal-Rolle),
 Q4 (Bucket-Namensraum) klären. RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) —
 bereits von den cluster-weiten Secret-RBAC-Markern abgedeckt.
 </content>

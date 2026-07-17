@@ -26,8 +26,6 @@ func failNextCloudOp(t *testing.T, op string, status int) {
 	if err := e.k8s.Create(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	e.reconcileN(t, "team-a", "app-data", 1) // finalizer only
-
 	e.fake.FailNext(op, status)
 	if _, err := e.reconcile(t, "team-a", "app-data"); err == nil {
 		t.Fatalf("reconcile with injected %s=%d succeeded, want error", op, status)
@@ -62,7 +60,6 @@ func TestReconcileProvisioningErrorPaths(t *testing.T) {
 				if err := e.k8s.Create(context.Background(), b); err != nil {
 					t.Fatal(err)
 				}
-				e.reconcileN(t, "team-a", "app-data", 1)
 				if _, err := e.reconcile(t, "team-a", "app-data"); err == nil {
 					t.Fatal("reconcile succeeded, want error")
 				}
@@ -201,7 +198,6 @@ func TestSecretWriteFailureRollsBackAccessKey(t *testing.T) {
 	if err := e.k8s.Create(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	e.reconcileN(t, "team-a", "app-data", 1) // finalizer
 	if _, err := e.reconcile(t, "team-a", "app-data"); err == nil {
 		t.Fatal("reconcile succeeded although the secret write fails, want error")
 	}
@@ -227,7 +223,6 @@ func TestAdminSecretWriteFailureRollsBackAdminKey(t *testing.T) {
 	if err := e.k8s.Create(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	e.reconcileN(t, "team-a", "app-data", 1)
 	if _, err := e.reconcile(t, "team-a", "app-data"); err == nil {
 		t.Fatal("reconcile succeeded although the admin secret write fails, want error")
 	}

@@ -265,6 +265,19 @@
       "versioningTemplate": "semver"
     },
     {
+      "description": "Update the rclone clone-job image default pinned in Go code (kept in sync with the helm-values managed clone.image tag)",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^internal/controller/clone\\.go$/"
+      ],
+      "matchStrings": [
+        "DefaultCloneImage = \"rclone/rclone:(?<currentValue>[\\d.]+)\""
+      ],
+      "depNameTemplate": "rclone/rclone",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
+    },
+    {
       "description": "Update Go version in Containerfile",
       "customType": "regex",
       "managerFilePatterns": [

@@ -366,3 +366,82 @@ func TestPendingRotationTrigger(t *testing.T) {
 		})
 	}
 }
+
+func TestCloneFromHoldSecret(t *testing.T) {
+	boolPtr := func(v bool) *bool { return &v }
+	tests := []struct {
+		name string
+		c    *CloneFrom
+		want bool
+	}{
+		{name: "nil clone never holds", c: nil, want: false},
+		{name: "unset defaults to hold", c: &CloneFrom{}, want: true},
+		{name: "explicit true holds", c: &CloneFrom{HoldSecretUntilCloned: boolPtr(true)}, want: true},
+		{name: "explicit false publishes immediately", c: &CloneFrom{HoldSecretUntilCloned: boolPtr(false)}, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.c.HoldSecret())
+		})
+	}
+}
+
+func TestCloneFromEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		wantURL  string
+		wantHost string
+	}{
+		{name: "bare host assumes https", endpoint: "object.storage.eu01.onstackit.cloud",
+			wantURL: "https://object.storage.eu01.onstackit.cloud", wantHost: "object.storage.eu01.onstackit.cloud"},
+		{name: "https url kept", endpoint: "https://s3.example.com",
+			wantURL: "https://s3.example.com", wantHost: "s3.example.com"},
+		{name: "http url kept (test fakes)", endpoint: "http://127.0.0.1:9000",
+			wantURL: "http://127.0.0.1:9000", wantHost: "127.0.0.1:9000"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &CloneFrom{Endpoint: tc.endpoint}
+			assert.Equal(t, tc.wantURL, c.EndpointURL())
+			assert.Equal(t, tc.wantHost, c.EndpointHost())
+		})
+	}
+}
+
+func TestCloneFromAddressingStyle(t *testing.T) {
+	c := &CloneFrom{}
+	assert.False(t, c.VirtualHosted(), "empty style defaults to path")
+
+	c.AddressingStyle = CloneAddressingPath
+	assert.False(t, c.VirtualHosted())
+
+	c.AddressingStyle = CloneAddressingVirtualHosted
+	assert.True(t, c.VirtualHosted())
+}
+
+func TestCloneSourceSecretKeys(t *testing.T) {
+	var keys CloneSourceSecretKeys
+	assert.Equal(t, DefaultAccessKeyIDKey, keys.AccessKeyIDKey())
+	assert.Equal(t, DefaultSecretAccessKeyKey, keys.SecretAccessKeyKey())
+
+	keys = CloneSourceSecretKeys{AccessKeyID: "SRC_AK", SecretAccessKey: "SRC_SK"}
+	assert.Equal(t, "SRC_AK", keys.AccessKeyIDKey())
+	assert.Equal(t, "SRC_SK", keys.SecretAccessKeyKey())
+}
+
+func TestClonePendingAndCompleted(t *testing.T) {
+	b := newBucket("team-a")
+	assert.False(t, b.ClonePending(), "no cloneFrom: nothing pending")
+	assert.False(t, b.CloneCompleted())
+
+	b.Spec.CloneFrom = &CloneFrom{Endpoint: "s3.example.com", Bucket: "src"}
+	assert.True(t, b.ClonePending(), "requested clone without status is pending")
+
+	b.Status.Clone = &CloneStatus{Phase: ClonePhaseRunning}
+	assert.True(t, b.ClonePending(), "running clone is still pending")
+
+	b.Status.Clone.Phase = ClonePhaseCompleted
+	assert.False(t, b.ClonePending(), "completed clone never runs again")
+	assert.True(t, b.CloneCompleted())
+}

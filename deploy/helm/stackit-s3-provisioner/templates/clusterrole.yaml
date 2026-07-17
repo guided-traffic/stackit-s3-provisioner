@@ -45,6 +45,26 @@ rules:
       - patch
       - update
       - watch
+  # Clone Jobs (spec.cloneFrom) in the operator namespace + pod lookup for
+  # polling rclone's remote-control stats
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
   # Events for status reporting (core + events.k8s.io broadcaster API)
   - apiGroups:
       - ""

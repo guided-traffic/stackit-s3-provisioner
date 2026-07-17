@@ -58,11 +58,16 @@ spec:
             {{- if .Values.wipeOnDelete.enabled }}
             - --enable-wipe-on-delete
             {{- end }}
+            - --clone-image={{ .Values.clone.image.repository }}:{{ .Values.clone.image.tag }}
           env:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- with .Values.clone.resources }}
+            - name: CLONE_JOB_RESOURCES
+              value: {{ toJson . | quote }}
+            {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

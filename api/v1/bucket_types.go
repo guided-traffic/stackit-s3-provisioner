@@ -14,6 +14,11 @@ const (
 	// and the workload credentials Secret is in place.
 	ConditionReady = "Ready"
 
+	// ConditionCloneCompleted tracks the spec.cloneFrom feature: it is True once
+	// the source bucket's contents have been copied into this bucket. It is only
+	// set on Buckets that request a clone.
+	ConditionCloneCompleted = "CloneCompleted"
+
 	// ReasonProvisioned indicates the bucket and its credentials are ready.
 	ReasonProvisioned = "Provisioned"
 	// ReasonProvisioning indicates provisioning is in progress.
@@ -23,6 +28,13 @@ const (
 	// ReasonNotImplemented is set by the operator skeleton: the controller wiring
 	// is in place but the StackIT provisioning flow is not yet implemented.
 	ReasonNotImplemented = "NotImplemented"
+
+	// ReasonCloning indicates the clone job is copying the source bucket.
+	ReasonCloning = "Cloning"
+	// ReasonCloned indicates the clone completed successfully.
+	ReasonCloned = "Cloned"
+	// ReasonCloneFailed indicates the last clone attempt failed (it is retried).
+	ReasonCloneFailed = "CloneFailed"
 )
 
 // BucketPhase is a coarse, human-readable summary of where a Bucket is in its
@@ -241,6 +253,189 @@ func orDefault(v, def string) string {
 	return def
 }
 
+// CloneSourceSecretKeys overrides the data-key names the operator reads the
+// clone-source credentials from. Empty fields fall back to the same env-var
+// style defaults as the workload Secret (AWS_ACCESS_KEY_ID /
+// AWS_SECRET_ACCESS_KEY), so a Secret written by this operator for another
+// Bucket works as a clone source without any key configuration.
+type CloneSourceSecretKeys struct {
+	// AccessKeyID overrides the key holding the source S3 access key id.
+	// Defaults to AWS_ACCESS_KEY_ID.
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
+	// +optional
+	AccessKeyID string `json:"accessKeyID,omitempty"`
+
+	// SecretAccessKey overrides the key holding the source S3 secret.
+	// Defaults to AWS_SECRET_ACCESS_KEY.
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
+	// +optional
+	SecretAccessKey string `json:"secretAccessKey,omitempty"`
+}
+
+// AccessKeyIDKey returns the effective data key for the source access key id.
+func (k CloneSourceSecretKeys) AccessKeyIDKey() string {
+	return orDefault(k.AccessKeyID, DefaultAccessKeyIDKey)
+}
+
+// SecretAccessKeyKey returns the effective data key for the source secret.
+func (k CloneSourceSecretKeys) SecretAccessKeyKey() string {
+	return orDefault(k.SecretAccessKey, DefaultSecretAccessKeyKey)
+}
+
+// CloneSourceSecretRef points to the Secret holding the credentials for the
+// clone source. It must live in the Bucket's own namespace — a namespace field
+// is deliberately not offered, because it would let a CR author read arbitrary
+// Secrets from foreign namespaces through the operator's privileges.
+type CloneSourceSecretRef struct {
+	// Name of the Secret (in the Bucket's namespace) holding the source
+	// credentials.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Keys overrides the data-key names the credentials are read from.
+	// +optional
+	Keys CloneSourceSecretKeys `json:"keys,omitempty"`
+}
+
+// CloneFrom requests that the contents of an existing S3 bucket (any
+// S3-compatible endpoint) are copied into this bucket once, right after it is
+// provisioned. The copy is performed by an rclone Job and is a one-shot
+// operation: after status.clone.phase reaches Completed, later changes to this
+// field have no effect.
+type CloneFrom struct {
+	// Endpoint is the S3 endpoint of the source bucket, as a bare host
+	// (TLS assumed, e.g. object.storage.eu01.onstackit.cloud) or a
+	// scheme-qualified URL.
+	// +kubebuilder:validation:MinLength=1
+	Endpoint string `json:"endpoint"`
+
+	// Bucket is the name of the source bucket at the endpoint.
+	// +kubebuilder:validation:MinLength=1
+	Bucket string `json:"bucket"`
+
+	// Region is the region of the source endpoint, when it requires one for
+	// SigV4 signing (e.g. eu01 for StackIT, eu-central-1 for AWS).
+	// +optional
+	Region string `json:"region,omitempty"`
+
+	// AddressingStyle selects how the source bucket is addressed: "path"
+	// (endpoint.host/bucket — the S3-compatible default, works for StackIT,
+	// MinIO, Ceph, …) or "virtual-hosted" (bucket.endpoint.host — AWS's
+	// preferred style). Defaults to path.
+	// +kubebuilder:validation:Enum=path;virtual-hosted
+	// +kubebuilder:default=path
+	// +optional
+	AddressingStyle string `json:"addressingStyle,omitempty"`
+
+	// SecretRef selects the Secret (in the Bucket's namespace) holding the
+	// credentials that can read the source bucket.
+	SecretRef CloneSourceSecretRef `json:"secretRef"`
+
+	// HoldSecretUntilCloned delays writing the workload credentials Secret until
+	// the clone completed successfully, so consuming workloads never start
+	// against a partially copied bucket. Disable to publish the credentials
+	// immediately; the Ready condition still waits for the clone either way.
+	// +kubebuilder:default=true
+	// +optional
+	HoldSecretUntilCloned *bool `json:"holdSecretUntilCloned,omitempty"`
+}
+
+// Values of CloneFrom.AddressingStyle.
+const (
+	// CloneAddressingPath addresses the source as endpoint.host/bucket.
+	CloneAddressingPath = "path"
+	// CloneAddressingVirtualHosted addresses the source as bucket.endpoint.host.
+	CloneAddressingVirtualHosted = "virtual-hosted"
+)
+
+// VirtualHosted reports whether the source bucket must be addressed
+// virtual-hosted style. An empty AddressingStyle means path style (the CRD
+// default; offline clients see the zero value).
+func (c *CloneFrom) VirtualHosted() bool {
+	return c.AddressingStyle == CloneAddressingVirtualHosted
+}
+
+// HoldSecret reports whether the workload Secret must be withheld until the
+// clone completed. Defaults to true; a nil receiver (no clone requested) means
+// the Secret is never held back.
+func (c *CloneFrom) HoldSecret() bool {
+	if c == nil {
+		return false
+	}
+	return c.HoldSecretUntilCloned == nil || *c.HoldSecretUntilCloned
+}
+
+// EndpointURL returns the source endpoint as a scheme-qualified URL, assuming
+// https for a bare host (mirrors the production S3 endpoint convention).
+func (c *CloneFrom) EndpointURL() string {
+	if strings.HasPrefix(c.Endpoint, "http://") || strings.HasPrefix(c.Endpoint, "https://") {
+		return c.Endpoint
+	}
+	return "https://" + c.Endpoint
+}
+
+// EndpointHost returns the source endpoint host without a scheme.
+func (c *CloneFrom) EndpointHost() string {
+	host := strings.TrimPrefix(c.Endpoint, "https://")
+	return strings.TrimPrefix(host, "http://")
+}
+
+// ClonePhase is the coarse lifecycle state of the one-shot clone operation.
+type ClonePhase string
+
+const (
+	// ClonePhaseRunning means the clone job is copying (or about to).
+	ClonePhaseRunning ClonePhase = "Running"
+	// ClonePhaseCompleted means the source bucket was copied successfully.
+	// This state is terminal: the clone never runs again for this Bucket.
+	ClonePhaseCompleted ClonePhase = "Completed"
+	// ClonePhaseFailed means the last clone attempt failed; it is retried with
+	// backoff (rclone resumes, already-copied objects are skipped).
+	ClonePhaseFailed ClonePhase = "Failed"
+)
+
+// CloneStatus is the observed state of the spec.cloneFrom operation.
+type CloneStatus struct {
+	// Phase is the coarse clone lifecycle state.
+	// +kubebuilder:validation:Enum=Running;Completed;Failed
+	// +optional
+	Phase ClonePhase `json:"phase,omitempty"`
+
+	// StartedAt is when the first clone job was created.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+
+	// CompletedAt is when the clone finished successfully.
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+
+	// TotalBytes is the total size of the source bucket, measured once before
+	// the copy starts so the progress percentage has a stable denominator.
+	// +optional
+	TotalBytes int64 `json:"totalBytes,omitempty"`
+
+	// BytesCopied is the number of bytes transferred so far (from rclone's
+	// remote-control stats, refreshed while the clone runs).
+	// +optional
+	BytesCopied int64 `json:"bytesCopied,omitempty"`
+
+	// Progress is a human-readable transfer summary, e.g. "2.0 GiB / 18.0 GiB (11%)".
+	// +optional
+	Progress string `json:"progress,omitempty"`
+
+	// Rate is the current transfer rate, e.g. "42.0 MiB/s".
+	// +optional
+	Rate string `json:"rate,omitempty"`
+
+	// ETA is rclone's estimated time to completion, e.g. "6m30s".
+	// +optional
+	ETA string `json:"eta,omitempty"`
+
+	// Message carries a short failure reason while Phase is Failed.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
 // SecretReference points to the Kubernetes Secret that receives the bucket's S3
 // access key and secret. The secret is created and kept in sync by the operator.
 type SecretReference struct {
@@ -279,6 +474,12 @@ type BucketSpec struct {
 	// +kubebuilder:default=eu01
 	// +optional
 	Region string `json:"region,omitempty"`
+
+	// CloneFrom requests a one-shot copy of an existing S3 bucket's contents
+	// into this bucket after provisioning. See CloneFrom for details; by default
+	// the workload credentials Secret is only written once the copy succeeded.
+	// +optional
+	CloneFrom *CloneFrom `json:"cloneFrom,omitempty"`
 
 	// WipeOnDelete requests that the operator deletes ALL objects (including
 	// object versions and delete markers) from the bucket before removing it
@@ -339,6 +540,12 @@ type BucketStatus struct {
 	// +optional
 	AccessKeyID string `json:"accessKeyID,omitempty"`
 
+	// Clone is the observed state of the spec.cloneFrom operation. It is only
+	// set on Buckets that request a clone; once Phase is Completed it is
+	// terminal and the clone never runs again.
+	// +optional
+	Clone *CloneStatus `json:"clone,omitempty"`
+
 	// LastRotationTrigger is the rotate-credentials-at annotation value the
 	// operator last acted upon. A differing (non-empty) annotation value requests
 	// a new rotation; recording it here makes the trigger level-based and
@@ -369,6 +576,7 @@ type BucketStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Whether the bucket is fully provisioned"
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.message",description="Current provisioning step or short failure reason"
 // +kubebuilder:printcolumn:name="Region",type="string",JSONPath=".spec.region",description="StackIT region"
+// +kubebuilder:printcolumn:name="Clone",type="string",JSONPath=".status.clone.progress",description="Clone transfer progress",priority=1
 // +kubebuilder:printcolumn:name="Resolved",type="string",JSONPath=".status.resolvedBucketName",description="Physical bucket name in StackIT Object Storage",priority=1
 // +kubebuilder:printcolumn:name="Secret",type="string",JSONPath=".spec.secretRef.name",description="Secret holding the workload credentials",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
@@ -422,6 +630,17 @@ func (b *Bucket) EffectiveBucketName() string {
 		return v
 	}
 	return b.Spec.BucketName
+}
+
+// CloneCompleted reports whether the requested clone has finished successfully
+// (terminal: the clone never runs again for this Bucket).
+func (b *Bucket) CloneCompleted() bool {
+	return b.Status.Clone != nil && b.Status.Clone.Phase == ClonePhaseCompleted
+}
+
+// ClonePending reports whether a requested clone still has to run.
+func (b *Bucket) ClonePending() bool {
+	return b.Spec.CloneFrom != nil && !b.CloneCompleted()
 }
 
 // PendingRotationTrigger returns the rotate-credentials-at annotation value
