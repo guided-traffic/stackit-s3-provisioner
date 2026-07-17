@@ -8,6 +8,10 @@ A Kubernetes operator that provisions **StackIT Object Storage** buckets, worklo
 credentials and isolation policies through Custom Resources. One operator
 deployment per cluster, bound to a single StackIT project via a service-account key.
 
+The operator runs on any Kubernetes cluster, but it is designed and tuned for
+**GitOps workflows — FluxCD in particular**: see
+[GitOps / FluxCD](#gitops--fluxcd).
+
 ## What it does
 
 A `Bucket` custom resource maps to one isolated workload: a StackIT bucket, a
@@ -61,6 +65,39 @@ spec:
       bucketURL:       BUCKET_URL  # default S3_BUCKET_URL
 ```
 
+## GitOps / FluxCD
+
+Nothing in the operator requires FluxCD — it works with plain `kubectl`, Argo CD
+or any other tooling. But its behavior is deliberately shaped so that a Git
+repository can stay the single source of truth and a continuously syncing
+controller like Flux never fights the operator:
+
+- **The operator never mutates `spec`, labels or annotations of a `Bucket`.**
+  All operator state goes to the status subresource (plus one operator-owned
+  bookkeeping annotation it only ever adds). Server-side apply and Flux drift
+  detection stay clean; re-applying the same manifests is always a no-op.
+- **Credentials rotation is level-based, not edge-based.** The
+  `rotate-credentials-at` annotation value lives in Git; changing it in Git
+  rotates exactly once, and every subsequent Flux sync of the same value does
+  nothing (see [Credentials rotation](#credentials-rotation)).
+- **Bucket cloning is one-shot and terminal.** Once `status.clone.phase` is
+  `Completed`, re-applied or even edited `cloneFrom` manifests never re-trigger
+  a copy (see [Cloning an existing bucket](#cloning-an-existing-bucket)).
+- **Config faults fail without a requeue hammer.** An invalid CR (region
+  mismatch, key collision, foreign bucket, self-clone …) parks as
+  `Ready=Failed` with a message instead of hot-looping; fixing the manifest in
+  Git and letting Flux sync it reconciles the new generation.
+- **Secret gating composes with GitOps app rollouts.** With a clone requested,
+  the credentials Secret only appears after the data is complete — pods that
+  Flux deploys in parallel and that consume the Secret via `envFrom` /
+  `secretKeyRef` simply stay pending until the bucket is actually ready. No
+  `dependsOn` choreography required.
+- **Disaster recovery replays from Git.** Physical bucket names are frozen in a
+  durable annotation, ownership tags use `namespace/name` (not the CR UID), and
+  cloud resources are found by deterministic names — restoring the same
+  manifests into a fresh cluster re-adopts the existing buckets instead of
+  duplicating them.
+
 ## Status
 
 The operator reports progress on the `Bucket` status subresource, so `kubectl get
@@ -90,6 +127,78 @@ foreign or non-empty bucket. On bootstrap the operator creates a shared
 `operator-admin` credentials group + S3 key (persisted in its own admin Secret,
 default `stackit-s3-provisioner-admin`); that group's URN sits in every bucket
 policy's exemption list as a lockout safeguard.
+
+## Cloning an existing bucket
+
+A `Bucket` can be seeded from an existing S3 bucket — any S3-compatible endpoint
+(another StackIT project, AWS, MinIO, …) — by declaring `spec.cloneFrom`. The
+contents are copied **once**, right after the bucket is provisioned:
+
+```yaml
+apiVersion: stackit-bucket.gtrfc.com/v1
+kind: Bucket
+metadata:
+  name: my-bucket
+  namespace: team-a
+spec:
+  bucketName: my-bucket
+  secretRef:
+    name: my-bucket-s3
+  cloneFrom:
+    endpoint: object.storage.eu01.onstackit.cloud  # host or URL of the source
+    bucket: seed-data                              # source bucket name
+    region: eu01                                   # optional (SigV4 signing)
+    secretRef:
+      name: seed-data-creds     # Secret with read access to the source bucket;
+      keys:                     # must live in the Bucket's own namespace
+        accessKeyID: AWS_ACCESS_KEY_ID          # optional overrides,
+        secretAccessKey: AWS_SECRET_ACCESS_KEY  # defaults shown
+    holdSecretUntilCloned: true # default
+```
+
+The source credentials Secret is read from the **Bucket's own namespace** only
+(no `namespace` field — referencing foreign namespaces through the operator's
+privileges is deliberately not possible). Its data-key names are configurable
+via `cloneFrom.secretRef.keys`, and the defaults match what this operator writes
+into its own credentials Secrets — so a Secret provisioned for another `Bucket`
+works as a clone source as-is.
+
+**Secret gating.** By default (`holdSecretUntilCloned: true`) the workload
+credentials Secret is only written once the copy finished successfully, so
+consuming workloads never start against a half-filled bucket. Set it to `false`
+to publish the credentials immediately; the `Ready` condition still waits for
+the clone either way.
+
+**How it runs.** The copy is executed by an [rclone](https://rclone.org) Job in
+the operator's namespace (image and pod resources via the Helm values
+`clone.image` / `clone.resources`). rclone's remote-control API — protected by
+a generated 32-character password, and by a NetworkPolicy restricting it to the
+operator (`clone.networkPolicy.enabled`, default `true`; disable on clusters
+whose CNI does not enforce NetworkPolicies) — is polled while the job runs, and
+the transfer progress lands in the CR status:
+
+```
+$ kubectl get bkt my-bucket -o wide
+NAME        BUCKET      PHASE          READY   STATUS                                                  CLONE
+my-bucket   my-bucket   Provisioning   False   cloning from …/seed-data: 2.0 GiB / 18.0 GiB (11%)      2.0 GiB / 18.0 GiB (11%)
+```
+
+`status.clone` carries the details (`phase`, `bytesCopied`, `totalBytes`,
+`progress`, `rate`, `eta`, `startedAt`, `completedAt`), and the `CloneCompleted`
+condition tracks the outcome. The total size is measured once up front, so the
+percentage has a stable denominator.
+
+**Semantics.**
+
+- The clone is **one-shot and terminal**: once `status.clone.phase` is
+  `Completed` it never runs again for this Bucket, even if `cloneFrom` changes.
+- A failed attempt is retried with backoff; rclone resumes and skips objects
+  that were already copied. `rclone copy` semantics: the destination is merged
+  into, never deleted from.
+- Cloning a bucket onto itself (same endpoint + bucket) is rejected as a
+  config fault.
+- Deleting the CR while a clone is running stops the job and cleans up its
+  staging Secret before the normal teardown.
 
 ## Credentials rotation
 
@@ -162,6 +271,61 @@ The feature is gated operator-wide by the Helm value `wipeOnDelete.enabled`
 degrades to the safe empty-only guard and a warning event
 (`WipeOnDeleteSkipped`) is emitted. A wipe also never runs on a bucket whose
 ownership tags do not prove this operator provisioned it.
+
+## Install (FluxCD)
+
+The chart is served from a plain Helm repository, so a `HelmRepository` +
+`HelmRelease` pair is all Flux needs:
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: stackit-s3-provisioner
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://guided-traffic.github.io/stackit-s3-provisioner/
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: stackit-s3-provisioner
+  namespace: stackit-s3-provisioner-system
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: stackit-s3-provisioner
+      version: "1.x"   # or pin an exact version
+      sourceRef:
+        kind: HelmRepository
+        name: stackit-s3-provisioner
+        namespace: flux-system
+  install:
+    createNamespace: true
+  values:
+    stackit:
+      region: eu01
+      serviceAccountKey:
+        secretName: stackit-sa-key   # see below
+```
+
+The StackIT service-account key must exist as a Secret (key `sa-key.json`) in
+the release namespace. It contains a private key, so never commit it to Git in
+plain text — ship it as a [SOPS-encrypted](https://fluxcd.io/flux/guides/mozilla-sops/)
+Secret manifest alongside the HelmRelease (or via SealedSecrets / ExternalSecrets):
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: stackit-sa-key
+  namespace: stackit-s3-provisioner-system
+stringData:
+  sa-key.json: |
+    { … service-account key JSON, SOPS-encrypted in Git … }
+```
 
 ## Install (Helm)
 
