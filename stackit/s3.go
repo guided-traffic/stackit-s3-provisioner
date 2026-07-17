@@ -206,6 +206,27 @@ func (s *S3Admin) WipeBucket(ctx context.Context, bucket string) error {
 	return nil
 }
 
+// BucketUsage returns the total size in bytes of all current objects in the
+// bucket (one recursive listing pass). The clone feature measures the source
+// bucket once before copying so the progress percentage has a stable
+// denominator; S3Admin doubles as the client for arbitrary S3-compatible
+// clone-source endpoints here.
+func (s *S3Admin) BucketUsage(ctx context.Context, bucket string) (int64, error) {
+	// Cancel the listing on early return so minio's producer goroutine does not
+	// block on an unread channel.
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var total int64
+	for obj := range s.mc.ListObjects(lctx, bucket, minio.ListObjectsOptions{Recursive: true}) {
+		if obj.Err != nil {
+			return 0, fmt.Errorf("list objects in %q: %w", bucket, obj.Err)
+		}
+		total += obj.Size
+	}
+	return total, nil
+}
+
 // BucketEmpty reports whether the bucket holds no objects. It is used to enforce
 // the empty-only delete guard (INIT-SETUP.md §0) before any teardown, so a
 // non-empty bucket never loses its credentials or data.

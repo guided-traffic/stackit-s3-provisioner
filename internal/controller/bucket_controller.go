@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"net/http"
 	"sync"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -108,8 +110,23 @@ type BucketReconciler struct {
 	// emitted instead of destroying data.
 	EnableWipeOnDelete bool
 
+	// CloneImage is the container image run by clone Jobs (spec.cloneFrom).
+	// Empty falls back to DefaultCloneImage.
+	CloneImage string
+
+	// CloneJobResources are the resource requirements applied to clone Job pods
+	// (Helm value clone.resources). The zero value applies none.
+	CloneJobResources corev1.ResourceRequirements
+
 	adminMu sync.Mutex
 	admin   *adminCreds // cached after the first successful bootstrap
+
+	// cloneStatsFn overrides rc stats fetching in tests; nil uses HTTP against
+	// the clone pod's rclone remote-control endpoint.
+	cloneStatsFn func(ctx context.Context, baseURL, user, pass string) (*rcloneStats, error)
+
+	cloneHTTPOnce sync.Once
+	cloneHTTP     *http.Client
 }
 
 // +kubebuilder:rbac:groups=stackit-bucket.gtrfc.com,resources=buckets,verbs=get;list;watch;create;update;patch;delete
@@ -118,6 +135,8 @@ type BucketReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 // Reconcile drives a Bucket towards its desired state.
 func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -169,8 +188,10 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if err := r.Update(ctx, &bucket); err != nil {
 			return ctrl.Result{}, err
 		}
-		// The update re-triggers reconcile; return to work on a fresh object.
-		return ctrl.Result{}, nil
+		// Requeue explicitly to work on a fresh object: the Bucket watch filters
+		// on generation/annotation changes, so this metadata-only update does not
+		// re-trigger a reconcile by itself.
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Skeleton mode: no service-account key configured, so no cloud calls.
@@ -200,29 +221,10 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Guard against Secret data-key collisions before writing anything: two
-	// logical fields mapping to the same key would silently drop a value. This is
-	// a configuration error, so surface it without hammering a requeue.
-	if err := b.ValidateSecretKeys(); err != nil {
+	// Configuration faults a retry cannot fix are surfaced without a requeue
+	// hammer (they re-reconcile on spec change).
+	if err := r.specGuardError(b); err != nil {
 		return r.failNoRequeue(ctx, b, err)
-	}
-
-	// Refuse to target the operator's own admin credentials Secret: otherwise the
-	// workload write would pollute it and the finalizer would later delete it,
-	// destroying the (unrecoverable) bootstrap admin key.
-	if r.isAdminSecret(b) {
-		return r.failNoRequeue(ctx, b, fmt.Errorf(
-			"secretRef %s/%s targets the operator's admin credentials Secret; refusing to provision",
-			b.SecretNamespace(), b.Spec.SecretRef.Name))
-	}
-
-	// This operator is bound to a single region; it cannot provision in another.
-	// Writing spec.region into the Secret while provisioning in the operator's
-	// region would advertise a region the bucket is not in, so reject the mismatch.
-	if b.GetRegion() != r.Stackit.Region() {
-		return r.failNoRequeue(ctx, b, fmt.Errorf(
-			"spec.region %q does not match this operator's region %q; provisioning is limited to %q",
-			b.GetRegion(), r.Stackit.Region(), r.Stackit.Region()))
 	}
 
 	// Resolve the physical bucket name once and freeze it (annotation now, status
@@ -259,18 +261,9 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("bucket connection info: %w", err))
 	}
 
-	gid, urn, err := r.Stackit.EnsureCredentialsGroup(ctx, workloadGroupName(b))
-	if err != nil {
-		return r.fail(ctx, b, fmt.Errorf("ensure credentials group: %w", err))
-	}
-
-	accessKeyID, err := r.ensureAccessKeyAndSecret(ctx, b, gid, host, bucketURL)
-	if err != nil {
-		return r.fail(ctx, b, fmt.Errorf("ensure workload credentials: %w", err))
-	}
-
-	if err := r.ensureBucketPolicy(ctx, name, admin, urn); err != nil {
-		return r.fail(ctx, b, fmt.Errorf("ensure bucket policy: %w", err))
+	creds, done, res, err := r.provisionCredentialsAndClone(ctx, b, name, admin, host, bucketURL)
+	if !done {
+		return res, err
 	}
 
 	r.recordPendingRotation(ctx, b, name)
@@ -278,9 +271,9 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	// Success: record observed state and mark Ready.
 	b.Status.ResolvedBucketName = name
 	b.Status.BucketURL = bucketURL
-	b.Status.CredentialsGroupID = gid
-	b.Status.CredentialsGroupURN = urn
-	b.Status.AccessKeyID = accessKeyID
+	b.Status.CredentialsGroupID = creds.gid
+	b.Status.CredentialsGroupURN = creds.urn
+	b.Status.AccessKeyID = creds.accessKeyID
 	b.Status.ObservedGeneration = b.Generation
 	b.Status.OperatorVersion = r.OperatorVersion
 	b.Status.Phase = s3v1.PhaseReady
@@ -294,9 +287,102 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	if err := r.Status().Update(ctx, b); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	logger.Info("bucket provisioned", "bucket", name, "requested", b.Spec.BucketName, "credentialsGroup", gid)
+	logger.Info("bucket provisioned", "bucket", name, "requested", b.Spec.BucketName, "credentialsGroup", creds.gid)
 	r.event(b, corev1.EventTypeNormal, s3v1.ReasonProvisioned, "bucket and isolated workload credentials provisioned")
 	return ctrl.Result{}, nil
+}
+
+// specGuardError checks the Bucket spec for configuration faults that must
+// fail the reconcile without a requeue: Secret data-key collisions (silent
+// data loss), a secretRef targeting the operator's own admin credentials
+// Secret (pollution now, admin-key destruction on delete), and a region this
+// single-region operator cannot provision in.
+func (r *BucketReconciler) specGuardError(b *s3v1.Bucket) error {
+	if err := b.ValidateSecretKeys(); err != nil {
+		return err
+	}
+	if r.isAdminSecret(b) {
+		return fmt.Errorf(
+			"secretRef %s/%s targets the operator's admin credentials Secret; refusing to provision",
+			b.SecretNamespace(), b.Spec.SecretRef.Name)
+	}
+	if b.GetRegion() != r.Stackit.Region() {
+		return fmt.Errorf(
+			"spec.region %q does not match this operator's region %q; provisioning is limited to %q",
+			b.GetRegion(), r.Stackit.Region(), r.Stackit.Region())
+	}
+	return nil
+}
+
+// workloadCreds bundles the provisioned credential identifiers recorded in
+// Bucket status after a successful reconcile.
+type workloadCreds struct {
+	gid, urn, accessKeyID string
+}
+
+// provisionCredentialsAndClone runs the credential half of the provisioning
+// flow: workload credentials group → isolation policy → optional one-shot
+// clone → workload access key + Secret. done=false means the reconcile ends
+// here with the returned result/error (clone still running, or a failure that
+// was already recorded in status).
+//
+// Ordering: the isolation policy is applied before any workload credential
+// exists (and before a clone runs), so the bucket is never open to other
+// project members while it is still being populated; the admin group stays
+// exempt, which is exactly what the clone job's destination side
+// authenticates with. With spec.cloneFrom set, the workload Secret is by
+// default held back until the copy succeeded, so workloads never start
+// against a partially copied bucket; holdSecretUntilCloned=false publishes it
+// up front. Ready always waits for the clone either way.
+func (r *BucketReconciler) provisionCredentialsAndClone(
+	ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds, host, bucketURL string,
+) (workloadCreds, bool, ctrl.Result, error) {
+	var creds workloadCreds
+	failed := func(err error) (workloadCreds, bool, ctrl.Result, error) {
+		res, rerr := r.fail(ctx, b, err)
+		return creds, false, res, rerr
+	}
+
+	var err error
+	creds.gid, creds.urn, err = r.Stackit.EnsureCredentialsGroup(ctx, workloadGroupName(b))
+	if err != nil {
+		return failed(fmt.Errorf("ensure credentials group: %w", err))
+	}
+
+	if err := r.ensureBucketPolicy(ctx, name, admin, creds.urn); err != nil {
+		return failed(fmt.Errorf("ensure bucket policy: %w", err))
+	}
+
+	if verr := validateCloneSource(b, name, host); verr != nil {
+		res, rerr := r.failNoRequeue(ctx, b, verr)
+		return creds, false, res, rerr
+	}
+
+	if b.ClonePending() {
+		if !b.Spec.CloneFrom.HoldSecret() {
+			creds.accessKeyID, err = r.ensureAccessKeyAndSecret(ctx, b, creds.gid, host, bucketURL)
+			if err != nil {
+				return failed(fmt.Errorf("ensure workload credentials: %w", err))
+			}
+			// Record a just-performed rotation immediately: the terminal status
+			// write is not reached while the clone runs, and the pending trigger
+			// would otherwise re-rotate on every clone poll. The clone progress
+			// updates persist the recorded value.
+			r.recordPendingRotation(ctx, b, name)
+		}
+		done, res, cerr := r.ensureClone(ctx, b, name, endpointURLFromBucketURL(bucketURL, name))
+		if !done {
+			return creds, false, res, cerr
+		}
+	}
+
+	if creds.accessKeyID == "" {
+		creds.accessKeyID, err = r.ensureAccessKeyAndSecret(ctx, b, creds.gid, host, bucketURL)
+		if err != nil {
+			return failed(fmt.Errorf("ensure workload credentials: %w", err))
+		}
+	}
+	return creds, true, ctrl.Result{}, nil
 }
 
 // ensureBucket makes the bucket exist, is idempotent, and enforces ownership.
@@ -548,6 +634,12 @@ func (r *BucketReconciler) ensureBucketPolicy(ctx context.Context, name string, 
 // admin group is never touched.
 func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
 	name := b.EffectiveBucketName()
+
+	// Stop a still-running clone first (job + staging Secret, tolerating their
+	// absence), so nothing keeps writing into the bucket while it is torn down.
+	if err := r.deleteCloneArtifacts(ctx, b, true); err != nil {
+		return err
+	}
 
 	bucketExists, err := r.Stackit.HasBucket(ctx, r.Stackit.ProjectID(), name)
 	if err != nil {
@@ -906,19 +998,54 @@ func (r *BucketReconciler) event(b *s3v1.Bucket, eventtype, reason, note string)
 // name+namespace, so it covers cross-namespace secretRefs too (where an owner
 // reference cannot exist). The predicate limits the watch to operator-managed
 // Secrets so unrelated Secret churn does not wake the controller.
+//
+// The Bucket watch itself only fires on generation or annotation changes (plus
+// create/delete; setting deletionTimestamp bumps the generation): the clone
+// feature updates status.clone every poll while a clone runs, and without the
+// filter every one of those writes would echo into an immediate re-reconcile,
+// turning the poll interval into a hot loop. Clone Jobs are watched so their
+// completion re-queues the owning Bucket without waiting for the next poll
+// (a cross-namespace owner reference is not permitted, hence the annotation
+// mapping).
 func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("bucket-controller")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&s3v1.Bucket{}).
+		For(&s3v1.Bucket{}, builder.WithPredicates(predicate.Or(
+			predicate.GenerationChangedPredicate{},
+			predicate.AnnotationChangedPredicate{},
+		))).
 		Named("bucket").
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.bucketsForSecret),
 			builder.WithPredicates(predicate.NewPredicateFuncs(isManagedSecret)),
 		).
+		Watches(
+			&batchv1.Job{},
+			handler.EnqueueRequestsFromMapFunc(bucketsForCloneJob),
+			builder.WithPredicates(predicate.NewPredicateFuncs(isCloneJob)),
+		).
 		Complete(r)
+}
+
+// isCloneJob reports whether an object is a clone Job provisioned by this
+// operator (managed-by + component labels). Used to scope the Job watch.
+func isCloneJob(obj client.Object) bool {
+	labels := obj.GetLabels()
+	return labels[managedByLabel] == managedByValue && labels[cloneComponentLabel] == cloneComponentValue
+}
+
+// bucketsForCloneJob maps a clone Job event back to its owning Bucket via the
+// namespace/name annotations stamped on the Job at creation.
+func bucketsForCloneJob(_ context.Context, obj client.Object) []ctrl.Request {
+	ann := obj.GetAnnotations()
+	ns, name := ann[cloneBucketNamespaceAnnotation], ann[cloneBucketNameAnnotation]
+	if ns == "" || name == "" {
+		return nil
+	}
+	return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}}}
 }
 
 // isManagedSecret reports whether a Secret was provisioned by this operator

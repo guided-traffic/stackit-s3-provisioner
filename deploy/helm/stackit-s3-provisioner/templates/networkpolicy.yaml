@@ -1,0 +1,30 @@
+{{- if .Values.clone.networkPolicy.enabled }}
+# Restricts ingress to clone Job pods: rclone's remote-control port (basic-auth
+# protected) is only reachable from the operator pod that polls it for transfer
+# progress. Selecting the clone pods with policyTypes Ingress also denies all
+# other ingress to them. Requires a NetworkPolicy-capable CNI — disable via
+# clone.networkPolicy.enabled on clusters without one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "stackit-s3-provisioner.fullname" . }}-clone-rc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stackit-s3-provisioner.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      # Labels the operator stamps on every clone Job pod.
+      app.kubernetes.io/managed-by: stackit-s3-provisioner
+      app.kubernetes.io/component: clone
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "stackit-s3-provisioner.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5572
+{{- end }}

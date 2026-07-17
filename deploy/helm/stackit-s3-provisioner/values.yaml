@@ -96,6 +96,32 @@ wipeOnDelete:
   # enabled turns the feature gate on. Opt-in, default off.
   enabled: false
 
+# clone configures the one-shot bucket-clone feature (spec.cloneFrom on a
+# Bucket CR: copy the contents of an existing S3 bucket into the freshly
+# provisioned one). The copy runs as a Kubernetes Job (rclone) in the
+# operator's namespace; the operator polls rclone's remote-control API for
+# transfer progress and surfaces it in the Bucket's status.
+clone:
+  # image is the rclone image run by clone Jobs. Renovate tracks the tag.
+  image:
+    repository: rclone/rclone
+    tag: "1.74.4"
+  # resources applied to clone Job pods. Copying is network-bound; raise the
+  # limits for very large transfers.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  # networkPolicy restricts ingress to clone Job pods so only the operator can
+  # reach the (basic-auth protected) rclone remote-control port. Disable on
+  # clusters without a NetworkPolicy-capable CNI, where the resource would be
+  # silently ignored anyway.
+  networkPolicy:
+    enabled: true
+
 # stackit configures the operator's binding to a StackIT project.
 stackit:
   # region is the StackIT region the operator provisions buckets in.
