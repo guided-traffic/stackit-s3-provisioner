@@ -51,9 +51,13 @@ affinity: {}
 # and without a single leader BOTH reconcile concurrently — an older version can
 # then re-apply a stale bucket policy after the new one wrote the correct one
 # (observed: multipart policy fix not reaching an existing bucket after upgrade).
-# With leader election the new pod waits for the old pod to release the lease
-# before it reconciles, so there is no concurrent write. Enabling this also grants
-# the operator the coordination.k8s.io/leases RBAC (see clusterrole.yaml).
+# Once both the outgoing and incoming pods run leader election, the incoming pod
+# waits for the lease before it reconciles, so there is no concurrent write — this
+# protects every future rollout. NOTE: the ONE rollout that first enables this
+# (false->true) still has an outgoing pod that predates leader election and keeps
+# reconciling freely, so that single upgrade can still race once; the periodic
+# driftResyncInterval below is what heals any stale policy left behind. Enabling
+# this also grants the operator the coordination.k8s.io/leases RBAC (clusterrole.yaml).
 leaderElection:
   enabled: true
 
@@ -62,8 +66,10 @@ leaderElection:
 # isolation policy — self-heals without an event. This matters on operator
 # upgrades: the Bucket watch only fires on generation/annotation changes, so a
 # policy change shipped in a new version would otherwise not reach
-# already-provisioned buckets until their CR is touched. A Go duration string
-# (e.g. "10m", "1h"). Set to "0" to disable and rely on events only.
+# already-provisioned buckets until their CR is touched. Must be a Go duration
+# string WITH A UNIT (e.g. "10m", "1h", "30s"); a bare number like 5 is rejected
+# and crash-loops the operator at startup. Set to "0" to disable and rely on
+# events only.
 driftResyncInterval: "10m"
 
 # bucketNaming controls how the operator composes the physical StackIT bucket
