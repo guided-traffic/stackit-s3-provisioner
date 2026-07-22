@@ -130,6 +130,11 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "stackit-s3-provisioner.stackit-bucket.gtrfc.com",
+		// Release the lease immediately on graceful shutdown so the incoming pod
+		// of a rolling update becomes leader within seconds instead of waiting out
+		// the full lease duration. Safe because main() exits as soon as Start
+		// returns (nothing runs after the manager stops).
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")

@@ -46,10 +46,16 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# Leader election ensures only one operator instance is active at a time.
-# Enable when running more than one replica.
+# leaderElection ensures only one operator instance reconciles at a time. Keep it
+# ON: during a rolling update the new pod starts before the old one terminates,
+# and without a single leader BOTH reconcile concurrently — an older version can
+# then re-apply a stale bucket policy after the new one wrote the correct one
+# (observed: multipart policy fix not reaching an existing bucket after upgrade).
+# With leader election the new pod waits for the old pod to release the lease
+# before it reconciles, so there is no concurrent write. Enabling this also grants
+# the operator the coordination.k8s.io/leases RBAC (see clusterrole.yaml).
 leaderElection:
-  enabled: false
+  enabled: true
 
 # driftResyncInterval makes the operator periodically re-reconcile every
 # provisioned Bucket so configuration drift — most importantly the per-bucket
