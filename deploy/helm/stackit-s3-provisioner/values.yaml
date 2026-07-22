@@ -51,6 +51,15 @@ affinity: {}
 leaderElection:
   enabled: false
 
+# driftResyncInterval makes the operator periodically re-reconcile every
+# provisioned Bucket so configuration drift — most importantly the per-bucket
+# isolation policy — self-heals without an event. This matters on operator
+# upgrades: the Bucket watch only fires on generation/annotation changes, so a
+# policy change shipped in a new version would otherwise not reach
+# already-provisioned buckets until their CR is touched. A Go duration string
+# (e.g. "10m", "1h"). Set to "0" to disable and rely on events only.
+driftResyncInterval: "10m"
+
 # bucketNaming controls how the operator composes the physical StackIT bucket
 # name from a Bucket CR. The rule is applied when a bucket is first provisioned
 # and then frozen per CR (recorded in status + an annotation): changing prefix or

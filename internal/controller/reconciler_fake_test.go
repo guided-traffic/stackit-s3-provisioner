@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -448,6 +449,38 @@ func TestReconcilePolicySelfHealing(t *testing.T) {
 		t.Errorf("objects lost during policy heal: count = %d, want 1", got)
 	}
 	_ = b
+}
+
+// TestReconcileDriftResyncRequeue verifies that a successful reconcile requeues
+// on the configured interval (so policy drift self-heals without an event), and
+// that a zero interval leaves the reconcile event-driven only.
+func TestReconcileDriftResyncRequeue(t *testing.T) {
+	t.Run("interval set: Ready reconcile requeues after it", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.r.DriftResyncInterval = 30 * time.Minute
+		e.provision(t, newBucketCR("team-a", "app-data"))
+
+		res, err := e.reconcile(t, "team-a", "app-data")
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		if res.RequeueAfter != 30*time.Minute {
+			t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, 30*time.Minute)
+		}
+	})
+
+	t.Run("interval zero: no requeue", func(t *testing.T) {
+		e := newTestEnv(t) // DriftResyncInterval defaults to 0
+		e.provision(t, newBucketCR("team-a", "app-data"))
+
+		res, err := e.reconcile(t, "team-a", "app-data")
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		if res.RequeueAfter != 0 {
+			t.Errorf("RequeueAfter = %v, want 0 (event-driven only)", res.RequeueAfter)
+		}
+	})
 }
 
 func TestTeardown(t *testing.T) {

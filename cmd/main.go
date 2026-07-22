@@ -6,6 +6,7 @@ import (
 	"flag"
 	"os"
 	"strconv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -49,6 +50,7 @@ func main() {
 	var ownershipName string
 	var enableWipeOnDelete bool
 	var cloneImage string
+	var driftResyncInterval time.Duration
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -90,6 +92,13 @@ func main() {
 		envOrDefault("CLONE_IMAGE", controller.DefaultCloneImage),
 		"Container image run by clone Jobs (spec.cloneFrom); an rclone image. "+
 			"Can also be set via CLONE_IMAGE.")
+	flag.DurationVar(&driftResyncInterval, "drift-resync-interval",
+		envDurationOrDefault("DRIFT_RESYNC_INTERVAL", 10*time.Minute),
+		"How often a provisioned Bucket is re-reconciled so configuration drift "+
+			"(notably the isolation policy) self-heals without an event. The Bucket "+
+			"watch only fires on generation/annotation changes, so a policy change "+
+			"shipped in an operator upgrade otherwise never reaches already-provisioned "+
+			"buckets. Can also be set via DRIFT_RESYNC_INTERVAL. Set to 0 to disable.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -112,6 +121,7 @@ func main() {
 		"bucketNameIncludeNamespace", bucketNameIncludeNamespace,
 		"ownershipName", ownershipName,
 		"enableWipeOnDelete", enableWipeOnDelete,
+		"driftResyncInterval", driftResyncInterval,
 	)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -174,6 +184,7 @@ func main() {
 		EnableWipeOnDelete:   enableWipeOnDelete,
 		CloneImage:           cloneImage,
 		CloneJobResources:    cloneResources,
+		DriftResyncInterval:  driftResyncInterval,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Bucket")
 		os.Exit(1)
@@ -209,6 +220,15 @@ func envOrDefault(key, def string) string {
 // when it is unset or unparseable.
 func envBoolOrDefault(key string, def bool) bool {
 	if v, err := strconv.ParseBool(os.Getenv(key)); err == nil {
+		return v
+	}
+	return def
+}
+
+// envDurationOrDefault parses the environment variable key as a Go duration
+// (e.g. "10m"), returning def when it is unset or unparseable.
+func envDurationOrDefault(key string, def time.Duration) time.Duration {
+	if v, err := time.ParseDuration(os.Getenv(key)); err == nil {
 		return v
 	}
 	return def
