@@ -31,7 +31,11 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
-      terminationGracePeriodSeconds: 10
+      # Exceed controller-runtime's graceful-shutdown timeout (default 30s) so an
+      # in-flight reconcile can drain and the leader lease is released on SIGTERM
+      # (LeaderElectionReleaseOnCancel) before kubelet SIGKILLs — otherwise the
+      # incoming pod must wait out the full lease duration to take over.
+      terminationGracePeriodSeconds: 40
       containers:
         - name: manager
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"

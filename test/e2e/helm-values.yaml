@@ -14,8 +14,11 @@ resources:
     cpu: 10m
     memory: 64Mi
 
+# Match the production default (on) so the Kind smoke test exercises the
+# leader-election startup path — lease acquisition, the coordination.k8s.io/leases
+# RBAC gate, and the LeaderElectionReleaseOnCancel shutdown.
 leaderElection:
-  enabled: false
+  enabled: true
 
 # Skeleton mode: no StackIT service-account key, so the operator does not touch
 # the cloud during e2e. Provisioning is covered by the integration tests.
