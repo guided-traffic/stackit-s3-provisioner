@@ -58,6 +58,7 @@ spec:
             {{- if .Values.wipeOnDelete.enabled }}
             - --enable-wipe-on-delete
             {{- end }}
+            - --drift-resync-interval={{ .Values.driftResyncInterval }}
             - --clone-image={{ .Values.clone.image.repository }}:{{ .Values.clone.image.tag }}
           env:
             - name: POD_NAMESPACE

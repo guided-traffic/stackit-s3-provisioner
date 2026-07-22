@@ -118,6 +118,15 @@ type BucketReconciler struct {
 	// (Helm value clone.resources). The zero value applies none.
 	CloneJobResources corev1.ResourceRequirements
 
+	// DriftResyncInterval, when > 0, requeues a successfully reconciled Bucket
+	// after this duration so configuration drift — most importantly the per-bucket
+	// isolation policy — self-heals without waiting for an event. The Bucket watch
+	// only fires on generation/annotation changes (the predicate filters out
+	// controller-runtime's periodic resync, see SetupWithManager), so a policy
+	// change shipped in an operator upgrade would otherwise never reach an
+	// already-provisioned, otherwise-unchanged bucket. Zero disables the requeue.
+	DriftResyncInterval time.Duration
+
 	adminMu sync.Mutex
 	admin   *adminCreds // cached after the first successful bootstrap
 
@@ -288,7 +297,10 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	}
 	logger.Info("bucket provisioned", "bucket", name, "requested", b.Spec.BucketName, "credentialsGroup", creds.gid)
 	r.event(b, corev1.EventTypeNormal, s3v1.ReasonProvisioned, "bucket and isolated workload credentials provisioned")
-	return ctrl.Result{}, nil
+	// Requeue on a timer so drift (notably a policy change from an operator
+	// upgrade) self-heals without an event. RequeueAfter <= 0 means no requeue,
+	// so a zero interval leaves the behavior unchanged (event-driven only).
+	return ctrl.Result{RequeueAfter: r.DriftResyncInterval}, nil
 }
 
 // specGuardError checks the Bucket spec for configuration faults that must

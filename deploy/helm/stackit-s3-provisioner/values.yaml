@@ -46,10 +46,25 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# Leader election ensures only one operator instance is active at a time.
-# Enable when running more than one replica.
+# leaderElection ensures only one operator instance reconciles at a time. Keep it
+# ON: during a rolling update the new pod starts before the old one terminates,
+# and without a single leader BOTH reconcile concurrently — an older version can
+# then re-apply a stale bucket policy after the new one wrote the correct one
+# (observed: multipart policy fix not reaching an existing bucket after upgrade).
+# With leader election the new pod waits for the old pod to release the lease
+# before it reconciles, so there is no concurrent write. Enabling this also grants
+# the operator the coordination.k8s.io/leases RBAC (see clusterrole.yaml).
 leaderElection:
-  enabled: false
+  enabled: true
+
+# driftResyncInterval makes the operator periodically re-reconcile every
+# provisioned Bucket so configuration drift — most importantly the per-bucket
+# isolation policy — self-heals without an event. This matters on operator
+# upgrades: the Bucket watch only fires on generation/annotation changes, so a
+# policy change shipped in a new version would otherwise not reach
+# already-provisioned buckets until their CR is touched. A Go duration string
+# (e.g. "10m", "1h"). Set to "0" to disable and rely on events only.
+driftResyncInterval: "10m"
 
 # bucketNaming controls how the operator composes the physical StackIT bucket
 # name from a Bucket CR. The rule is applied when a bucket is first provisioned
