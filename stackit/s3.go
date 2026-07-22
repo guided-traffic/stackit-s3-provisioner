@@ -43,8 +43,17 @@ func BuildIsolationPolicy(bucket, adminURN, workloadURN string) string {
 				"Sid":       "workload-objects-only",
 				"Effect":    effectDeny,
 				"Principal": map[string]any{"AWS": workloadURN},
-				"NotAction": []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"},
-				"Resource":  res,
+				// The multipart-management actions are required by clients that
+				// resume or clean up chunked uploads (e.g. the Docker/GitLab
+				// registry S3 driver lists in-progress multipart uploads on every
+				// blob commit and 500s without them). Uploading parts itself maps
+				// to s3:PutObject, but ListMultipartUploads/ListParts/Abort are
+				// distinct IAM actions and must be exempted explicitly.
+				"NotAction": []string{
+					"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation",
+					"s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:AbortMultipartUpload",
+				},
+				"Resource": res,
 			},
 		},
 	}

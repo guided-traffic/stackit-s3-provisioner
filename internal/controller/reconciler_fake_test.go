@@ -434,9 +434,18 @@ func TestReconcilePolicySelfHealing(t *testing.T) {
 	if e.fake.Policy("app-data") != "" {
 		t.Fatal("test setup: policy not cleared")
 	}
+	// Live data must survive the policy update: healing rewrites the policy in
+	// place and never deletes or recreates the bucket (operator-upgrade safety).
+	e.fake.SeedObject("app-data", "keep.bin", "v1", false)
 	e.reconcileN(t, "team-a", "app-data", 1)
 	if got := e.fake.Policy("app-data"); !stackit.PoliciesEquivalent(got, want) {
 		t.Errorf("policy not restored:\ngot  %s\nwant %s", got, want)
+	}
+	if got := e.fake.BucketNames(); len(got) != 1 {
+		t.Errorf("bucket recreated or deleted during policy heal: %v", got)
+	}
+	if got := e.fake.ObjectCount("app-data"); got != 1 {
+		t.Errorf("objects lost during policy heal: count = %d, want 1", got)
 	}
 	_ = b
 }
@@ -558,6 +567,26 @@ func TestTeardownWipeOnDelete(t *testing.T) {
 		}
 		if !e.rec.hasReason(reasonWiping) {
 			t.Errorf("missing %s event; events: %+v", reasonWiping, e.rec.events)
+		}
+	})
+
+	t.Run("spec false, gate enabled: never wiped", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.r.EnableWipeOnDelete = true
+		b := e.provision(t, newBucketCR("team-a", "app-data")) // WipeOnDelete stays false
+		seedData(e)
+
+		if err := e.k8s.Delete(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.reconcile(t, "team-a", "app-data"); err == nil {
+			t.Fatal("teardown succeeded, want blocked (empty-only guard, no wipe requested)")
+		}
+		if e.fake.ObjectCount("app-data") != 3 {
+			t.Error("objects were deleted although spec.wipeOnDelete is false")
+		}
+		if len(e.fake.BucketNames()) != 1 {
+			t.Error("bucket was deleted despite data-loss guard")
 		}
 	})
 

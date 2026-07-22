@@ -55,7 +55,10 @@ func TestBuildIsolationPolicy(t *testing.T) {
 	if s2.Principal == nil || s2.Principal.AWS != workURN {
 		t.Errorf("stmt2 Principal = %+v, want workload %s", s2.Principal, workURN)
 	}
-	for _, want := range []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"} {
+	for _, want := range []string{
+		"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation",
+		"s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:AbortMultipartUpload",
+	} {
 		if !contains(s2.NotAction, want) {
 			t.Errorf("stmt2 NotAction missing %q: %v", want, s2.NotAction)
 		}
