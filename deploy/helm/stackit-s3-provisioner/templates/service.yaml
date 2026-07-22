@@ -1,0 +1,18 @@
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+# Metrics Service selected by the ServiceMonitor; only needed for scraping.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stackit-s3-provisioner.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stackit-s3-provisioner.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "stackit-s3-provisioner.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP
+{{- end }}
