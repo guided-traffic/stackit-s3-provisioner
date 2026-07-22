@@ -1,0 +1,131 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+{{- $alerts := .Values.monitoring.prometheusRule.alerts }}
+{{- /* Skip the whole resource when every alert is disabled: prometheus-operator
+       rejects a rule group without rules. Extend the `or` when adding alerts. */}}
+{{- if or $alerts.bucketsWipeOnDelete.enabled $alerts.bucketFailed.enabled $alerts.bucketStuckProvisioning.enabled $alerts.bucketStuckDeleting.enabled $alerts.cloneFailed.enabled $alerts.skeletonMode.enabled $alerts.wipeRequestedButGateDisabled.enabled $alerts.reconcileErrors.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "stackit-s3-provisioner.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stackit-s3-provisioner.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: stackit-s3-provisioner
+      rules:
+        {{- if $alerts.bucketsWipeOnDelete.enabled }}
+        - alert: StackitS3BucketsWipeOnDelete
+          expr: max(stackit_s3_provisioner_buckets_wipe_on_delete) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Bucket resources with wipeOnDelete exist
+            description: >-
+              {{ `{{ $value }}` }} Bucket resource(s) carry spec.wipeOnDelete=true.
+              Deleting such a Bucket CR irreversibly deletes ALL objects
+              (including versions and delete markers) in its bucket.
+        {{- end }}
+        {{- if $alerts.bucketFailed.enabled }}
+        - alert: StackitS3BucketFailed
+          expr: max(stackit_s3_provisioner_buckets{phase="Failed"}) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Bucket resources in phase Failed
+            description: >-
+              {{ `{{ $value }}` }} Bucket resource(s) are in phase Failed. Config
+              faults park without requeueing, so they stay Failed until fixed —
+              inspect `kubectl get bkt -A` and the Buckets' status.message.
+        {{- end }}
+        {{- if $alerts.bucketStuckProvisioning.enabled }}
+        - alert: StackitS3BucketStuckProvisioning
+          expr: sum(max by (phase) (stackit_s3_provisioner_buckets{phase=~"Pending|Provisioning"})) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Bucket provisioning is stuck
+            description: >-
+              {{ `{{ $value }}` }} Bucket resource(s) have been in phase
+              Pending/Provisioning for over 30 minutes — StackIT API problems,
+              quota limits or a long-running clone are typical causes.
+        {{- end }}
+        {{- if $alerts.bucketStuckDeleting.enabled }}
+        - alert: StackitS3BucketStuckDeleting
+          expr: max(stackit_s3_provisioner_buckets{phase="Deleting"}) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Bucket deletion is blocked
+            description: >-
+              {{ `{{ $value }}` }} Bucket resource(s) have been in phase Deleting
+              for over 30 minutes. Most likely the data-loss guard is blocking
+              teardown of a non-empty bucket — empty the bucket or set
+              spec.wipeOnDelete (with the operator gate enabled).
+        {{- end }}
+        {{- if $alerts.cloneFailed.enabled }}
+        - alert: StackitS3CloneFailed
+          expr: max(stackit_s3_provisioner_buckets_clone{phase="Failed"}) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Bucket clone keeps failing
+            description: >-
+              {{ `{{ $value }}` }} bucket clone(s) have been in phase Failed for
+              over 30 minutes. The operator retries with backoff, but a
+              persistent failure (dead source credentials, vanished source
+              bucket) needs manual intervention — see status.clone and the
+              clone Job logs in the operator namespace.
+        {{- end }}
+        {{- if $alerts.skeletonMode.enabled }}
+        - alert: StackitS3SkeletonMode
+          expr: max(stackit_s3_provisioner_skeleton_mode) == 1
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: Operator runs in skeleton mode
+            description: >-
+              The operator has no StackIT service-account key configured and
+              provisions nothing, while its health probes stay green. Check
+              stackit.serviceAccountKey in the Helm values and the referenced
+              Secret.
+        {{- end }}
+        {{- if $alerts.wipeRequestedButGateDisabled.enabled }}
+        - alert: StackitS3WipeRequestedButGateDisabled
+          expr: >-
+            max(stackit_s3_provisioner_buckets_wipe_on_delete) > 0
+            and max(stackit_s3_provisioner_wipe_on_delete_gate_enabled) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: wipeOnDelete requested but feature gate is off
+            description: >-
+              Bucket resource(s) request spec.wipeOnDelete=true, but the
+              operator-wide gate (Helm value wipeOnDelete.enabled) is off.
+              Deleting such a CR silently degrades to the empty-only guard —
+              the wipe the manifest promises will not happen.
+        {{- end }}
+        {{- if $alerts.reconcileErrors.enabled }}
+        - alert: StackitS3ReconcileErrors
+          expr: sum(increase(controller_runtime_reconcile_errors_total{controller="bucket"}[15m])) > 3
+          labels:
+            severity: warning
+          annotations:
+            summary: Bucket reconciler keeps erroring
+            description: >-
+              {{ `{{ $value | humanize }}` }} Bucket reconcile errors within 15
+              minutes — transient StackIT API or Kubernetes API failures that
+              have not (yet) parked a Bucket in Failed. Check the operator logs.
+        {{- end }}
+{{- end }}
+{{- end }}

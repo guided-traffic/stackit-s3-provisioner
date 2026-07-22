@@ -281,6 +281,67 @@ degrades to the safe empty-only guard and a warning event
 (`WipeOnDeleteSkipped`) is emitted. A wipe also never runs on a bucket whose
 ownership tags do not prove this operator provisioned it.
 
+## Monitoring
+
+The operator serves Prometheus metrics on `:8080` (`--metrics-bind-address`) —
+the standard controller-runtime and Go collectors plus its own metrics:
+
+| Metric | Type | Meaning |
+| ------ | ---- | ------- |
+| `stackit_s3_provisioner_buckets{phase}` | gauge | Number of `Bucket` resources per `status.phase` (`Pending`, `Provisioning`, `Ready`, `Failed`, `Deleting`; `Unknown` for CRs without a status yet). All phases are always exported. |
+| `stackit_s3_provisioner_buckets_clone{phase}` | gauge | Number of `Bucket` resources per clone phase (`Running`, `Completed`, `Failed`); only Buckets with a clone are counted |
+| `stackit_s3_provisioner_buckets_wipe_on_delete` | gauge | Number of `Bucket` resources with `spec.wipeOnDelete: true` |
+| `stackit_s3_provisioner_skeleton_mode` | gauge | `1` while the operator runs without a StackIT service-account key (provisions nothing) |
+| `stackit_s3_provisioner_wipe_on_delete_gate_enabled` | gauge | `1` while the operator-wide `--enable-wipe-on-delete` feature gate is on |
+| `stackit_s3_provisioner_credentials_last_rotation_timestamp_seconds{namespace,name}` | gauge | Unix time of the Bucket's last [credentials rotation](#credentials-rotation); absent for never-rotated Buckets |
+
+All gauges are computed live from the cluster state on every scrape, so they
+never drift. For clusters running the
+[prometheus-operator](https://github.com/prometheus-operator/prometheus-operator)
+stack (e.g. kube-prometheus-stack), the chart can ship the scrape config and
+alerting rules — both **disabled by default** because they require the
+`monitoring.coreos.com` CRDs, and installation would fail on clusters without
+them:
+
+```yaml
+# values.yaml
+monitoring:
+  serviceMonitor:
+    enabled: true          # renders a metrics Service + ServiceMonitor
+    interval: 30s
+    scrapeTimeout: ""      # empty = Prometheus default
+    labels: {}             # extra ServiceMonitor labels, e.g. release: kube-prometheus-stack
+  prometheusRule:
+    enabled: true
+    labels: {}             # extra PrometheusRule labels
+    alerts:                # every alert has its own toggle, all default to enabled
+      bucketsWipeOnDelete:          { enabled: true }
+      bucketFailed:                 { enabled: true }
+      bucketStuckProvisioning:      { enabled: true }
+      bucketStuckDeleting:          { enabled: true }
+      cloneFailed:                  { enabled: true }
+      skeletonMode:                 { enabled: true }
+      wipeRequestedButGateDisabled: { enabled: true }
+      reconcileErrors:              { enabled: true }
+```
+
+Some kube-prometheus-stack installs only discover `ServiceMonitor`/
+`PrometheusRule` objects carrying a specific label (typically
+`release: <helm-release-name>`); set it via the `labels` values above.
+
+Shipped alerts — every toggle lives under `monitoring.prometheusRule.alerts.<name>.enabled`:
+
+| Alert | Toggle | Severity | Fires when |
+| ----- | ------ | -------- | ---------- |
+| `StackitS3BucketFailed` | `bucketFailed` | `warning` | a `Bucket` sits in phase `Failed` for 15m. Config faults deliberately park without requeueing — without this alert nobody notices them. |
+| `StackitS3BucketStuckProvisioning` | `bucketStuckProvisioning` | `warning` | Buckets sit in `Pending`/`Provisioning` for 30m (StackIT API problems, quota, a long-running clone) |
+| `StackitS3BucketStuckDeleting` | `bucketStuckDeleting` | `warning` | a finalizer teardown hangs for 30m — usually the non-empty data-loss guard blocking [deletion](#deletion-behavior) |
+| `StackitS3CloneFailed` | `cloneFailed` | `warning` | a [bucket clone](#cloning-an-existing-bucket) stays `Failed` for 30m despite backoff retries |
+| `StackitS3SkeletonMode` | `skeletonMode` | `critical` | the operator runs without a service-account key for 15m: probes stay green, nothing is provisioned |
+| `StackitS3BucketsWipeOnDelete` | `bucketsWipeOnDelete` | `warning` | at least one `Bucket` carries `spec.wipeOnDelete: true` for 5m — deleting such a CR irreversibly wipes all objects in its bucket |
+| `StackitS3WipeRequestedButGateDisabled` | `wipeRequestedButGateDisabled` | `warning` | Buckets request `spec.wipeOnDelete` while the operator-wide gate (`wipeOnDelete.enabled`) is off — deletion would silently degrade to the empty-only guard |
+| `StackitS3ReconcileErrors` | `reconcileErrors` | `warning` | more than 3 reconcile errors within 15m (controller-runtime's built-in `controller_runtime_reconcile_errors_total`) |
+
 ## Install (FluxCD)
 
 The chart is served from a plain Helm repository, so a `HelmRepository` +

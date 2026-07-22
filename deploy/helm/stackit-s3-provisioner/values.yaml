@@ -122,6 +122,65 @@ clone:
   networkPolicy:
     enabled: true
 
+# monitoring integrates the operator with a prometheus-operator stack. Both
+# resources below use prometheus-operator CRDs (monitoring.coreos.com/v1) —
+# enable them only on clusters where those CRDs exist, or the install fails.
+monitoring:
+  # serviceMonitor scrapes the operator's metrics endpoint (:8080). Enabling it
+  # also renders the metrics Service the ServiceMonitor selects.
+  serviceMonitor:
+    enabled: false
+    # interval between scrapes (Prometheus duration).
+    interval: 30s
+    # scrapeTimeout per scrape; empty uses the Prometheus default.
+    scrapeTimeout: ""
+    # labels are added to the ServiceMonitor, e.g. the `release: <name>` label
+    # many kube-prometheus-stack installs require for discovery.
+    labels: {}
+  # prometheusRule ships the operator's alerting rules. Every alert can be
+  # switched off individually; all alerts default to enabled. The resource is
+  # only rendered when enabled is true AND at least one alert is enabled.
+  prometheusRule:
+    enabled: false
+    # labels are added to the PrometheusRule, e.g. `release: <name>`.
+    labels: {}
+    alerts:
+      # bucketsWipeOnDelete fires (warning) while at least one Bucket CR
+      # carries spec.wipeOnDelete=true — deleting such a CR irreversibly
+      # wipes all objects in its bucket.
+      bucketsWipeOnDelete:
+        enabled: true
+      # bucketFailed fires (warning) while any Bucket is in phase Failed.
+      # Config faults deliberately park without requeue-hammering, so without
+      # this alert nobody notices them.
+      bucketFailed:
+        enabled: true
+      # bucketStuckProvisioning fires (warning) when Buckets sit in phase
+      # Pending/Provisioning for 30m (StackIT API down, quota, network).
+      bucketStuckProvisioning:
+        enabled: true
+      # bucketStuckDeleting fires (warning) when a finalizer teardown hangs for
+      # 30m — usually the non-empty-bucket data-loss guard blocking deletion.
+      bucketStuckDeleting:
+        enabled: true
+      # cloneFailed fires (warning) when a bucket clone stays Failed for 30m
+      # (dead source credentials, vanished source bucket).
+      cloneFailed:
+        enabled: true
+      # skeletonMode fires (critical) while the operator runs without a StackIT
+      # service-account key: probes stay green but nothing is provisioned.
+      skeletonMode:
+        enabled: true
+      # wipeRequestedButGateDisabled fires (warning) when Buckets request
+      # spec.wipeOnDelete but the operator-wide feature gate is off — deletion
+      # would silently degrade to the empty-only guard.
+      wipeRequestedButGateDisabled:
+        enabled: true
+      # reconcileErrors fires (warning) on more than 3 reconcile errors within
+      # 15m (controller-runtime's built-in error counter).
+      reconcileErrors:
+        enabled: true
+
 # stackit configures the operator's binding to a StackIT project.
 stackit:
   # region is the StackIT region the operator provisions buckets in.
