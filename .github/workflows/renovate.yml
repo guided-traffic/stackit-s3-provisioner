@@ -3,6 +3,7 @@ on:
   # Run daily at 02:00 UTC
   schedule:
     - cron: '0 2 * * *'
+      timezone: "Europe/Berlin"
   # After each push to main
   # push:
   #   branches:
