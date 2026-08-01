@@ -126,7 +126,7 @@ clone:
   # image is the rclone image run by clone Jobs. Renovate tracks the tag.
   image:
     repository: rclone/rclone
-    tag: "1.74.4"
+    tag: "1.75.0"
   # resources applied to clone Job pods. Copying is network-bound; raise the
   # limits for very large transfers.
   resources:
