@@ -19,6 +19,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/tags"
 )
 
 // bucketIsolationPolicy delegates to the production policy builder so the test
@@ -233,6 +234,47 @@ func TestIntegrationWorkloadCredentials(t *testing.T) {
 		t.Fatalf("workload A read mismatch: got %q want %q", got, payload)
 	}
 	t.Log("OK: workload A read its object back")
+
+	// 2b. workload A: overwrite an EXISTING key. On StorageGRID this needs the
+	// proprietary s3:PutOverwriteObject action; without it a plain PutObject on
+	// an existing key fails with AccessDenied while writes to new keys succeed,
+	// which silently breaks clients that rewrite keys (barman/CNPG, restic,
+	// Terraform state).
+	overwritten := []byte("workload-a-overwritten-" + sfx)
+	if err := putObject(mcA, bucketA, obj, overwritten); err != nil {
+		t.Fatalf("workload A overwrite of existing key in bucket A failed: %v", err)
+	}
+	got, err = getObject(mcA, bucketA, obj)
+	if err != nil {
+		t.Fatalf("workload A read after overwrite: %v", err)
+	}
+	if !bytes.Equal(got, overwritten) {
+		t.Fatalf("workload A overwrite not visible: got %q want %q", got, overwritten)
+	}
+	t.Log("OK: workload A overwrote an existing object")
+
+	// 2c. workload A: object tagging (set, read back, delete). Granted because
+	// no access decision in the isolation policy depends on tags.
+	tagCtx, tagCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer tagCancel()
+	wantTags, err := tags.MapToObjectTags(map[string]string{"managed-by": "stackit-s3-provisioner"})
+	if err != nil {
+		t.Fatalf("build object tags: %v", err)
+	}
+	if err := mcA.PutObjectTagging(tagCtx, bucketA, obj, wantTags, minio.PutObjectTaggingOptions{}); err != nil {
+		t.Fatalf("workload A PutObjectTagging on its own object: %v", err)
+	}
+	gotTags, err := mcA.GetObjectTagging(tagCtx, bucketA, obj, minio.GetObjectTaggingOptions{})
+	if err != nil {
+		t.Fatalf("workload A GetObjectTagging on its own object: %v", err)
+	}
+	if gotTags.ToMap()["managed-by"] != "stackit-s3-provisioner" {
+		t.Fatalf("object tags not persisted: %v", gotTags.ToMap())
+	}
+	if err := mcA.RemoveObjectTagging(tagCtx, bucketA, obj, minio.RemoveObjectTaggingOptions{}); err != nil {
+		t.Fatalf("workload A RemoveObjectTagging on its own object: %v", err)
+	}
+	t.Log("OK: workload A set, read and removed object tags")
 
 	// 3. workload B: must NOT read / list / write bucket A.
 	if err := retry(90*time.Second, func() error {

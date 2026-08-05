@@ -11,8 +11,85 @@ import (
 	"github.com/minio/minio-go/v7/pkg/tags"
 )
 
-// effectDeny is the S3 policy Effect used by both isolation statements.
-const effectDeny = "Deny"
+const (
+	// effectDeny is the S3 policy Effect used by both isolation statements.
+	effectDeny = "Deny"
+	// actionAll is the wildcard action of statement 1: every principal outside
+	// the admin/workload pair is denied everything on the bucket.
+	actionAll = "s3:*"
+)
+
+// workloadAllowedActions is the exemption list of statement 2 in
+// BuildIsolationPolicy. Because that statement is a Deny with NotAction, this is
+// an inverted whitelist: every S3 action NOT listed here is denied to the
+// workload credentials.
+//
+// Inclusion criterion: an action operates on object data, object metadata or
+// object listings. Everything that changes *who* may access the bucket, routes
+// its contents elsewhere, pins its lifetime, or rewrites history stays denied —
+// see deniedByDesign below for the reasoning per group.
+//
+// The backend is NetApp StorageGRID, which supports a superset of the AWS action
+// names plus its own s3:PutOverwriteObject. Actions that AWS folds into
+// s3:PutObject are separate here, so a merely "reasonable" list silently breaks
+// clients; keep this list aligned with StorageGRID's documented action set:
+// https://docs.netapp.com/us-en/storagegrid-117/s3/bucket-and-group-access-policies.html
+var workloadAllowedActions = []string{
+	// Object data. s3:PutOverwriteObject is a StorageGRID-specific action that
+	// gates any write to an *already existing* key (data, user metadata or
+	// tags). Without it a plain PutObject on an existing key fails with
+	// AccessDenied — which breaks every client that rewrites a key, e.g. barman
+	// (CNPG backups write base/<id>/backup.info twice per backup).
+	"s3:GetObject", "s3:PutObject", "s3:PutOverwriteObject", "s3:DeleteObject",
+
+	// Listing and endpoint discovery.
+	"s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketLocation",
+
+	// Multipart management. Uploading parts itself maps to s3:PutObject, but
+	// clients that resume or clean up chunked uploads call these distinct
+	// actions (the Docker/GitLab registry S3 driver lists in-progress multipart
+	// uploads on every blob commit and 500s without them).
+	"s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:AbortMultipartUpload",
+
+	// Object tagging. Commonly set in passing by rclone --metadata, Velero and
+	// `aws s3 cp --tagging`.
+	//
+	// INVARIANT: this policy must never gain tag-based Condition keys
+	// (s3:ExistingObjectTag/*, s3:RequestObjectTag/*). Granting the workload
+	// s3:PutObjectTagging is only harmless because no access decision depends on
+	// tags; with such a condition the workload could rewrite its own permissions.
+	"s3:GetObjectTagging", "s3:PutObjectTagging", "s3:DeleteObjectTagging",
+
+	// Version-aware *reads*. Dormant while versioning is off (the workload
+	// cannot enable it — s3:PutBucketVersioning is denied), but harmless and
+	// present so a later versioning feature does not need another policy fix.
+	"s3:GetObjectVersion", "s3:GetObjectVersionTagging",
+
+	// Read-only bucket configuration probes issued by several SDKs before a
+	// write. They expose no secret; denying them only produces confusing
+	// AccessDenied errors on the client side.
+	"s3:GetBucketVersioning", "s3:GetBucketObjectLockConfiguration",
+}
+
+// Denied by design — actions deliberately absent from workloadAllowedActions,
+// recorded so that extending the list stays a conscious decision:
+//
+//   - s3:GetBucketPolicy / PutBucketPolicy / DeleteBucketPolicy — the workload
+//     could lift its own restrictions; Get additionally leaks the admin URN.
+//   - s3:PutReplicationConfiguration / PutBucketNotification /
+//     PutBucketMetadataNotification — exfiltration channels: they mirror bucket
+//     contents to a destination the workload chooses.
+//   - s3:PutObjectRetention / PutObjectLegalHold /
+//     PutBucketObjectLockConfiguration / PutBucketCompliance /
+//     s3:BypassGovernanceRetention — a workload could pin objects permanently
+//     and make the bucket undeletable, breaking finalizer teardown.
+//   - s3:DeleteObjectVersion / DeleteObjectVersionTagging /
+//     PutObjectVersionTagging — mutating or destroying historic versions. Only
+//     current-version writes are granted, so versioning keeps its recovery value.
+//   - s3:PutBucketVersioning / PutLifecycleConfiguration /
+//     PutEncryptionConfiguration / PutBucketCORS / PutBucketTagging /
+//     s3:DeleteBucket — bucket reconfiguration; owned by the operator.
+//   - s3:GetObjectAcl / GetBucketAcl — not needed; ACLs are unused here.
 
 // BuildIsolationPolicy returns the validated per-bucket S3 bucket policy (see
 // INIT-SETUP.md §4.1). It confines the bucket to exactly two principals:
@@ -36,24 +113,15 @@ func BuildIsolationPolicy(bucket, adminURN, workloadURN string) string {
 				"Sid":          "deny-all-except-admin-and-workload",
 				"Effect":       effectDeny,
 				"NotPrincipal": map[string]any{"AWS": []string{adminURN, workloadURN}},
-				"Action":       []string{"s3:*"},
+				"Action":       []string{actionAll},
 				"Resource":     res,
 			},
 			map[string]any{
 				"Sid":       "workload-objects-only",
 				"Effect":    effectDeny,
 				"Principal": map[string]any{"AWS": workloadURN},
-				// The multipart-management actions are required by clients that
-				// resume or clean up chunked uploads (e.g. the Docker/GitLab
-				// registry S3 driver lists in-progress multipart uploads on every
-				// blob commit and 500s without them). Uploading parts itself maps
-				// to s3:PutObject, but ListMultipartUploads/ListParts/Abort are
-				// distinct IAM actions and must be exempted explicitly.
-				"NotAction": []string{
-					"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation",
-					"s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:AbortMultipartUpload",
-				},
-				"Resource": res,
+				"NotAction": workloadAllowedActions,
+				"Resource":  res,
 			},
 		},
 	}
