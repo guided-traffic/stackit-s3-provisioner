@@ -11,8 +11,13 @@ import (
 	"github.com/minio/minio-go/v7/pkg/tags"
 )
 
-// effectDeny is the S3 policy Effect used by both isolation statements.
-const effectDeny = "Deny"
+const (
+	// effectDeny is the S3 policy Effect used by both isolation statements.
+	effectDeny = "Deny"
+	// actionAll is the wildcard action of statement 1: every principal outside
+	// the admin/workload pair is denied everything on the bucket.
+	actionAll = "s3:*"
+)
 
 // workloadAllowedActions is the exemption list of statement 2 in
 // BuildIsolationPolicy. Because that statement is a Deny with NotAction, this is
@@ -108,7 +113,7 @@ func BuildIsolationPolicy(bucket, adminURN, workloadURN string) string {
 				"Sid":          "deny-all-except-admin-and-workload",
 				"Effect":       effectDeny,
 				"NotPrincipal": map[string]any{"AWS": []string{adminURN, workloadURN}},
-				"Action":       []string{"s3:*"},
+				"Action":       []string{actionAll},
 				"Resource":     res,
 			},
 			map[string]any{

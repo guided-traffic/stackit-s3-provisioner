@@ -43,7 +43,7 @@ func TestBuildIsolationPolicy(t *testing.T) {
 	if s1.NotPrincipal.AWS[0] != adminURN || s1.NotPrincipal.AWS[1] != workURN {
 		t.Errorf("stmt1 NotPrincipal = %v, want [%s %s]", s1.NotPrincipal.AWS, adminURN, workURN)
 	}
-	if len(s1.Action) != 1 || s1.Action[0] != "s3:*" {
+	if len(s1.Action) != 1 || s1.Action[0] != actionAll {
 		t.Errorf("stmt1 Action = %v, want [s3:*]", s1.Action)
 	}
 
@@ -85,7 +85,7 @@ func TestBuildIsolationPolicy(t *testing.T) {
 // history, or reconfigure the bucket the operator owns.
 func TestWorkloadAllowedActions_DeniedByDesign(t *testing.T) {
 	for _, forbidden := range []string{
-		"s3:*",
+		actionAll,
 		"s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy",
 		"s3:PutReplicationConfiguration", "s3:PutBucketNotification", "s3:PutBucketMetadataNotification",
 		"s3:PutObjectRetention", "s3:PutObjectLegalHold", "s3:PutBucketObjectLockConfiguration",
