@@ -153,7 +153,14 @@ S3-Admin-Key**. Lösung — einmaliger **Bootstrap** beim ersten Start je Projek
       "Sid": "workload-objects-only",
       "Effect": "Deny",
       "Principal": { "AWS": "<urn workload-group>" },
-      "NotAction": ["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],
+      "NotAction": [
+        "s3:GetObject","s3:PutObject","s3:PutOverwriteObject","s3:DeleteObject",
+        "s3:ListBucket","s3:ListBucketVersions","s3:GetBucketLocation",
+        "s3:ListBucketMultipartUploads","s3:ListMultipartUploadParts","s3:AbortMultipartUpload",
+        "s3:GetObjectTagging","s3:PutObjectTagging","s3:DeleteObjectTagging",
+        "s3:GetObjectVersion","s3:GetObjectVersionTagging",
+        "s3:GetBucketVersioning","s3:GetBucketObjectLockConfiguration"
+      ],
       "Resource": ["arn:aws:s3:::<bucket>", "arn:aws:s3:::<bucket>/*"]
     }
   ]
@@ -166,6 +173,23 @@ S3-Admin-Key**. Lösung — einmaliger **Bootstrap** beim ersten Start je Projek
   unabhängig von der Policy — zweites Sicherheitsnetz.
 - Stmt 2 (`Deny`+`NotAction`) begrenzt die Workload-Group auf Objekt-Operationen; explizites
   Deny schlägt das Default-`Allow` → **kein Bucket-Management** (kein PutBucketPolicy/DeleteBucket).
+- **`NotAction` ist eine invertierte Whitelist**: jede nicht gelistete Action ist für den
+  Workload denied. Aufnahmekriterium: die Action arbeitet auf Objekt-Daten, Objekt-Metadaten
+  oder Listings. Denied bleibt alles, was *Zugriff* ändert (Bucket-Policy), Inhalte
+  *weiterleitet* (Replication/Notification → Exfiltration), Objekte *festnagelt*
+  (Retention/Legal-Hold/Compliance → Bucket wird unlöschbar, Teardown bricht), *Historie*
+  zerstört (`DeleteObjectVersion`) oder den Bucket *umkonfiguriert*. Vollständige Begründung
+  je Gruppe im Kommentar an `workloadAllowedActions` in [`stackit/s3.go`](stackit/s3.go).
+- `s3:PutOverwriteObject` ist eine **StorageGRID-eigene** Action und greift bei jedem Write
+  auf einen *bereits existierenden* Key (Daten, User-Metadaten, Tags). Fehlt sie, schlägt ein
+  simples `PutObject` auf einen vorhandenen Key mit `AccessDenied` fehl — das bricht jeden
+  Client, der Keys neu schreibt (barman/CNPG, restic, Terraform-State, Registry-Treiber).
+  Sie ist **keine** Sicherheitsgrenze: `s3:DeleteObject` ist ohnehin erlaubt, ein Angreifer
+  erreicht dasselbe per Delete+Put. WORM entsteht laut NetApp nur aus dem *Paar*
+  `Deny PutOverwriteObject` **und** `Deny DeleteObject`.
+- **Invariante:** Solange der Workload `s3:PutObjectTagging` hat, darf diese Policy **keine**
+  tag-basierten Condition-Keys (`s3:ExistingObjectTag/*`, `s3:RequestObjectTag/*`) bekommen —
+  sonst könnte der Workload über Tags seine eigenen Rechte umschreiben.
 - Principal/`NotPrincipal` = Group-**URN** (`urn:sgws:identity::…:group/…`, aus
   `CreateCredentialsGroup`); Resource = `arn:aws:s3:::…`. Mischung ist korrekt (StorageGRID).
 
