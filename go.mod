@@ -1,6 +1,6 @@
 module github.com/guided-traffic/stackit-s3-provisioner
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/minio/minio-go/v7 v7.2.1
