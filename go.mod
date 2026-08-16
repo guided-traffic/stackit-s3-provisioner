@@ -3,7 +3,7 @@ module github.com/guided-traffic/stackit-s3-provisioner
 go 1.26.6
 
 require (
-	github.com/minio/minio-go/v7 v7.2.1
+	github.com/minio/minio-go/v7 v7.3.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/stackitcloud/stackit-sdk-go/core v0.26.0
 	github.com/stackitcloud/stackit-sdk-go/services/objectstorage v1.9.1
