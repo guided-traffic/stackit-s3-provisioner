@@ -453,6 +453,18 @@ type SecretReference struct {
 	Keys SecretKeys `json:"keys,omitempty"`
 }
 
+// LocalBucketReference names another Bucket CR in the same namespace as the
+// referencing Bucket. Cross-namespace references are deliberately not
+// expressible: the namespace is this operator's trust boundary, and a reference
+// resolved by CR name (rather than by physical bucket name or by a raw
+// credentials-group URN) cannot be pointed at a resource outside it.
+type LocalBucketReference struct {
+	// Name is the metadata.name of a Bucket CR in this Bucket's namespace.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+}
+
 // BucketSpec defines the desired state of a StackIT Object Storage bucket and its
 // dedicated, isolated workload credentials (one CR = one isolated workload, see
 // INIT-SETUP.md §8).
@@ -468,6 +480,44 @@ type BucketSpec struct {
 	// SecretRef selects the Secret that receives the provisioned S3 access key and
 	// secret. The operator writes accessKeyID and secretAccessKey into this Secret.
 	SecretRef SecretReference `json:"secretRef"`
+
+	// GrantReadAccess lists other Bucket CRs in THIS Bucket's namespace whose
+	// workload credentials additionally receive read-only access to this bucket.
+	// It is set on the bucket that owns the data (the grantor), so a bucket's
+	// full access list is visible in its own spec rather than scattered across
+	// the namespace.
+	//
+	// Granted readers may list the bucket and get objects and their tags; every
+	// write, delete and bucket-management action stays denied, as does access
+	// from any other principal. Entries name a Bucket CR and are resolved through
+	// the Kubernetes API in this Bucket's namespace: a Bucket in another
+	// namespace cannot be named here, and a same-named Bucket elsewhere in the
+	// cluster resolves to a different credentials group.
+	//
+	// The principal that ends up in the bucket policy is that Bucket's
+	// credentials group, located by the deterministic group name the operator
+	// derives from namespace and CR name. That name — not the namespace itself —
+	// is the boundary the grant ultimately rests on, and it is a truncated
+	// string plus a 32-bit hash, so it is not collision-proof against a chosen
+	// namespace/name pair. Treat a namespace that can create Bucket CRs as
+	// trusted; the same derivation already decides which credentials group a
+	// Bucket owns, independently of this field.
+	//
+	// A referenced Bucket that does not exist yet, or whose credentials group is
+	// not provisioned yet, is skipped with a warning event and picked up
+	// automatically once it appears; it never blocks this bucket from becoming
+	// Ready. Deleting a referenced Bucket revokes its access on the next
+	// reconcile. Referencing this Bucket itself is rejected and, should it slip
+	// through, ignored when the policy is built.
+	//
+	// Leaving the list empty preserves the previous behavior exactly: the
+	// bucket's policy is then byte-identical to a bucket that never used the
+	// feature.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
+	GrantReadAccess []LocalBucketReference `json:"grantReadAccess,omitempty"`
 
 	// Region is the StackIT region the bucket is provisioned in.
 	// +kubebuilder:validation:MinLength=1
@@ -540,6 +590,15 @@ type BucketStatus struct {
 	// +optional
 	AccessKeyID string `json:"accessKeyID,omitempty"`
 
+	// GrantedReadTo lists the spec.grantReadAccess entries that are currently
+	// reflected in the bucket policy, i.e. the referenced Buckets whose
+	// credentials group was found and granted read-only access. Entries that
+	// could not be resolved are absent, which makes a pending or revoked grant
+	// visible without reading the policy from S3.
+	// +optional
+	// +listType=atomic
+	GrantedReadTo []string `json:"grantedReadTo,omitempty"`
+
 	// Clone is the observed state of the spec.cloneFrom operation. It is only
 	// set on Buckets that request a clone; once Phase is Completed it is
 	// terminal and the clone never runs again.
@@ -571,6 +630,7 @@ type BucketStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=bkt
+// +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.grantReadAccess) || self.spec.grantReadAccess.all(g, g.name != self.metadata.name)",message="spec.grantReadAccess must not reference the Bucket itself"
 // +kubebuilder:printcolumn:name="Bucket",type="string",JSONPath=".spec.bucketName",description="Requested bucket name"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="Coarse reconcile lifecycle state"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Whether the bucket is fully provisioned"

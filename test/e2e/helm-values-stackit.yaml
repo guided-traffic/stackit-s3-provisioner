@@ -1,0 +1,55 @@
+# Helm values for the CLOUD E2E run: the operator gets a real STACKIT
+# service-account key and provisions actual buckets, credentials groups and
+# access keys. Used by `make e2e-stackit`; the default `make e2e-local` run uses
+# helm-values.yaml and stays in skeleton mode.
+#
+# Everything here is chosen so a run is identifiable and fully reversible:
+# the bucket prefix and the ownership name mark every resource as belonging to
+# this throwaway run, and the wipe gate lets the finalizer tear a bucket down
+# even after the tests wrote objects into it.
+replicaCount: 1
+
+image:
+  repository: stackit-s3-provisioner
+  pullPolicy: Never
+  tag: test
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+leaderElection:
+  enabled: true
+
+# Short interval so a read grant that resolves late (grantee provisioned after
+# its grantor) is picked up quickly even if the grantee watch were to miss it.
+# The test must not depend on this, but it keeps a failure diagnosable.
+driftResyncInterval: "1m"
+
+# Every bucket this run creates is named s3e2e-<namespace>-<cr name>, so leftovers
+# after a crashed run are unambiguous and the sweep in hack/e2ecleanup can find
+# and remove them.
+bucketNaming:
+  prefix: s3e2e
+  includeNamespace: true
+
+# Distinct from the production default so this throwaway operator can never adopt
+# or delete a bucket provisioned by a real deployment against the same project.
+ownership:
+  name: stackit-s3-provisioner-e2e
+
+# Required: the grant tests put objects into the buckets, and without the gate the
+# finalizer refuses to delete a non-empty bucket, which would leak real cloud
+# resources (including live access keys) past the end of the run.
+wipeOnDelete:
+  enabled: true
+
+stackit:
+  region: eu01
+  serviceAccountKey:
+    secretName: stackit-sa-key
+    secretKey: sa-key.json
