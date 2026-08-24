@@ -17,8 +17,10 @@ The operator runs on any Kubernetes cluster, but it is designed and tuned for
 A `Bucket` custom resource maps to one isolated workload: a StackIT bucket, a
 dedicated credentials group, an S3 access key, and a deny-based bucket policy that
 isolates workloads from each other (Layer 2). Cross-project isolation (Layer 1) is
-structurally guaranteed by StackIT itself. See [`CLAUDE.md`](CLAUDE.md) and
-[`INIT-SETUP.md`](INIT-SETUP.md) for the architecture and security invariants.
+structurally guaranteed by StackIT itself. A bucket can optionally
+[share itself read-only](#sharing-a-bucket-read-only) with other Buckets in its
+namespace. See [`CLAUDE.md`](CLAUDE.md) and [`INIT-SETUP.md`](INIT-SETUP.md) for
+the architecture and security invariants.
 
 ```yaml
 apiVersion: stackit-bucket.gtrfc.com/v1
@@ -119,7 +121,11 @@ my-bucket   my-bucket   Ready   True    provisioned          eu01     2m
   requeue-hammering — fix the CR and the next generation reconciles.
 - Other status fields: `resolvedBucketName`, `bucketURL`, `credentialsGroupID`,
   `credentialsGroupURN`, `accessKeyID` (never the secret), `observedGeneration`,
-  `operatorVersion`.
+  `operatorVersion`, `grantedReadTo` (see
+  [Sharing a bucket read-only](#sharing-a-bucket-read-only)), `clone` (see
+  [Cloning an existing bucket](#cloning-an-existing-bucket)),
+  `lastRotationTrigger` / `lastRotationTime` (see
+  [Credentials rotation](#credentials-rotation)).
 
 Each `Bucket` is stamped with S3 ownership tags (`managed-by` + `owner=<ns>/<name>`)
 so the operator adopts only buckets it owns and refuses to clobber a pre-existing
@@ -255,6 +261,72 @@ kubectl annotate buckets -l team=payments \
 Both commands operate on the current namespace; add `-n <namespace>` or
 `--all-namespaces` (with `kubectl annotate buckets --all-namespaces -l …`) as
 needed.
+
+## Sharing a bucket read-only
+
+By default a bucket is reachable by exactly one credential: its own. A bucket
+can additionally grant **read-only** access to other `Bucket` CRs in the **same
+namespace** via `spec.grantReadAccess`. The grant is declared on the bucket that
+owns the data, so a bucket's full access list is visible in its own spec:
+
+```yaml
+apiVersion: stackit-bucket.gtrfc.com/v1
+kind: Bucket
+metadata:
+  name: gitlab-artifacts
+  namespace: gitlab
+spec:
+  bucketName: gitlab-artifacts
+  secretRef:
+    name: gitlab-artifacts-s3
+  grantReadAccess:            # optional, default: no additional access
+    - name: gitlab-backups    # metadata.name of a Bucket CR in namespace gitlab
+```
+
+The credentials in `gitlab-backups-s3` can now list `gitlab-artifacts` and get
+its objects. They still cannot write to it, delete from it, or touch its
+configuration.
+
+| Granted to a reader | Denied to a reader |
+| ------------------- | ------------------ |
+| `ListBucket`, `ListBucketVersions` | every `Put*`, `Delete*` and `Create*` action |
+| `GetObject`, `GetObjectVersion` | multipart listing/abort (would expose or destroy the owner's in-flight uploads) |
+| `GetObjectTagging`, `GetObjectVersionTagging` | bucket policy, replication, notifications, lifecycle, object lock |
+| `GetBucketLocation`, `GetBucketVersioning`, `GetBucketObjectLockConfiguration` | anything at all on buckets that did not grant it |
+
+Rules worth knowing:
+
+- **Namespace-scoped.** Entries name a `Bucket` CR and are resolved in the
+  granting Bucket's own namespace, so a Bucket in another namespace cannot be
+  named here and a same-named Bucket elsewhere resolves to a different
+  credentials group. Note that the principal written into the policy is located
+  by the operator's derived credentials-group name, which is what already decides
+  which group a Bucket owns — a namespace allowed to create `Bucket` resources is
+  inside the trust boundary either way.
+- **Never blocking.** A referenced Bucket that does not exist yet (or is not
+  finished provisioning) is skipped with a `ReadGrantPending` warning event; the
+  granting bucket still becomes `Ready`. The grant is applied automatically as
+  soon as the reference resolves.
+- **Revocation is automatic.** Deleting a referenced Bucket removes it from the
+  policy on the granting bucket's next reconcile. Removing the entry from
+  `spec.grantReadAccess` does the same, immediately.
+- **Self-references are rejected** by the CRD schema.
+- **A bucket being filled by a clone shares nothing yet.** While
+  [`spec.cloneFrom`](#cloning-an-existing-bucket) is still copying, granted
+  readers stay out of the policy and are added the moment the copy succeeds — the
+  same reason the bucket's own credentials Secret is held back by default.
+- **An ambiguous reference grants nothing.** If the credentials-group name a
+  reference resolves to exists more than once in the StackIT project, the grant
+  is refused with a `ReadGrantPending` event rather than pointed at a guess.
+- Whatever is currently in effect is listed in `status.grantedReadTo`:
+
+  ```console
+  $ kubectl get bucket gitlab-artifacts -o jsonpath='{.status.grantedReadTo}'
+  ["gitlab-backups"]
+  ```
+
+Leaving `grantReadAccess` unset keeps the previous behavior exactly — the
+bucket policy is then identical to that of a bucket that never used the feature.
 
 ## Deletion behavior
 

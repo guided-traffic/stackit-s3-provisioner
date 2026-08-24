@@ -96,6 +96,11 @@ test-e2e: ## Run E2E smoke tests against a running Kind cluster.
 	@echo "Running E2E tests..."
 	$(GOTEST) -v -tags=e2e -count=1 -timeout=20m ./test/e2e/...
 
+.PHONY: test-e2e-stackit
+test-e2e-stackit: ## Run E2E tests incl. the cloud suite against a running Kind cluster (operator needs a real SA key).
+	@echo "Running E2E tests (cloud suite enabled)..."
+	E2E_STACKIT=1 $(GOTEST) -v -tags=e2e -count=1 -timeout=40m ./test/e2e/...
+
 ##@ Security
 
 .PHONY: gosec
@@ -173,8 +178,51 @@ kind-delete: ## Delete the Kind test cluster.
 	@echo "Deleting Kind cluster..."
 	-kind delete cluster --name $(KIND_CLUSTER)
 
+# SA_KEY is the STACKIT service-account key handed to the operator by e2e-stackit.
+# E2E_BUCKET_PREFIX must match bucketNaming.prefix in test/e2e/helm-values-stackit.yaml:
+# it is what the cleanup sweep uses to tell this run's cloud resources from real ones.
+SA_KEY ?= account-1.json
+E2E_BUCKET_PREFIX ?= s3e2e
+
+.PHONY: e2e-stackit
+e2e-stackit: kind-create ## Run E2E against the REAL StackIT API (creates and deletes real buckets/keys; needs $(SA_KEY)).
+	@test -f $(SA_KEY) || { echo "ERROR: $(SA_KEY) not found — the cloud E2E run needs a StackIT service-account key"; exit 1; }
+	@echo "Building E2E image..."
+	docker build -f Containerfile -t $(E2E_IMG) .
+	@echo "Loading E2E image into Kind cluster..."
+	kind load docker-image $(E2E_IMG) --name $(KIND_CLUSTER)
+	@echo "Creating service-account key Secret..."
+	kubectl create namespace stackit-s3-provisioner-system --dry-run=client -o yaml | kubectl apply -f -
+	kubectl create secret generic stackit-sa-key \
+		--namespace stackit-s3-provisioner-system \
+		--from-file=sa-key.json=$(SA_KEY) \
+		--dry-run=client -o yaml | kubectl apply -f -
+	@echo "Installing operator via Helm (real SA key)..."
+	helm install stackit-s3-provisioner $(HELM_CHART_DIR) \
+		--namespace stackit-s3-provisioner-system \
+		--values test/e2e/helm-values-stackit.yaml \
+		--wait \
+		--timeout 180s
+	@echo "Running E2E tests (cloud suite)..."
+	-$(MAKE) test-e2e-stackit
+	@echo "Releasing any Bucket left behind (finalizer teardown, cluster still up)..."
+	-kubectl delete buckets.stackit-bucket.gtrfc.com --all --all-namespaces --timeout=5m
+	@echo "Deleting Kind cluster..."
+	$(MAKE) kind-delete
+	@echo "Sweeping the project for leftovers..."
+	$(MAKE) e2e-stackit-sweep
+	@echo "E2E (cloud) done. Re-run the test target above to see failures in isolation."
+
+.PHONY: e2e-stackit-sweep
+e2e-stackit-sweep: ## Delete cloud resources a crashed e2e-stackit run left behind (incl. the orphaned admin key).
+	go run ./hack/e2ecleanup -key $(SA_KEY) -prefix $(E2E_BUCKET_PREFIX) -delete -admin
+
+.PHONY: e2e-stackit-sweep-dry
+e2e-stackit-sweep-dry: ## Report, without deleting, what e2e-stackit-sweep would remove.
+	go run ./hack/e2ecleanup -key $(SA_KEY) -prefix $(E2E_BUCKET_PREFIX)
+
 .PHONY: e2e-local
-e2e-local: kind-create ## Run full E2E test locally with Kind.
+e2e-local: kind-create ## Run full E2E test locally with Kind (skeleton mode, no cloud calls).
 	@echo "Building E2E image..."
 	docker build -f Containerfile -t $(E2E_IMG) .
 	@echo "Loading E2E image into Kind cluster..."

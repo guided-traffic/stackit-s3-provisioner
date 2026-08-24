@@ -193,6 +193,64 @@ S3-Admin-Key**. Lösung — einmaliger **Bootstrap** beim ersten Start je Projek
 - Principal/`NotPrincipal` = Group-**URN** (`urn:sgws:identity::…:group/…`, aus
   `CreateCredentialsGroup`); Resource = `arn:aws:s3:::…`. Mischung ist korrekt (StorageGRID).
 
+#### 4.1.1 Optionales drittes Statement: Read-Grants (`spec.grantReadAccess`)
+
+Ein Bucket kann anderen `Bucket`-CRs **seines eigenen Namespace** lesenden Zugriff
+gewähren (Producer-Seite: der Daten-Eigentümer deklariert, wer lesen darf). Ohne
+Grant bleibt das Dokument **byte-identisch** zum Zwei-Statement-Template oben — ein
+Operator-Upgrade schreibt bestehende Policies also nicht um.
+
+Mit ≥1 Reader kommt ein drittes Statement dazu, und Stmt 1 nimmt die Reader in
+`NotPrincipal` auf (sonst würde der Blanket-Deny sie trotz Stmt 3 aussperren):
+
+```jsonc
+{ // 3) Reader auf reine Lese-Ops begrenzen
+  "Sid": "granted-readers-read-only",
+  "Effect": "Deny",
+  "Principal": { "AWS": ["<urn reader-group-a>", "<urn reader-group-b>"] },
+  "NotAction": [
+    "s3:GetObject","s3:GetObjectVersion",
+    "s3:ListBucket","s3:ListBucketVersions","s3:GetBucketLocation",
+    "s3:GetObjectTagging","s3:GetObjectVersionTagging",
+    "s3:GetBucketVersioning","s3:GetBucketObjectLockConfiguration"
+  ],
+  "Resource": ["arn:aws:s3:::<bucket>", "arn:aws:s3:::<bucket>/*"]
+}
+```
+
+- **Echte Teilmenge von Stmt 2.** Beide Listen sind über dieselben Konstanten
+  gebaut (`stackit/s3.go`), was Tippfehler und abweichende Schreibweisen ausschließt.
+  Die Teilmengen- und Read-only-Eigenschaft selbst ist **nicht** vom Compiler
+  erzwungen (jede Konstante ließe sich in beide Listen schreiben) — sie hängt an
+  `TestReaderAllowedActions_ReadOnly`. Kein `Put*`/`Delete*`/`Create*`.
+- **Kein Multipart-Listing für Reader.** `ListBucketMultipartUploads` /
+  `ListMultipartUploadParts` legen die *noch nicht committeten* Uploads des Eigentümers
+  offen, `AbortMultipartUpload` zerstört sie. Für `ls`/`get` nicht nötig.
+- **Herkunft der Reader-URN ist sicherheitskritisch.** Sie wird **nie** aus
+  `status.credentialsGroupURN` des referenzierten CR gelesen (`buckets/status`-Schreibrecht
+  ist schwächer als Secret-Leserecht — eine gefälschte URN käme sonst wörtlich in die
+  Policy). Stattdessen: deterministischer Group-Name aus `namespace/name`
+  (`workloadGroupName`) → Lookup gegen die Control Plane. `BuildIsolationPolicy` filtert
+  zusätzlich Admin- und Workload-URN aus der Reader-Liste heraus.
+- **Grenze dieser Auflösung (verifiziert 2026-08-24).** `workloadGroupName` ist
+  `"s3op-<ns>-<name>"` auf 23 Zeichen gekürzt + 8-Hex-FNV-1a-32 über `"<ns>/<name>"`.
+  Das kollidiert über Namespaces hinweg, empirisch reproduziert:
+  `("gitlab","gitlab-artifacts")` und `("gitlab-gitlab","artifacts787ngo")` ergeben beide
+  `s3op-gitlab-gitlab-arti-70dbcfc2`. Die Namespace-Bindung des Grants ist also eine
+  Eigenschaft des **CR-Lookups**, keine kryptographische Zusicherung über das Principal.
+  Das ist **nicht** grant-spezifisch: derselbe Name entscheidet über
+  `EnsureCredentialsGroup` (Find-or-Create, **ohne** Ownership-Check) schon heute, welche
+  Credentials-Group ein Bucket besitzt — siehe offene Punkte in §5.
+- **Anzeigenamen sind nicht eindeutig.** Erscheint der abgeleitete Name mehrfach im
+  Projekt, wird der Grant **verweigert** (Event `ReadGrantPending`) statt geraten;
+  bei einem einzelnen Treffer gilt First-Match wie in `FindCredentialsGroupByName`.
+- **Warum das Filtern nötig ist:** Admin-URN als Reader ⇒ der Admin-Key verliert
+  `PutBucketPolicy` auf diesem Bucket ⇒ **nicht reparierbarer Lockout** (Deny schlägt
+  alles). Workload-URN als Reader ⇒ zweites, engeres Deny auf den Eigentümer; Denies
+  **schneiden sich**, der Eigentümer verlöre also still seinen Schreibzugriff.
+- Reader-Liste wird dedupliziert und sortiert → Dokument deterministisch, `PoliciesEquivalent`
+  meldet keinen Scheindrift.
+
 ## 5. Kritische Guardrails
 
 1. **Rollen nur auf Projekt-Ebene zuweisen.** Eine Organisations-weite Rolle, die in
@@ -321,7 +379,9 @@ in den frisch provisionierten Bucket. Kern-Entscheidungen:
 ## 9. Machbarkeits-Smoke-Test — VERIFIZIERT (2026-06-30)
 
 Minimaler Go-Code gegen die **echte** StackIT-API, mit beiden Service-Account-Keys
-(`account-1.json` = Projekt `1f426c6e…`, `account-2.json` = Projekt `eb4205a7…`).
+(`account-1.json` = Projekt `ebc9d379…`, `account-2.json` = Projekt `5ad5e488…`;
+SA-Keys am 2026-08-24 gegen dedizierte e2e-Accounts getauscht — die alten Projekte antworten
+auf `EnsureService` mit 403).
 
 **Layer 1 — Cross-Projekt (Control Plane), beide Tests grün:**
 
