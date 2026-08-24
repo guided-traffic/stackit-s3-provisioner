@@ -61,6 +61,28 @@ func main() {
 	}
 }
 
+// leftovers is what one sweep found: the buckets and workload credentials
+// groups belonging to e2e runs, plus the id of the shared bootstrap admin group
+// (kept separate because it is only removed on request).
+type leftovers struct {
+	buckets      []string
+	groups       []stackit.CredentialsGroupInfo
+	adminGroupID string
+}
+
+func (l leftovers) empty() bool { return len(l.buckets)+len(l.groups) == 0 }
+
+// report prints what was found, in the same shape for a dry run and a real one.
+func (l leftovers) report() {
+	fmt.Printf("found %d bucket(s) and %d credentials group(s) from e2e runs\n", len(l.buckets), len(l.groups))
+	for _, b := range l.buckets {
+		fmt.Printf("  bucket %s\n", b)
+	}
+	for _, g := range l.groups {
+		fmt.Printf("  group  %s (%s)\n", g.DisplayName, g.ID)
+	}
+}
+
 func run(keyPath, prefix, region string, doDelete, withAdmin bool, timeout time.Duration) error {
 	if strings.TrimSpace(prefix) == "" {
 		return fmt.Errorf("-prefix must not be empty: it is the only thing separating e2e resources from real ones")
@@ -73,34 +95,20 @@ func run(keyPath, prefix, region string, doDelete, withAdmin bool, timeout time.
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	acc, err := stackit.LoadAccount(keyPath)
+	c, err := newClient(keyPath, region)
 	if err != nil {
-		return fmt.Errorf("load account: %w", err)
-	}
-	c, err := stackit.NewClient(acc, region)
-	if err != nil {
-		return fmt.Errorf("client: %w", err)
+		return err
 	}
 	fmt.Printf("project %s, region %s, prefix %q, delete=%v\n", c.ProjectID(), region, prefix, doDelete)
 
-	buckets, err := leftoverBuckets(ctx, c, prefix)
+	found, err := findLeftovers(ctx, c, prefix)
 	if err != nil {
 		return err
 	}
-	groups, adminGroupID, err := leftoverGroups(ctx, c, prefix)
-	if err != nil {
-		return err
-	}
+	found.report()
 
-	fmt.Printf("found %d bucket(s) and %d credentials group(s) from e2e runs\n", len(buckets), len(groups))
-	for _, b := range buckets {
-		fmt.Printf("  bucket %s\n", b)
-	}
-	for _, g := range groups {
-		fmt.Printf("  group  %s (%s)\n", g.DisplayName, g.ID)
-	}
 	if !doDelete {
-		if len(buckets)+len(groups) > 0 {
+		if !found.empty() {
 			fmt.Println("dry run: pass -delete to remove these")
 		}
 		return nil
@@ -108,25 +116,68 @@ func run(keyPath, prefix, region string, doDelete, withAdmin bool, timeout time.
 
 	// Buckets first: a credentials group cannot be deleted while it still has
 	// keys, and a bucket cannot be deleted while it still has objects.
-	if len(buckets) > 0 {
-		admin, err := adminS3(ctx, c, adminGroupID, buckets[0])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: no admin S3 client (%v); buckets that still hold objects cannot be emptied\n", err)
-		}
-		for _, b := range buckets {
-			if admin != nil {
-				if err := admin.WipeBucket(ctx, b); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: wipe %s: %v\n", b, err)
-				}
-			}
-			if err := c.DeleteBucket(ctx, b); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: delete bucket %s: %v\n", b, err)
-				continue
-			}
-			fmt.Printf("deleted bucket %s\n", b)
-		}
+	deleteBuckets(ctx, c, found)
+	deleteGroups(ctx, c, found.groups)
+	if withAdmin {
+		deleteAdminGroup(ctx, c, found.adminGroupID)
 	}
+	return nil
+}
 
+// newClient loads the service-account key and binds a client to the region.
+func newClient(keyPath, region string) (*stackit.Client, error) {
+	acc, err := stackit.LoadAccount(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load account: %w", err)
+	}
+	c, err := stackit.NewClient(acc, region)
+	if err != nil {
+		return nil, fmt.Errorf("client: %w", err)
+	}
+	return c, nil
+}
+
+// findLeftovers collects everything a sweep may touch in one place, so the
+// dry-run and the delete path report on exactly the same set.
+func findLeftovers(ctx context.Context, c *stackit.Client, prefix string) (leftovers, error) {
+	buckets, err := leftoverBuckets(ctx, c, prefix)
+	if err != nil {
+		return leftovers{}, err
+	}
+	groups, adminGroupID, err := leftoverGroups(ctx, c, prefix)
+	if err != nil {
+		return leftovers{}, err
+	}
+	return leftovers{buckets: buckets, groups: groups, adminGroupID: adminGroupID}, nil
+}
+
+// deleteBuckets empties and removes the e2e buckets. Failures are reported and
+// skipped rather than aborting: one stuck bucket must not keep the sweep from
+// removing everything else, least of all the still-valid access keys.
+func deleteBuckets(ctx context.Context, c *stackit.Client, found leftovers) {
+	if len(found.buckets) == 0 {
+		return
+	}
+	admin, err := adminS3(ctx, c, found.adminGroupID, found.buckets[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: no admin S3 client (%v); buckets that still hold objects cannot be emptied\n", err)
+	}
+	for _, b := range found.buckets {
+		if admin != nil {
+			if wipeErr := admin.WipeBucket(ctx, b); wipeErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: wipe %s: %v\n", b, wipeErr)
+			}
+		}
+		if delErr := c.DeleteBucket(ctx, b); delErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: delete bucket %s: %v\n", b, delErr)
+			continue
+		}
+		fmt.Printf("deleted bucket %s\n", b)
+	}
+}
+
+// deleteGroups drains and removes the workload credentials groups of e2e runs.
+func deleteGroups(ctx context.Context, c *stackit.Client, groups []stackit.CredentialsGroupInfo) {
 	for _, g := range groups {
 		if err := c.DeleteAllAccessKeys(ctx, g.ID); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: drain keys of %s: %v\n", g.DisplayName, err)
@@ -137,18 +188,22 @@ func run(keyPath, prefix, region string, doDelete, withAdmin bool, timeout time.
 		}
 		fmt.Printf("deleted group %s\n", g.DisplayName)
 	}
+}
 
-	if withAdmin && adminGroupID != "" {
-		if err := c.DeleteAllAccessKeys(ctx, adminGroupID); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: drain admin keys: %v\n", err)
-		}
-		if err := c.DeleteCredentialsGroup(ctx, adminGroupID); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: delete admin group: %v\n", err)
-		} else {
-			fmt.Printf("deleted group %s (bootstrap admin)\n", adminGroupName)
-		}
+// deleteAdminGroup removes the shared bootstrap group and the access key inside
+// it. Only reached with -admin; see the package comment for when that is safe.
+func deleteAdminGroup(ctx context.Context, c *stackit.Client, adminGroupID string) {
+	if adminGroupID == "" {
+		return
 	}
-	return nil
+	if err := c.DeleteAllAccessKeys(ctx, adminGroupID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: drain admin keys: %v\n", err)
+	}
+	if err := c.DeleteCredentialsGroup(ctx, adminGroupID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: delete admin group: %v\n", err)
+		return
+	}
+	fmt.Printf("deleted group %s (bootstrap admin)\n", adminGroupName)
 }
 
 // leftoverBuckets returns the project's buckets whose name starts with prefix.
