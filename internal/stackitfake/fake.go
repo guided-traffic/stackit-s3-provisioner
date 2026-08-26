@@ -72,6 +72,17 @@ type Server struct {
 	groups         map[string]*group
 	seq            int
 	failNext       map[string]int
+	failNextRaw    map[string]rawFailure
+	calls          map[string]int
+}
+
+// rawFailure is an injected response that bypasses the JSON error envelope, so
+// a test can reproduce an intermediary answering with something the API never
+// would — an nginx or WAF HTML error page, for instance.
+type rawFailure struct {
+	status      int
+	contentType string
+	body        string
 }
 
 // New starts a fake with the service already enabled (the common case).
@@ -83,6 +94,8 @@ func New(projectID, region string) *Server {
 		buckets:        map[string]*bucket{},
 		groups:         map[string]*group{},
 		failNext:       map[string]int{},
+		failNextRaw:    map[string]rawFailure{},
+		calls:          map[string]int{},
 	}
 	s.CP = httptest.NewServer(http.HandlerFunc(s.controlPlane))
 	s.S3 = httptest.NewServer(http.HandlerFunc(s.dataPlane))
@@ -119,13 +132,69 @@ func (s *Server) FailNext(op string, status int) {
 	s.failNext[op] = status
 }
 
-// failFor consumes a pending failure injection for op. Caller must hold mu.
+// FailNextRaw makes the next call of the given operation answer with a verbatim
+// body and Content-Type instead of the API's JSON error envelope. It exists to
+// reproduce an intermediary — a gateway or WAF returning an HTML error page —
+// which the SDK surfaces as an ordinary API error carrying that page's status
+// code. Distinguishing the two is what keeps a reachability failure from being
+// mistaken for an answer.
+func (s *Server) FailNextRaw(op string, status int, contentType, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failNextRaw[op] = rawFailure{status: status, contentType: contentType, body: body}
+}
+
+// Calls reports how many times the fake served the given operation. Counting
+// happens in failFor, which every named operation consults exactly once before
+// doing any work, so the counter cannot drift away from the set of operations
+// FailNext knows about.
+func (s *Server) Calls(op string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls[op]
+}
+
+// failFor records a call to op and consumes a pending failure injection for it.
+// Caller must hold mu.
 func (s *Server) failFor(op string) (int, bool) {
+	s.calls[op]++
 	if st, ok := s.failNext[op]; ok {
 		delete(s.failNext, op)
 		return st, true
 	}
 	return 0, false
+}
+
+// rawFor consumes a pending raw failure injection for op. Caller must hold mu.
+func (s *Server) rawFor(op string) (rawFailure, bool) {
+	if f, ok := s.failNextRaw[op]; ok {
+		delete(s.failNextRaw, op)
+		return f, true
+	}
+	return rawFailure{}, false
+}
+
+// cpFail serves a pending failure injection for a control-plane operation and
+// reports whether it did. A raw injection wins over a JSON one, so a test that
+// arms both gets the intermediary behaviour it asked for.
+func (s *Server) cpFail(w http.ResponseWriter, op string) bool {
+	if f, ok := s.rawFor(op); ok {
+		s.calls[op]++
+		writeRaw(w, f)
+		return true
+	}
+	if st, ok := s.failFor(op); ok {
+		apiError(w, st, "injected "+op+" failure")
+		return true
+	}
+	return false
+}
+
+// writeRaw serves an injected raw failure verbatim.
+func writeRaw(w http.ResponseWriter, f rawFailure) {
+	w.Header().Set("Content-Type", f.contentType)
+	w.WriteHeader(f.status)
+	_, _ = io.WriteString(w, f.body)
 }
 
 // SeedBucket creates a bucket directly in the fake (bypassing the API), e.g. a
@@ -335,8 +404,7 @@ func (s *Server) splitCPPath(w http.ResponseWriter, path string) (string, bool) 
 func (s *Server) handleService(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		if st, ok := s.failFor("ServiceStatus"); ok {
-			apiError(w, st, "injected ServiceStatus failure")
+		if s.cpFail(w, "ServiceStatus") {
 			return
 		}
 		if !s.serviceEnabled {
@@ -345,8 +413,7 @@ func (s *Server) handleService(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID})
 	case http.MethodPost:
-		if st, ok := s.failFor("EnableService"); ok {
-			apiError(w, st, "injected EnableService failure")
+		if s.cpFail(w, "EnableService") {
 			return
 		}
 		s.serviceEnabled = true
@@ -361,8 +428,7 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusMethodNotAllowed, r.Method)
 		return
 	}
-	if st, ok := s.failFor("ListBuckets"); ok {
-		apiError(w, st, "injected ListBuckets failure")
+	if s.cpFail(w, "ListBuckets") {
 		return
 	}
 	names := make([]string, 0, len(s.buckets))
@@ -381,8 +447,7 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, name strin
 	b := s.buckets[name]
 	switch r.Method {
 	case http.MethodPost:
-		if st, ok := s.failFor("CreateBucket"); ok {
-			apiError(w, st, "injected CreateBucket failure")
+		if s.cpFail(w, "CreateBucket") {
 			return
 		}
 		if b != nil {
@@ -392,8 +457,7 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, name strin
 		s.buckets[name] = &bucket{Name: name, Tags: map[string]string{}}
 		writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID, fieldBucket: name})
 	case http.MethodGet:
-		if st, ok := s.failFor("GetBucket"); ok {
-			apiError(w, st, "injected GetBucket failure")
+		if s.cpFail(w, "GetBucket") {
 			return
 		}
 		if b == nil {
@@ -402,8 +466,7 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, name strin
 		}
 		writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID, fieldBucket: s.bucketJSON(b)})
 	case http.MethodDelete:
-		if st, ok := s.failFor("DeleteBucket"); ok {
-			apiError(w, st, "injected DeleteBucket failure")
+		if s.cpFail(w, "DeleteBucket") {
 			return
 		}
 		if b == nil {
@@ -426,8 +489,7 @@ func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusMethodNotAllowed, r.Method)
 		return
 	}
-	if st, ok := s.failFor("CreateGroup"); ok {
-		apiError(w, st, "injected CreateGroup failure")
+	if s.cpFail(w, "CreateGroup") {
 		return
 	}
 	var payload struct {
@@ -453,8 +515,7 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request, id st
 		apiError(w, http.StatusMethodNotAllowed, r.Method)
 		return
 	}
-	if st, ok := s.failFor("DeleteGroup"); ok {
-		apiError(w, st, "injected DeleteGroup failure")
+	if s.cpFail(w, "DeleteGroup") {
 		return
 	}
 	g := s.groups[id]
@@ -475,8 +536,7 @@ func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusMethodNotAllowed, r.Method)
 		return
 	}
-	if st, ok := s.failFor("ListGroups"); ok {
-		apiError(w, st, "injected ListGroups failure")
+	if s.cpFail(w, "ListGroups") {
 		return
 	}
 	ids := make([]string, 0, len(s.groups))
@@ -496,8 +556,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusMethodNotAllowed, r.Method)
 		return
 	}
-	if st, ok := s.failFor("CreateKey"); ok {
-		apiError(w, st, "injected CreateKey failure")
+	if s.cpFail(w, "CreateKey") {
 		return
 	}
 	g := s.groups[r.URL.Query().Get("credentials-group")]
@@ -527,8 +586,7 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request, keyID s
 		apiError(w, http.StatusMethodNotAllowed, r.Method)
 		return
 	}
-	if st, ok := s.failFor("DeleteKey"); ok {
-		apiError(w, st, "injected DeleteKey failure")
+	if s.cpFail(w, "DeleteKey") {
 		return
 	}
 	// Real-API fidelity: deleting a key without its group id is a 500.
@@ -552,8 +610,7 @@ func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusMethodNotAllowed, r.Method)
 		return
 	}
-	if st, ok := s.failFor("ListKeys"); ok {
-		apiError(w, st, "injected ListKeys failure")
+	if s.cpFail(w, "ListKeys") {
 		return
 	}
 	g := s.groups[r.URL.Query().Get("credentials-group")]

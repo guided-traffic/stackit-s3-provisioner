@@ -128,6 +128,20 @@ type BucketReconciler struct {
 	// already-provisioned, otherwise-unchanged bucket. Zero disables the requeue.
 	DriftResyncInterval time.Duration
 
+	// ProviderDegradedGrace, when > 0, is how long an already-provisioned Bucket
+	// keeps its Ready state while reconciles fail for a non-definitive reason —
+	// an unreachable provider, a gateway error page, a Kubernetes API blip.
+	// Ready describes the last verified state of the bucket, not the outcome of
+	// the last attempt to verify it, so a short provider outage no longer marks
+	// every Bucket in the cluster unhealthy at once and no longer cascades into
+	// the health checks that watch them.
+	//
+	// Once the grace elapses the Bucket drops to Failed as before, so a real
+	// outage still becomes visible; the window only decides how fast. Zero
+	// disables the hold entirely and restores the previous behavior, which makes
+	// it a values-only rollback that needs no new image.
+	ProviderDegradedGrace time.Duration
+
 	adminMu sync.Mutex
 	admin   *adminCreds // cached after the first successful bootstrap
 
@@ -288,6 +302,9 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	b.Status.OperatorVersion = r.OperatorVersion
 	b.Status.Phase = s3v1.PhaseReady
 	b.Status.Message = fmt.Sprintf("bucket %q provisioned with isolated workload credentials", name)
+	// The provider answered for every step of this pass, so any held-over
+	// degradation is over.
+	clearDegraded(b)
 	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{
 		Type:    s3v1.ConditionReady,
 		Status:  metav1.ConditionTrue,
@@ -598,6 +615,14 @@ type ownershipCollisionError struct {
 	detail string
 }
 
+// errCredentialDestroyed marks a failure that happened AFTER the workload's live
+// access key was deleted and before a replacement was published. Unlike an
+// unreachable provider, this is something the operator knows for certain about
+// this Bucket: the credential in the Secret no longer works. It therefore drops
+// Ready immediately instead of entering the degraded hold — the same treatment
+// the failNoRequeue faults get, only established mid-pass rather than up front.
+var errCredentialDestroyed = errors.New("workload credential destroyed and not replaced")
+
 func (e *ownershipCollisionError) Error() string {
 	return fmt.Sprintf("bucket %q already exists and is not owned by this operator (%s); refusing to adopt", e.name, e.detail)
 }
@@ -612,6 +637,10 @@ func (e *ownershipCollisionError) Error() string {
 // a key, nothing changes. Otherwise the group's keys are cleared (their secrets
 // are unrecoverable) and a fresh key is created and written — this heals a lost
 // Secret and, because clearing precedes creation, never leaves an orphan key.
+//
+// Errors raised after the clear are wrapped in errCredentialDestroyed: from that
+// point the workload's published credential is known dead, which the degraded
+// hold must not paper over.
 func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1.Bucket, groupID, host, bucketURL string) (string, error) {
 	secretKey := types.NamespacedName{Name: b.Spec.SecretRef.Name, Namespace: b.SecretNamespace()}
 
@@ -639,7 +668,7 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 	}
 	ak, err := r.Stackit.CreateAccessKey(ctx, groupID)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: create replacement access key: %w", errCredentialDestroyed, err)
 	}
 	data := b.SecretData(s3v1.SecretValues{
 		AccessKeyID:     ak.AccessKeyID,
@@ -653,7 +682,7 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 		if delErr := r.Stackit.DeleteAccessKey(ctx, groupID, ak.KeyID); delErr != nil {
 			log.FromContext(ctx).Error(delErr, "failed to roll back orphaned access key", "group", groupID)
 		}
-		return "", fmt.Errorf("write credentials secret %s: %w", secretKey, err)
+		return "", fmt.Errorf("%w: write credentials secret %s: %w", errCredentialDestroyed, secretKey, err)
 	}
 	return ak.AccessKeyID, nil
 }
@@ -1150,18 +1179,121 @@ func (r *BucketReconciler) deleteSecret(ctx context.Context, b *s3v1.Bucket) err
 	return nil
 }
 
-// fail records a failed reconcile (Ready=False, reason Failed) and requeues via
-// the returned error so the controller retries with backoff.
+// fail records a failed reconcile and requeues via the returned error so the
+// controller retries with backoff.
+//
+// An already-provisioned Bucket keeps its Ready state instead of dropping to
+// Failed while the failure is non-definitive and the grace window has not
+// elapsed — see degrade. The error is returned either way, so the retry, the
+// Warning event and controller_runtime_reconcile_errors_total are unaffected;
+// only the Bucket's advertised health changes.
 func (r *BucketReconciler) fail(ctx context.Context, b *s3v1.Bucket, err error) (ctrl.Result, error) {
-	r.markFailed(ctx, b, err)
+	if !r.degrade(ctx, b, err) {
+		r.markFailed(ctx, b, err)
+	}
 	return ctrl.Result{}, err
 }
 
 // failNoRequeue records a failed reconcile without returning an error, for
 // configuration faults that a retry cannot fix (they re-reconcile on spec change).
+//
+// These are the definitive faults — a Secret key collision, a secretRef aimed at
+// the admin Secret, a wrong region, an invalid composed name, an ownership
+// collision, an unusable clone source. Every one of them is a statement about
+// this Bucket that the operator established locally, so they always drop Ready
+// and never take the degraded path.
 func (r *BucketReconciler) failNoRequeue(ctx context.Context, b *s3v1.Bucket, err error) (ctrl.Result, error) {
 	r.markFailed(ctx, b, err)
 	return ctrl.Result{}, nil
+}
+
+// degrade holds a provisioned Bucket's Ready state through a reconcile failure
+// that says nothing about the Bucket, recording the degradation in
+// ConditionProviderReachable and status.degradedSince instead. It reports
+// whether it took ownership of the failure; false means the caller must fall
+// back to markFailed.
+//
+// The classification is by origin, not by parsing the error: everything routed
+// here failed while talking to the StackIT API, the S3 data plane or the
+// Kubernetes API, and an unrecognised failure of those is treated as "could not
+// verify" rather than "verified bad". That default is deliberate. Getting it
+// wrong in this direction costs a delayed signal, bounded by the grace window;
+// getting it wrong in the other direction marks every Bucket in the cluster
+// unhealthy on the first blip, which is the incident this exists to prevent.
+func (r *BucketReconciler) degrade(ctx context.Context, b *s3v1.Bucket, err error) bool {
+	if !r.holdsReadyThrough(b, err) {
+		return false
+	}
+
+	now := metav1.Now()
+	if b.Status.DegradedSince == nil {
+		b.Status.DegradedSince = &now
+	} else if now.Sub(b.Status.DegradedSince.Time) >= r.ProviderDegradedGrace {
+		// The provider has been unreachable for longer than the operator is
+		// willing to vouch for a state it can no longer verify. Hand back to
+		// markFailed, keeping degradedSince so the status records when it began.
+		return false
+	}
+
+	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{
+		Type:    s3v1.ConditionProviderReachable,
+		Status:  metav1.ConditionFalse,
+		Reason:  s3v1.ReasonProviderUnreachable,
+		Message: err.Error(),
+	})
+	b.Status.Message = err.Error()
+	b.Status.OperatorVersion = r.OperatorVersion
+	// The same Warning event as a hard failure: the degradation stays as visible
+	// in the event stream as it was before, only the condition differs.
+	r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed, err.Error())
+	if uerr := r.Status().Update(ctx, b); uerr != nil {
+		log.FromContext(ctx).V(1).Info("status update after degradation did not apply", "error", uerr.Error())
+	}
+	return true
+}
+
+// holdsReadyThrough reports whether b's Ready state may survive err.
+func (r *BucketReconciler) holdsReadyThrough(b *s3v1.Bucket, err error) bool {
+	if r.ProviderDegradedGrace <= 0 {
+		return false
+	}
+	// A Bucket being torn down has no Ready state worth defending, and showing
+	// one would hide a teardown blocked by the non-empty data-loss guard.
+	if !b.DeletionTimestamp.IsZero() {
+		return false
+	}
+	// A structured refusal is the provider's own answer, not a failure to reach
+	// it: a 401/403 from the API, or the token endpoint rejecting the
+	// service-account key with 400 invalid_grant. The latter is how a revoked or
+	// deleted key surfaces — it never reaches the Object Storage API at all — and
+	// masking either for the length of the grace window would blind exactly the
+	// response that matters most. A gateway page carrying the same status code
+	// does not match, see stackit.ProviderRefused.
+	if stackit.ProviderRefused(err) {
+		return false
+	}
+	// The operator deleted this workload's live access key in this very pass and
+	// could not publish a replacement. That is local certainty that the credential
+	// in the Secret is dead, not an unverifiable provider state, so the Bucket must
+	// stop advertising Ready at once.
+	if errors.Is(err, errCredentialDestroyed) {
+		return false
+	}
+	// Only a Bucket that has converged on its current spec has a verified Ready
+	// state to hold. If the user changed the spec and the new state cannot be
+	// reached, Ready=False is the honest answer.
+	return b.Status.ObservedGeneration == b.Generation &&
+		b.Status.Phase == s3v1.PhaseReady &&
+		meta.IsStatusConditionTrue(b.Status.Conditions, s3v1.ConditionReady)
+}
+
+// clearDegraded removes the degradation markers after a successful reconcile.
+// The condition is removed rather than set to True so that a Bucket which never
+// degraded and one which recovered look identical, and so an operator upgrade
+// writes nothing to Buckets that are simply healthy.
+func clearDegraded(b *s3v1.Bucket) {
+	b.Status.DegradedSince = nil
+	meta.RemoveStatusCondition(&b.Status.Conditions, s3v1.ConditionProviderReachable)
 }
 
 func (r *BucketReconciler) markFailed(ctx context.Context, b *s3v1.Bucket, err error) {

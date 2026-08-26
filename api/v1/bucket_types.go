@@ -19,6 +19,18 @@ const (
 	// set on Buckets that request a clone.
 	ConditionCloneCompleted = "CloneCompleted"
 
+	// ConditionProviderReachable is set to False while an already-provisioned
+	// Bucket keeps failing to reconcile for a reason that says nothing about the
+	// Bucket itself — the StackIT or Kubernetes API being unreachable or
+	// answering with a gateway error. The Ready condition deliberately stays
+	// True during that window (see BucketStatus.DegradedSince), so this is the
+	// condition that carries the degradation.
+	//
+	// It is absent on a healthy Bucket rather than present-and-True: a Bucket
+	// that has never degraded and one that has recovered look the same, and
+	// nothing is written to Buckets that were provisioned before this existed.
+	ConditionProviderReachable = "ProviderReachable"
+
 	// ReasonProvisioned indicates the bucket and its credentials are ready.
 	ReasonProvisioned = "Provisioned"
 	// ReasonProvisioning indicates provisioning is in progress.
@@ -35,6 +47,11 @@ const (
 	ReasonCloned = "Cloned"
 	// ReasonCloneFailed indicates the last clone attempt failed (it is retried).
 	ReasonCloneFailed = "CloneFailed"
+
+	// ReasonProviderUnreachable indicates the last reconcile of an already
+	// provisioned Bucket failed for a non-definitive reason and its Ready state
+	// is being held. It is the reason on ConditionProviderReachable.
+	ReasonProviderUnreachable = "ProviderUnreachable"
 )
 
 // BucketPhase is a coarse, human-readable summary of where a Bucket is in its
@@ -616,6 +633,22 @@ type BucketStatus struct {
 	// +optional
 	LastRotationTime *metav1.Time `json:"lastRotationTime,omitempty"`
 
+	// DegradedSince is when the operator first failed to reconcile this already
+	// provisioned Bucket for a reason that carries no information about the
+	// Bucket itself — an unreachable provider, a gateway error page, a
+	// Kubernetes API blip. While it is set, Ready is deliberately held at its
+	// last verified value and ConditionProviderReachable is False; the Bucket
+	// only drops to Failed once the degradation outlives the operator's grace
+	// window (--provider-degraded-grace). It is cleared on the next successful
+	// reconcile.
+	//
+	// A reconcile can therefore report Ready while the provider is unreachable.
+	// That is the intended trade: Ready describes the last verified state of the
+	// bucket, not the outcome of the last attempt to verify it, so a provider
+	// blip no longer marks every Bucket in the cluster unhealthy at once.
+	// +optional
+	DegradedSince *metav1.Time `json:"degradedSince,omitempty"`
+
 	// OperatorVersion is the version of the operator that last reconciled this Bucket.
 	// +optional
 	OperatorVersion string `json:"operatorVersion,omitempty"`
@@ -636,6 +669,7 @@ type BucketStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Whether the bucket is fully provisioned"
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.message",description="Current provisioning step or short failure reason"
 // +kubebuilder:printcolumn:name="Region",type="string",JSONPath=".spec.region",description="StackIT region"
+// +kubebuilder:printcolumn:name="Degraded",type="string",JSONPath=".status.degradedSince",description="Since when reconciles keep failing while Ready is held",priority=1
 // +kubebuilder:printcolumn:name="Clone",type="string",JSONPath=".status.clone.progress",description="Clone transfer progress",priority=1
 // +kubebuilder:printcolumn:name="Resolved",type="string",JSONPath=".status.resolvedBucketName",description="Physical bucket name in StackIT Object Storage",priority=1
 // +kubebuilder:printcolumn:name="Secret",type="string",JSONPath=".spec.secretRef.name",description="Secret holding the workload credentials",priority=1

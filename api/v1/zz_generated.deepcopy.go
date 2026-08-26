@@ -142,6 +142,10 @@ func (in *BucketStatus) DeepCopyInto(out *BucketStatus) {
 		in, out := &in.LastRotationTime, &out.LastRotationTime
 		*out = (*in).DeepCopy()
 	}
+	if in.DegradedSince != nil {
+		in, out := &in.DegradedSince, &out.DegradedSince
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))

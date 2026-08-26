@@ -46,6 +46,16 @@ var (
 		"Number of Bucket resources per clone phase (only Buckets with a clone).",
 		[]string{"phase"}, nil,
 	)
+	bucketsDegradedDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_buckets_provider_degraded",
+		"Number of Bucket resources whose Ready state is being held while reconciles keep failing for a non-definitive reason.",
+		nil, nil,
+	)
+	bucketDegradedSinceDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds",
+		"Unix time at which this Bucket started degrading; absent for Buckets that are not degraded.",
+		[]string{"namespace", "name"}, nil,
+	)
 	bucketsWipeOnDeleteDesc = prometheus.NewDesc(
 		"stackit_s3_provisioner_buckets_wipe_on_delete",
 		"Number of Bucket resources with spec.wipeOnDelete set to true.",
@@ -92,6 +102,8 @@ func RegisterBucketMetrics(reader client.Reader, skeletonMode, wipeGateEnabled b
 func (c *bucketMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- bucketsDesc
 	ch <- bucketsCloneDesc
+	ch <- bucketsDegradedDesc
+	ch <- bucketDegradedSinceDesc
 	ch <- bucketsWipeOnDeleteDesc
 	ch <- skeletonModeDesc
 	ch <- wipeGateDesc
@@ -117,6 +129,7 @@ func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	byPhase := map[s3v1.BucketPhase]int{}
 	byClonePhase := map[s3v1.ClonePhase]int{}
 	wipeOnDelete := 0
+	degraded := 0
 	for i := range buckets.Items {
 		b := &buckets.Items[i]
 		phase := b.Status.Phase
@@ -129,6 +142,21 @@ func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		if b.Spec.WipeOnDelete {
 			wipeOnDelete++
+		}
+		// Both degraded metrics describe a hold that is actually in effect, so
+		// they require phase Ready as well. status.degradedSince deliberately
+		// survives into phase Failed once the grace elapses — it records when the
+		// trouble began — but at that point the Bucket is no longer being held
+		// and is covered by the Failed phase gauge instead. Counting it here too
+		// would report a hold that has already been given up.
+		if t := b.Status.DegradedSince; t != nil && phase == s3v1.PhaseReady {
+			degraded++
+			// Per Bucket rather than one aggregate timestamp: alerting on how
+			// long a degradation has lasted is only actionable if it names the
+			// Bucket. Absent while healthy, so `time() - <series>` is the age of
+			// the hold wherever the series exists.
+			ch <- prometheus.MustNewConstMetric(bucketDegradedSinceDesc, prometheus.GaugeValue,
+				float64(t.Unix()), b.Namespace, b.Name)
 		}
 		if t := b.Status.LastRotationTime; t != nil {
 			ch <- prometheus.MustNewConstMetric(lastRotationDesc, prometheus.GaugeValue,
@@ -145,6 +173,7 @@ func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 			float64(byClonePhase[phase]), string(phase))
 	}
 	ch <- prometheus.MustNewConstMetric(bucketsWipeOnDeleteDesc, prometheus.GaugeValue, float64(wipeOnDelete))
+	ch <- prometheus.MustNewConstMetric(bucketsDegradedDesc, prometheus.GaugeValue, float64(degraded))
 }
 
 func boolGauge(b bool) float64 {

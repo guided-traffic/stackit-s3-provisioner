@@ -38,8 +38,26 @@ func TestBucketMetricsCollector(t *testing.T) {
 
 	fresh := newBucket("ns-c", "fresh", "uid-5") // no status yet -> Unknown
 
+	// A Bucket whose Ready state is being held through provider failures: it
+	// still counts as Ready in the phase gauge, which is precisely why the
+	// degraded gauges have to exist alongside it.
+	degraded := newBucket("ns-c", "degraded", "uid-6")
+	degraded.Status.Phase = s3v1.PhaseReady
+	degraded.Status.DegradedSince = &metav1.Time{Time: time.Unix(1700000500, 0)}
+
+	// A second degradation proves the timestamp series is emitted per Bucket.
+	degradedOlder := newBucket("ns-c", "degraded-older", "uid-7")
+	degradedOlder.Status.Phase = s3v1.PhaseReady
+	degradedOlder.Status.DegradedSince = &metav1.Time{Time: time.Unix(1700000100, 0)}
+
+	// A Bucket that already gave up the hold: degradedSince survives to record
+	// when the trouble started, but it must not be counted as held any more.
+	gaveUp := newBucket("ns-c", "gave-up", "uid-8")
+	gaveUp.Status.Phase = s3v1.PhaseFailed
+	gaveUp.Status.DegradedSince = &metav1.Time{Time: time.Unix(1700000200, 0)}
+
 	cl := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(ready, failed, cloning, cloneFailed, fresh).Build()
+		WithObjects(ready, failed, cloning, cloneFailed, fresh, degraded, degradedOlder, gaveUp).Build()
 
 	c := &bucketMetricsCollector{reader: cl, skeletonMode: true, wipeGateEnabled: false}
 	expected := `
@@ -47,8 +65,8 @@ func TestBucketMetricsCollector(t *testing.T) {
 # TYPE stackit_s3_provisioner_buckets gauge
 stackit_s3_provisioner_buckets{phase="Pending"} 0
 stackit_s3_provisioner_buckets{phase="Provisioning"} 2
-stackit_s3_provisioner_buckets{phase="Ready"} 1
-stackit_s3_provisioner_buckets{phase="Failed"} 1
+stackit_s3_provisioner_buckets{phase="Ready"} 3
+stackit_s3_provisioner_buckets{phase="Failed"} 2
 stackit_s3_provisioner_buckets{phase="Deleting"} 0
 stackit_s3_provisioner_buckets{phase="Unknown"} 1
 # HELP stackit_s3_provisioner_buckets_clone Number of Bucket resources per clone phase (only Buckets with a clone).
@@ -56,6 +74,13 @@ stackit_s3_provisioner_buckets{phase="Unknown"} 1
 stackit_s3_provisioner_buckets_clone{phase="Running"} 1
 stackit_s3_provisioner_buckets_clone{phase="Completed"} 0
 stackit_s3_provisioner_buckets_clone{phase="Failed"} 1
+# HELP stackit_s3_provisioner_buckets_provider_degraded Number of Bucket resources whose Ready state is being held while reconciles keep failing for a non-definitive reason.
+# TYPE stackit_s3_provisioner_buckets_provider_degraded gauge
+stackit_s3_provisioner_buckets_provider_degraded 2
+# HELP stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds Unix time at which this Bucket started degrading; absent for Buckets that are not degraded.
+# TYPE stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds gauge
+stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds{name="degraded",namespace="ns-c"} 1.7000005e+09
+stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds{name="degraded-older",namespace="ns-c"} 1.7000001e+09
 # HELP stackit_s3_provisioner_buckets_wipe_on_delete Number of Bucket resources with spec.wipeOnDelete set to true.
 # TYPE stackit_s3_provisioner_buckets_wipe_on_delete gauge
 stackit_s3_provisioner_buckets_wipe_on_delete 2

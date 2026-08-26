@@ -17,6 +17,8 @@ Source-of-Truth fürs Live-Credential, Policy self-heilend bei Drift. **Ohne SA-
 
 ```
 stackit/client.go                        API-Wrapper (Auth, Bucket-/Group-/AccessKey-Ops, S3-Endpoint, Find/EnsureGroup)
+stackit/errors.go                        Fehler-Klassifikation: ProviderRefused / isServiceNotEnabled via json.Valid(Body)
+stackit/retry.go                         Retry-RoundTripper (nur GET/HEAD) unter der SDK-Auth
 stackit/s3.go                            Data-Plane: S3Admin (minio) Put/Get-Policy + BucketEmpty, BuildIsolationPolicy §4.1
 stackit/client_test.go                   Offline-Unit-Tests (Key-Parsing)
 stackit/s3_test.go                       Offline-Unit-Tests (Policy-Builder + Drift-Vergleich)
@@ -29,6 +31,7 @@ cmd/main.go                              controller-runtime Manager (stackit.Cli
 internal/controller/bucket_controller.go Reconciler (VOLL: §8-Provisioning + Admin-Bootstrap + Finalizer-Teardown)
 internal/controller/clone.go             Bucket-Clone (spec.cloneFrom): rclone-Job, Staging-Secret, rc-Progress-Polling
 internal/controller/reconciler_grants_test.go Offline-Tests Read-Grants (spec.grantReadAccess) + Watch-Mapping
+internal/controller/reconciler_degraded_test.go Offline-Tests Sticky-Ready (Halten, Grace-Ablauf, Auth-Ausnahme, Teardown)
 internal/controller/reconciler_*_test.go Offline-Reconciler-Tests (fake k8s-Client + stackitfake, inkl. Fehlerpfade)
 internal/stackitfake/                    In-Memory-Fake der StackIT-API (Control-Plane REST + S3-XML) für Offline-Tests
 config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
@@ -101,6 +104,18 @@ Zwei Ebenen:
 - AccessKey-Response: `accessKey`=S3-Key-ID, `secretAccessKey`=Secret, `keyId`=interne Lösch-ID.
 - S3-Endpoint eu01: `object.storage.eu01.onstackit.cloud`, **Path-Style**, **SigV4**
   (Host aus `Bucket.urlPathStyle` ableitbar).
+- `config.WithMaxRetries` ist seit core v0.26.0 ein **No-Op** (`func WithMaxRetries(_ int)`) — SDK retryt nicht.
+  `config.WithHTTPClient` wird von `auth.SetupAuth` als *innerer* Transport uebernommen (auth.go:222),
+  ein RoundTripper dort deckt API-Requests **und** Token-Fetches ab und laeuft unter der Auth.
+- **Entzogener SA-Key = Token-Endpoint 400 `{"error":"invalid_grant"}`**, NICHT 401/403 der API — der
+  Key-Flow erreicht die API gar nicht. Der SDK stempelt Token-Endpoint-Status/Body in denselben
+  `GenericOpenAPIError`. Live verifiziert 2026-08-25.
+- **Fehler-Diskriminator ist `json.Valid(apiErr.Body)`, nicht der Statuscode.** Ein Gateway/WAF erzeugt
+  denselben `*oapierror.GenericOpenAPIError` mit HTML-Body. `oapierror.Model` taugt NICHT: der SDK
+  dekodiert jeden Body in `objectstorage.ErrorMessage` (nur `Detail`), fremdgeformtes JSON landet
+  fehlerfrei in einer leeren Struct. Live verifiziert 2026-08-25 (INIT-SETUP.md §8.2).
+- `GetServiceStatus`: 200 = aktiviert, strukturiertes **404** = nicht aktiviert, strukturiertes **403** =
+  nicht berechtigt. Nur beim 404 darf `EnableService` folgen.
 - `objectstorage`-Top-Level-Paket ist **deprecated ab 2026-09-30** → später aufs versionierte Subpaket migrieren.
 
 ## Credentials-Secret (Vertrag)
@@ -182,6 +197,19 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   löscht vorher alle Objekte (inkl. Versions/Delete-Markers, `S3Admin.WipeBucket`) — nur wenn
   Feature-Gate an (`--enable-wipe-on-delete` / Helm `wipeOnDelete.enabled`, Default aus) **und**
   Ownership-Tags passen; sonst Degradierung auf Empty-Only + Warning-Event `WipeOnDeleteSkipped`.
+- **Transiente Provider-Fehler (§8.2, implementiert 2026-08-25):** `Ready` beschreibt den zuletzt
+  **verifizierten** Zustand, nicht das Ergebnis des letzten Verifikationsversuchs. `fail` haelt `Ready`
+  eines provisionierten Buckets, `degrade` schreibt stattdessen `status.degradedSince` +
+  `ProviderReachable=False`; nach `--provider-degraded-grace` (Helm `providerDegradedGrace`, Default 30m,
+  `0` = aus) faellt der Bucket wie vorher auf `Failed`. Klassifikation **nach Herkunft**: `failNoRequeue`
+  = definitiv (Spec-Guards, Ownership-Collision, `validateCloneSource`), `fail` = nicht-definitiv.
+  Unbekannte Fehler sind per Konstruktion nicht-definitiv. **Ausnahmen** (fallen sofort):
+  `stackit.ProviderRefused` = strukturiertes **400/401/403** — 400 ist das Fehlerbild eines entzogenen
+  SA-Keys (Token-Endpoint `invalid_grant`, der Key-Flow erreicht die API nie; live verifiziert
+  2026-08-25); `errCredentialDestroyed` = Key geloescht, Ersatz nicht publiziert (lokale Gewissheit,
+  ueber Rotations-Annotation ohne Generations-Bump erreichbar); Teardown;
+  `ObservedGeneration != Generation`; nie-Ready. Fehler wird weiterhin zurueckgegeben, also feuert
+  `StackitS3ReconcileErrors` unveraendert; zusaetzlich `StackitS3BucketProviderDegraded`.
 - **Guards (produktionssicher):** CR darf `secretRef` **nicht** aufs Admin-Secret zeigen (sonst
   Pollution + Admin-Lockout beim Delete); `spec.region` muss = Operator-Region sein (Single-Region v1).
   Beides → `Ready=Failed` ohne Requeue-Hammer.
@@ -221,6 +249,9 @@ Reconciler steht, alle Offline/lint/gosec/envtest-Checks grün. **Erledigt:** En
 über den Reconciler gegen die echte StackIT-API (`make e2e-stackit`, Kind + echter SA-Key) inkl.
 Read-Grants; Layer-2-Policy-Enforcement mit 3 Statements direkt gegen StorageGRID
 (`go test -tags integration ./stackit/ -run IntegrationReadGrant`).
+**Erledigt (2026-08-25):** Transiente Provider-Fehler (INIT-SETUP.md §8.2) — EnsureService eskaliert
+keinen fehlgeschlagenen Read mehr zu einem Write + prozessweiter Cache, Retry-RoundTripper fuer GET/HEAD
+unter der SDK-Auth, Sticky-`Ready` mit begrenztem Grace. Ticket `local_s3-provisioner-transient-errors.md`.
 **Offen:** (1) Clone-Feature mit echtem rclone-Image im e2e (offline nur Fake-Job-Lifecycle);
 (2) die beiden präexistenten Sicherheits-Befunde oben; (3) Q2 (Minimal-Rolle), Q4 (Bucket-Namensraum).
 RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) — bereits von den cluster-weiten

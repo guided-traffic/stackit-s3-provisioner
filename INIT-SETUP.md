@@ -376,6 +376,130 @@ in den frisch provisionierten Bucket. Kern-Entscheidungen:
   zurück auf die CR (Cross-Namespace-OwnerRef nicht erlaubt).
 - **RBAC neu:** `batch/jobs` CRUD + `pods` get/list/watch (Pod-IP für rc-Polling).
 
+### 8.2 Transiente Provider-Fehler — implementiert (2026-08-25)
+
+Anlass: Incident mgmt-p 2026-08-25. Zwei Ereignisse, dieselbe Verstaerkerkette
+(Provider-Blip → alle Buckets non-Ready → alle Flux-Kustomizations non-Ready →
+clusterweiter Alarmsturm):
+
+1. **08:13–08:15 UTC** — StackIT-API antwortete `403` als **nginx-HTML-Seite**
+   (SDK: `undefined response type, status code 403`). 342 Reconcile-Fehler in
+   ~2 Minuten, alle 19 Buckets gleichzeitig non-Ready.
+2. **10:37 UTC** — ein einzelnes `ensure bucket: unexpected EOF`.
+
+**Verifizierte API-Semantik** (Live-Messung 2026-08-25, `GetServiceStatus`, eu01):
+
+| Fall | Status | Body | `json.Valid(Body)` |
+| ---- | ------ | ---- | ------------------ |
+| Object Storage aktiviert | 200 | `{"project":"<uuid>","scope":"PUBLIC"}` | — |
+| Object Storage **nicht** aktiviert | **404** | `{"detail":[{"key":"project.not_found","msg":"The project could not be found"}]}` | `true` |
+| **Keine Berechtigung** | **403** | `{"timestamp":…,"path":…,"status":403,"error":"Forbidden","message":"Unauthorized"}` | `true` |
+
+Die 403-Faelle wurden gegen nicht existierende Projekt-IDs gemessen, das 404
+gegen ein reales Projekt ohne Object Storage; Gegenprobe mit zwei realen
+Fremdprojekten ergab 200, also trennt die API sauber zwischen "nicht berechtigt"
+(403) und "berechtigt, Service nicht aktiviert" (404).
+
+**Wichtige Einschraenkung dieser Messung:** sie lief mit einem GUELTIGEN Key.
+Das 403 bedeutet "dieser Key darf nicht auf dieses Projekt" — es ist NICHT das
+Fehlerbild eines entzogenen Keys. Ein geloeschter oder rotierter SA-Key erreicht
+die Object-Storage-API ueberhaupt nicht: der Key-Flow scheitert vorher am
+Token-Endpoint. Ebenfalls live gemessen (2026-08-25,
+`https://accounts.stackit.cloud/oauth/v2/token`):
+
+| Fall | Status | Body |
+| ---- | ------ | ---- |
+| Key entzogen / nicht vorhanden | **400** | `{"error":"invalid_grant"}` (Content-Type `application/json`, RFC 6749 §5.2) |
+
+Der SDK stempelt Status und Body des Token-Endpoints in denselben
+`*oapierror.GenericOpenAPIError` wie API-Fehler (`core/clients/auth_flow.go`
+`parseTokenResponse`), beide Fehlerbilder kommen also in einer Form an — deshalb
+enthaelt die Definitiv-Menge unten **400**. Eine erste Fassung matchte nur
+401/403 und haette nach einer Key-Sperrung die ganze Flotte fuer das volle
+Grace-Fenster auf `Ready=True` gehalten.
+
+**Entscheidender Diskriminator: `json.Valid(apiErr.Body)`, nicht der Statuscode.**
+Ein Gateway/WAF vor der API erzeugt denselben `*oapierror.GenericOpenAPIError`
+mit dessen Statuscode, aber einem HTML-Body — genau der 08:13-Fall. `oapierror.Model`
+taugt NICHT als Diskriminator: der SDK dekodiert jeden Fehlerbody in
+`objectstorage.ErrorMessage` (nur Feld `Detail`), sodass der andersgeformte
+403-JSON-Body fehlerfrei in eine leere Struct dekodiert. Nur der Rohbody trennt.
+
+**Drei Massnahmen (`stackit/errors.go`, `stackit/retry.go`, Reconciler):**
+
+1. **`EnsureService` eskaliert einen fehlgeschlagenen Read nicht mehr zu einem
+   Write.** Vorher wurde JEDER `GetServiceStatus`-Fehler als "nicht aktiviert"
+   gelesen und `EnableService` versucht — pro Bucket, pro Reconcile. Jetzt nur
+   noch bei strukturiertem 404 (`isServiceNotEnabled`); alles andere wird
+   durchgereicht. Ausserdem wird ein verifiziertes "aktiviert" prozessweit
+   gecacht (`Client.serviceReady`), da das Projekt unter einem laufenden Operator
+   nicht deaktiviert werden kann, ohne dass alles andere ebenfalls bricht.
+2. **Retry-`RoundTripper` unter der Authentifizierung.** `config.WithMaxRetries`
+   ist seit core v0.26.0 ein No-Op, der SDK retryt also gar nicht.
+   `config.WithHTTPClient` wird von `auth.SetupAuth` als *innerer* Transport des
+   Key-Flows uebernommen (`core@v0.26.0/auth/auth.go:222`), der Retry deckt damit
+   API-Requests **und** Token-Fetches ab, und jeder Versuch traegt den bereits
+   gesetzten Authorization-Header. **Nur GET/HEAD** werden wiederholt: ein
+   abgebrochener Write ist mehrdeutig, und ein wiederholtes `CreateAccessKey`
+   wuerde einen zweiten Key erzeugen, dessen Secret nur einmal zurueckkommt und
+   dann verloren waere. Die S3-Data-Plane braucht das nicht — minio-go retryt selbst.
+3. **`Ready` ueberlebt einen nicht-definitiven Fehler** (`BucketReconciler.degrade`).
+   `Ready` beschreibt den zuletzt **verifizierten** Zustand des Buckets, nicht das
+   Ergebnis des letzten Verifikationsversuchs.
+
+**Klassifikation nach Herkunft, nicht nach Fehlertext.** Die vorhandene Trennung
+`fail` vs. `failNoRequeue` kodierte die Unterscheidung bereits — sie war fuer die
+Requeue-Hammer-Vermeidung gebaut und deckt sich exakt:
+
+- `failNoRequeue` (definitiv, `Ready` faellt immer): Spec-Guards, ungueltiger
+  komponierter Bucketname, `validateCloneSource`, Ownership-Collision. Alles
+  Aussagen ueber *diesen* Bucket, die der Operator lokal festgestellt hat.
+- `fail` (nicht-definitiv, `Ready` wird gehalten): jeder Fehler beim Reden mit der
+  StackIT-API, der S3-Data-Plane oder der Kubernetes-API.
+
+Der Default fuer unbekannte Fehler faellt damit *per Konstruktion* auf "konnte
+nicht verifizieren". Das ist Absicht: ein falsch gehaltenes `Ready` kostet ein
+verzoegertes Signal, begrenzt durch das Grace-Fenster; ein falsch fallengelassenes
+`Ready` markiert die ganze Flotte beim ersten Blip als krank.
+
+**Ausnahmen vom Halten** (fallen sofort auf `Failed`):
+
+- **Strukturierte Ablehnung durch den Provider** (`stackit.ProviderRefused`:
+  `errors.As` auf `*oapierror.GenericOpenAPIError` **und** `json.Valid(Body)`
+  **und** Status ∈ {400,401,403}). 401/403 = die Object-Storage-API lehnt einen
+  authentifizierten Request ab; **400 = der Token-Endpoint lehnt den SA-Key ab**,
+  das Fehlerbild eines entzogenen Keys. Muss sofort sichtbar bleiben — sonst
+  sieht die Flotte nach einer Key-Sperrung 30 Minuten lang gruen aus, waehrend
+  sie tot ist. Die `json.Valid`-Bedingung ist nicht kosmetisch: ohne sie waere
+  der 08:13-Gateway-403 wieder "definitiv" und der Incident reproduziert.
+- **Vom Operator zerstoertes Workload-Credential** (`errCredentialDestroyed`).
+  `ensureAccessKeyAndSecret` loescht erst alle Group-Keys, dann legt es den neuen
+  an (leak-frei). Scheitert der Create oder der Secret-Write danach, ist das
+  publizierte Credential nachweislich tot — lokale Gewissheit, kein
+  unverifizierbarer Provider-Zustand. Erreichbar ohne Spec-Aenderung: der
+  Rotations-Trigger ist eine reine Annotation, `metadata.generation` bewegt sich
+  nicht, der Generations-Guard greift also nicht.
+- Bucket im Teardown (`DeletionTimestamp` gesetzt) — sonst waere ein durch den
+  Data-Loss-Guard blockiertes Delete unsichtbar.
+- `ObservedGeneration != Generation` — geaenderte Spec wurde nie verifiziert.
+- Bucket war nie `Ready`.
+
+**Begrenzung:** `--provider-degraded-grace` (Helm `providerDegradedGrace`,
+Default `30m`, `0` = aus). Nach Ablauf faellt der Bucket wie vorher auf `Failed`.
+Waehrend des Haltens: `status.degradedSince`, Condition `ProviderReachable=False`,
+unveraenderte Warning-Events, und der Reconcile gibt den Fehler weiter zurueck —
+`controller_runtime_reconcile_errors_total` und der bestehende
+`StackitS3ReconcileErrors`-Alarm feuern also sofort wie bisher. Zusaetzlich
+`stackit_s3_provisioner_buckets_provider_degraded` +
+`StackitS3BucketProviderDegraded`, damit das Halten selbst nie stillschweigend
+passiert.
+
+**Bewusst NICHT gemacht:** eine Taxonomie transienter Fehlermuster (Stringmatch
+auf `unexpected EOF`, `undefined response type`, 5xx-Listen). Diese Liste ist
+provider-kontrolliert und offen — sie kann nie fertig sein, und jeder nicht
+gelistete Fehler faellt auf den falschen Default. Die hier gepflegte Liste
+definitiver Faelle ist geschlossen und gehoert uns.
+
 ## 9. Machbarkeits-Smoke-Test — VERIFIZIERT (2026-06-30)
 
 Minimaler Go-Code gegen die **echte** StackIT-API, mit beiden Service-Account-Keys

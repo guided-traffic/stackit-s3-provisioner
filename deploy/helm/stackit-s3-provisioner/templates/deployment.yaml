@@ -63,6 +63,7 @@ spec:
             - --enable-wipe-on-delete
             {{- end }}
             - --drift-resync-interval={{ .Values.driftResyncInterval }}
+            - --provider-degraded-grace={{ .Values.providerDegradedGrace }}
             - --clone-image={{ .Values.clone.image.repository }}:{{ .Values.clone.image.tag }}
           env:
             - name: POD_NAMESPACE
