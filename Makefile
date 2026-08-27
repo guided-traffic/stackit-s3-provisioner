@@ -287,7 +287,7 @@ GOLANGCI_LINT_VERSION ?= v2.13.1
 # renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
 # renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
-GOSEC_VERSION ?= v2.28.0
+GOSEC_VERSION ?= v2.29.0
 
 # Cyclomatic complexity threshold (recommended: 10-15)
 CYCLO_THRESHOLD ?= 15
