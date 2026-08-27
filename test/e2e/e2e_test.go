@@ -80,7 +80,15 @@ func TestOperatorIsHealthy(t *testing.T) {
 
 // TestBucketSkeletonReconcile creates a Bucket and asserts the operator wires it
 // through the skeleton reconcile path, then cleans it up.
+//
+// Skipped when the operator was deployed with a real service-account key: the
+// assertions below describe the no-cloud path, and running them against a live
+// key would silently provision a real bucket under the guise of a skeleton test.
+// The cloud path has its own coverage in cloud_test.go.
 func TestBucketSkeletonReconcile(t *testing.T) {
+	if os.Getenv("E2E_STACKIT") == "1" {
+		t.Skip("E2E_STACKIT=1: operator provisions for real; see cloud_test.go")
+	}
 	_, dyn := clients(t)
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()

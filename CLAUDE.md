@@ -17,6 +17,8 @@ Source-of-Truth fürs Live-Credential, Policy self-heilend bei Drift. **Ohne SA-
 
 ```
 stackit/client.go                        API-Wrapper (Auth, Bucket-/Group-/AccessKey-Ops, S3-Endpoint, Find/EnsureGroup)
+stackit/errors.go                        Fehler-Klassifikation: ProviderRefused / isServiceNotEnabled via json.Valid(Body)
+stackit/retry.go                         Retry-RoundTripper (nur GET/HEAD) unter der SDK-Auth
 stackit/s3.go                            Data-Plane: S3Admin (minio) Put/Get-Policy + BucketEmpty, BuildIsolationPolicy §4.1
 stackit/client_test.go                   Offline-Unit-Tests (Key-Parsing)
 stackit/s3_test.go                       Offline-Unit-Tests (Policy-Builder + Drift-Vergleich)
@@ -28,12 +30,16 @@ api/v1/bucket_types.go                    CRD `Bucket` (stackit-bucket.gtrfc.com
 cmd/main.go                              controller-runtime Manager (stackit.Client + Admin-Secret-Name/-Namespace)
 internal/controller/bucket_controller.go Reconciler (VOLL: §8-Provisioning + Admin-Bootstrap + Finalizer-Teardown)
 internal/controller/clone.go             Bucket-Clone (spec.cloneFrom): rclone-Job, Staging-Secret, rc-Progress-Polling
+internal/controller/reconciler_grants_test.go Offline-Tests Read-Grants (spec.grantReadAccess) + Watch-Mapping
+internal/controller/reconciler_degraded_test.go Offline-Tests Sticky-Ready (Halten, Grace-Ablauf, Auth-Ausnahme, Teardown)
 internal/controller/reconciler_*_test.go Offline-Reconciler-Tests (fake k8s-Client + stackitfake, inkl. Fehlerpfade)
 internal/stackitfake/                    In-Memory-Fake der StackIT-API (Control-Plane REST + S3-XML) für Offline-Tests
 config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
 deploy/helm/stackit-s3-provisioner/      Helm-Chart (CRD via `make sync-helm-crd` synchronisiert)
 test/integration/                        //go:build integration — envtest gegen echten API-Server
-test/e2e/                                //go:build e2e — Kind-Smoke (Operator healthy + CR reconciled)
+test/e2e/e2e_test.go                     //go:build e2e — Kind-Smoke Skeleton-Mode (Operator healthy + CR reconciled)
+test/e2e/cloud_test.go                   //go:build e2e — Kind gegen ECHTE API (E2E_STACKIT=1): Provisioning + Read-Grants
+hack/e2ecleanup/                         Sweep fuer Cloud-Reste eines abgebrochenen e2e-Laufs (inkl. verwaister Admin-Key)
 Makefile / Containerfile / renovate.json CI-Gerüst (an Valkey-Operator orientiert)
 .github/workflows/                       release.yml (Test+Release), build.yml (Docker+Helm), renovate.yml
 account-1.json / account-2.json          SA-Keys (ECHTE RSA-Private-Keys, .gitignore'd, NIE committen)
@@ -54,10 +60,13 @@ make help                       # alle Targets
 make generate-all               # CRD + DeepCopy regenerieren, Helm-Chart-CRD syncen (nach api/v1-Änderung!)
 make lint gosec vuln cyclo      # Linter + Security-Scans (wie CI)
 make test-unit-coverage         # Unit (offline), make test-integration-coverage = envtest
-make e2e-local                  # Kind hochziehen, via Helm installieren, e2e-Smoke
+make e2e-local                  # Kind hochziehen, via Helm installieren, e2e-Smoke (Skeleton, kein Cloud-Call)
+make e2e-stackit                # Kind + ECHTER SA-Key: legt reale Buckets/Groups/Keys an, raeumt garantiert ab
+make e2e-stackit-sweep-dry      # zeigt Cloud-Reste eines abgebrochenen Laufs (nur Report)
+make e2e-stackit-sweep          # loescht diese Reste inkl. verwaister operator-admin-Group
 ```
 
-Integration-Tests treffen die **echte** StackIT-API (Projekte `1f426c6e…` und `eb4205a7…`,
+Integration-Tests treffen die **echte** StackIT-API (Projekte `ebc9d379…` und `5ad5e488…`,
 Region `eu01`), erzeugen + löschen reale Buckets/Groups/Keys. Skippen automatisch ohne SA-Key-Dateien.
 
 ## Architektur (Kern)
@@ -95,6 +104,18 @@ Zwei Ebenen:
 - AccessKey-Response: `accessKey`=S3-Key-ID, `secretAccessKey`=Secret, `keyId`=interne Lösch-ID.
 - S3-Endpoint eu01: `object.storage.eu01.onstackit.cloud`, **Path-Style**, **SigV4**
   (Host aus `Bucket.urlPathStyle` ableitbar).
+- `config.WithMaxRetries` ist seit core v0.26.0 ein **No-Op** (`func WithMaxRetries(_ int)`) — SDK retryt nicht.
+  `config.WithHTTPClient` wird von `auth.SetupAuth` als *innerer* Transport uebernommen (auth.go:222),
+  ein RoundTripper dort deckt API-Requests **und** Token-Fetches ab und laeuft unter der Auth.
+- **Entzogener SA-Key = Token-Endpoint 400 `{"error":"invalid_grant"}`**, NICHT 401/403 der API — der
+  Key-Flow erreicht die API gar nicht. Der SDK stempelt Token-Endpoint-Status/Body in denselben
+  `GenericOpenAPIError`. Live verifiziert 2026-08-25.
+- **Fehler-Diskriminator ist `json.Valid(apiErr.Body)`, nicht der Statuscode.** Ein Gateway/WAF erzeugt
+  denselben `*oapierror.GenericOpenAPIError` mit HTML-Body. `oapierror.Model` taugt NICHT: der SDK
+  dekodiert jeden Body in `objectstorage.ErrorMessage` (nur `Detail`), fremdgeformtes JSON landet
+  fehlerfrei in einer leeren Struct. Live verifiziert 2026-08-25 (INIT-SETUP.md §8.2).
+- `GetServiceStatus`: 200 = aktiviert, strukturiertes **404** = nicht aktiviert, strukturiertes **403** =
+  nicht berechtigt. Nur beim 404 darf `EnableService` folgen.
 - `objectstorage`-Top-Level-Paket ist **deprecated ab 2026-09-30** → später aufs versionierte Subpaket migrieren.
 
 ## Credentials-Secret (Vertrag)
@@ -154,11 +175,41 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   Operator mutiert Annotation nie), Event `CredentialsRotated`.
 - **Policy (`ensureBucketPolicy`):** `BuildIsolationPolicy` (§4.1), nur bei Drift neu setzen
   (`PoliciesEquivalent`). Self-healing gegen manuelle Änderungen.
+- **Read-Grants (`spec.grantReadAccess`, INIT-SETUP.md §4.1.1):** Producer-Seite — der
+  Daten-Bucket listet `Bucket`-CRs **seines Namespace**, deren Workload-Group nur-lesend
+  darf. Drittes Policy-Statement + Reader in Stmt-1-`NotPrincipal`; ohne Grant Dokument
+  byte-identisch zu vorher (kein Rewrite beim Upgrade). Reader-URN kommt **nie** aus
+  `status.credentialsGroupURN` (fälschbar via `buckets/status`), sondern aus
+  `workloadGroupName(grantee)` → Control-Plane-Lookup; `BuildIsolationPolicy` filtert
+  Admin- + Workload-URN zusätzlich raus (Lockout- bzw. Owner-Verengungs-Schutz).
+  Unauflösbarer Grant = Skip + Event `ReadGrantPending`, blockiert `Ready` nicht.
+  Mehrdeutiger Group-Displayname (mehrfach im Projekt) = Grant **verweigert**, nicht geraten.
+  **Während eines laufenden Clones bleiben Reader aus der Policy** (`holdSecretUntilCloned`
+  schützt nur den eigenen Workload; ein Reader hat schon Credentials) — nach Clone-Erfolg
+  wird die Policy im selben Pass mit Readern neu geschrieben.
+  Grantee publiziert `status.credentialsGroupURN` **sofort** nach Group-Create, nicht erst
+  bei Ready — sonst weckt ein selbst noch klonender Grantee seine Grantoren nie.
+  Zweiter Bucket-Watch (`granteeCredentialsPredicate`, nur Create/Delete/URN-Wechsel/
+  Deletion-Start) weckt Grantoren — sonst Hot-Loop über Status-Writes.
+  Status: `status.grantedReadTo`. Self-Grant per Root-CEL abgelehnt (envtest-verifiziert).
 - **Finalizer-Teardown:** Empty-Check **zuerst** (Admin-S3, Data-Loss-Guard) → dann Keys → Group →
   Bucket → Secret. Shared Admin-Group wird **nie** angefasst. Opt-in-Wipe: `spec.wipeOnDelete`
   löscht vorher alle Objekte (inkl. Versions/Delete-Markers, `S3Admin.WipeBucket`) — nur wenn
   Feature-Gate an (`--enable-wipe-on-delete` / Helm `wipeOnDelete.enabled`, Default aus) **und**
   Ownership-Tags passen; sonst Degradierung auf Empty-Only + Warning-Event `WipeOnDeleteSkipped`.
+- **Transiente Provider-Fehler (§8.2, implementiert 2026-08-25):** `Ready` beschreibt den zuletzt
+  **verifizierten** Zustand, nicht das Ergebnis des letzten Verifikationsversuchs. `fail` haelt `Ready`
+  eines provisionierten Buckets, `degrade` schreibt stattdessen `status.degradedSince` +
+  `ProviderReachable=False`; nach `--provider-degraded-grace` (Helm `providerDegradedGrace`, Default 30m,
+  `0` = aus) faellt der Bucket wie vorher auf `Failed`. Klassifikation **nach Herkunft**: `failNoRequeue`
+  = definitiv (Spec-Guards, Ownership-Collision, `validateCloneSource`), `fail` = nicht-definitiv.
+  Unbekannte Fehler sind per Konstruktion nicht-definitiv. **Ausnahmen** (fallen sofort):
+  `stackit.ProviderRefused` = strukturiertes **400/401/403** — 400 ist das Fehlerbild eines entzogenen
+  SA-Keys (Token-Endpoint `invalid_grant`, der Key-Flow erreicht die API nie; live verifiziert
+  2026-08-25); `errCredentialDestroyed` = Key geloescht, Ersatz nicht publiziert (lokale Gewissheit,
+  ueber Rotations-Annotation ohne Generations-Bump erreichbar); Teardown;
+  `ObservedGeneration != Generation`; nie-Ready. Fehler wird weiterhin zurueckgegeben, also feuert
+  `StackitS3ReconcileErrors` unveraendert; zusaetzlich `StackitS3BucketProviderDegraded`.
 - **Guards (produktionssicher):** CR darf `secretRef` **nicht** aufs Admin-Secret zeigen (sonst
   Pollution + Admin-Lockout beim Delete); `spec.region` muss = Operator-Region sein (Single-Region v1).
   Beides → `Ready=Failed` ohne Requeue-Hammer.
@@ -173,12 +224,36 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   terminal), Failed-Job → Delete + Backoff-Retry (rclone resumed). **Bucket-Watch filtert auf
   Generation/Annotation** (sonst Hot-Loop durch Progress-Writes) — Finalizer-Add requeued explizit.
 
+## Sicherheits-Befunde (verifiziert 2026-08-24, PRÄEXISTENT — nicht vom Grant-Feature eingeführt)
+
+1. **`workloadGroupName` kollidiert über Namespaces** (`internal/controller/bucket_controller.go`).
+   `("s3op-"+ns+"-"+name)[:23]` + 8-Hex-FNV-1a-32. Empirisch reproduziert:
+   `("gitlab","gitlab-artifacts")` == `("gitlab-gitlab","artifacts787ngo")` ==
+   `s3op-gitlab-gitlab-arti-70dbcfc2`. `EnsureCredentialsGroup` ist Find-or-Create
+   **ohne** Ownership-Check (der Tag-Guard schützt nur Buckets) → fremdes CR adoptiert
+   die Gruppe, `ensureAccessKeyAndSecret` löscht den Live-Key des Opfers und schreibt
+   einen neuen ins eigene Secret. Fix = längerer/kryptographischer Suffix ⇒ **Migration**
+   (alle bestehenden Gruppen würden umbenannt, alte Gruppen + Keys verwaisen). Offen.
+2. **`spec.secretRef.namespace` ungeprüft** (`api/v1/bucket_types.go` `SecretNamespace()`).
+   Einziger Guard ist `isAdminSecret` (ein Name+Namespace). `upsertSecret` merged in ein
+   beliebiges Secret jedes Namespace, `deleteSecret` löscht es beim CR-Delete. Wer irgendwo
+   ein Bucket-CR anlegen darf, hat ein Cross-Namespace-Write/Delete-Primitiv. Offen.
+
+Beide untergraben die Prämisse „Namespace = Trust-Boundary". Doc-Kommentare in
+`bucket_types.go`, `resolveReadGrants`, README und INIT-SETUP §4.1.1 sind entsprechend
+entschärft — sie behaupten keine Garantie mehr, die der Mechanismus nicht hergibt.
+
 ## Nächster Schritt
 
-Reconciler steht + alle Offline/lint/envtest-Checks grün. **Offen:** (1) End-to-End-Provisioning gegen
-die **echte** StackIT-API testen (analog `stackit/credentials_integration_test.go`, aber über den
-Reconciler); (2) e2e-Smoke (`make e2e-local`) mit echtem SA-Key gegen Kind — inkl. Clone-Feature mit
-echtem rclone-Image (offline nur mit Fake-Job-Lifecycle getestet); (3) Q2 (Minimal-Rolle),
-Q4 (Bucket-Namensraum) klären. RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) —
-bereits von den cluster-weiten Secret-RBAC-Markern abgedeckt.
+Reconciler steht, alle Offline/lint/gosec/envtest-Checks grün. **Erledigt:** End-to-End-Provisioning
+über den Reconciler gegen die echte StackIT-API (`make e2e-stackit`, Kind + echter SA-Key) inkl.
+Read-Grants; Layer-2-Policy-Enforcement mit 3 Statements direkt gegen StorageGRID
+(`go test -tags integration ./stackit/ -run IntegrationReadGrant`).
+**Erledigt (2026-08-25):** Transiente Provider-Fehler (INIT-SETUP.md §8.2) — EnsureService eskaliert
+keinen fehlgeschlagenen Read mehr zu einem Write + prozessweiter Cache, Retry-RoundTripper fuer GET/HEAD
+unter der SDK-Auth, Sticky-`Ready` mit begrenztem Grace. Ticket `local_s3-provisioner-transient-errors.md`.
+**Offen:** (1) Clone-Feature mit echtem rclone-Image im e2e (offline nur Fake-Job-Lifecycle);
+(2) die beiden präexistenten Sicherheits-Befunde oben; (3) Q2 (Minimal-Rolle), Q4 (Bucket-Namensraum).
+RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) — bereits von den cluster-weiten
+Secret-RBAC-Markern abgedeckt.
 </content>

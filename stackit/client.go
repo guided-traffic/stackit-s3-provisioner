@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/stackitcloud/stackit-sdk-go/core/config"
@@ -64,15 +65,35 @@ type Client struct {
 	api     *objectstorage.APIClient
 	account Account
 	region  string
+
+	// serviceReady caches a verified "Object Storage is enabled" answer for the
+	// lifetime of the process. Without it EnsureService queries the API once per
+	// Bucket per reconcile, which is both pure overhead and a needless exposure
+	// to provider blips: the project cannot be un-enabled underneath a running
+	// operator without every other call failing too, and a restart re-verifies.
+	serviceReady atomic.Bool
 }
 
 // NewClient builds an Object Storage client authenticated with the account's SA
 // key file. Auth uses the key flow; the RSA private key is embedded in the file,
 // so no separate key path is required.
+//
+// The supplied http.Client installs retryTransport underneath authentication:
+// auth.SetupAuth adopts HTTPClient.Transport as the key flow's inner transport
+// (core/auth/auth.go), so API requests are retried with the Authorization header
+// the flow already attached.
+//
+// Token fetches traverse the same transport but are NOT retried: the key flow
+// exchanges a signed assertion via POST, and retryTransport repeats only GET and
+// HEAD. A token fetch failing during a provider blip therefore fails the whole
+// reconcile — which the requeue and the degraded-Ready hold already cover, and
+// which is preferable to carving a per-endpoint exception into the rule that no
+// write is ever repeated.
 func NewClient(acc Account, region string) (*Client, error) {
 	api, err := objectstorage.NewAPIClient(
 		config.WithServiceAccountKeyPath(acc.KeyPath),
 		config.WithRegion(region),
+		config.WithHTTPClient(retryingHTTPClient()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("init object storage client for %s: %w", acc.Issuer, err)
@@ -84,6 +105,11 @@ func NewClient(acc Account, region string) (*Client, error) {
 // static token auth. It exists for tests that run against a local in-memory
 // fake of the StackIT API; production always uses NewClient (key-flow auth
 // against the real endpoint).
+//
+// It deliberately omits the retrying transport. Tests drive error paths through
+// stackitfake.FailNext, which arms a single failure; retrying would consume the
+// injection and let the call succeed, quietly turning error-path tests into
+// happy-path tests. retryTransport is covered directly in retry_test.go instead.
 func NewClientWithEndpoint(projectID, region, endpoint string) (*Client, error) {
 	api, err := objectstorage.NewAPIClient(
 		config.WithEndpoint(endpoint),
@@ -104,18 +130,35 @@ func (c *Client) Region() string { return c.region }
 
 // EnsureService makes sure Object Storage is enabled for the project (a
 // prerequisite for creating buckets). It is idempotent: if the service is
-// already enabled it returns nil without re-enabling.
+// already enabled it returns nil without re-enabling, and the verified answer
+// is cached for the rest of the process lifetime.
+//
+// The service is enabled only on the API's definitive "not enabled" answer (a
+// structured JSON 404). Any other failure leaves the status unknown and is
+// returned as-is, so that a failed read is never escalated into an attempted
+// write — see isServiceNotEnabled for why that distinction is load-bearing.
 func (c *Client) EnsureService(ctx context.Context) error {
-	if _, err := c.api.GetServiceStatus(ctx, c.account.ProjectID, c.region).Execute(); err == nil {
-		return nil // already enabled
+	if c.serviceReady.Load() {
+		return nil
+	}
+	_, err := c.api.GetServiceStatus(ctx, c.account.ProjectID, c.region).Execute()
+	switch {
+	case err == nil:
+		c.serviceReady.Store(true)
+		return nil
+	case !isServiceNotEnabled(err):
+		return fmt.Errorf("check object storage status in project %s: %w", c.account.ProjectID, err)
 	}
 	if _, err := c.api.EnableService(ctx, c.account.ProjectID, c.region).Execute(); err != nil {
 		return fmt.Errorf("enable object storage in project %s: %w", c.account.ProjectID, err)
 	}
-	// Wait until the service reports ready.
+	// Wait until the service reports ready. Any error is treated as "not ready
+	// yet" here, unlike above: the service was just enabled, so errors during
+	// propagation are expected and the deadline bounds the wait.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		if _, err := c.api.GetServiceStatus(ctx, c.account.ProjectID, c.region).Execute(); err == nil {
+			c.serviceReady.Store(true)
 			return nil
 		}
 		if time.Now().After(deadline) {

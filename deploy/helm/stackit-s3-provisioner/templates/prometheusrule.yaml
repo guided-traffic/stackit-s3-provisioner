@@ -2,7 +2,7 @@
 {{- $alerts := .Values.monitoring.prometheusRule.alerts }}
 {{- /* Skip the whole resource when every alert is disabled: prometheus-operator
        rejects a rule group without rules. Extend the `or` when adding alerts. */}}
-{{- if or $alerts.bucketsWipeOnDelete.enabled $alerts.bucketFailed.enabled $alerts.bucketStuckProvisioning.enabled $alerts.bucketStuckDeleting.enabled $alerts.cloneFailed.enabled $alerts.skeletonMode.enabled $alerts.wipeRequestedButGateDisabled.enabled $alerts.reconcileErrors.enabled }}
+{{- if or $alerts.bucketsWipeOnDelete.enabled $alerts.bucketFailed.enabled $alerts.bucketStuckProvisioning.enabled $alerts.bucketStuckDeleting.enabled $alerts.cloneFailed.enabled $alerts.skeletonMode.enabled $alerts.wipeRequestedButGateDisabled.enabled $alerts.reconcileErrors.enabled $alerts.bucketProviderDegraded.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -114,6 +114,23 @@ spec:
               operator-wide gate (Helm value wipeOnDelete.enabled) is off.
               Deleting such a CR silently degrades to the empty-only guard —
               the wipe the manifest promises will not happen.
+        {{- end }}
+        {{- if $alerts.bucketProviderDegraded.enabled }}
+        - alert: StackitS3BucketProviderDegraded
+          expr: max(stackit_s3_provisioner_buckets_provider_degraded) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Bucket Ready state is being held through provider failures
+            description: >-
+              {{ `{{ $value }}` }} Bucket resource(s) keep failing to reconcile
+              while their Ready condition is deliberately held True
+              (providerDegradedGrace). They still report Ready to health checks,
+              so this alert is the only signal until the grace elapses and they
+              drop to Failed. Inspect status.degradedSince and the
+              ProviderReachable condition, and check whether the StackIT API is
+              reachable from the operator.
         {{- end }}
         {{- if $alerts.reconcileErrors.enabled }}
         - alert: StackitS3ReconcileErrors

@@ -40,7 +40,7 @@ func TestBucketPolicyRoundtrip(t *testing.T) {
 	ctx := context.Background()
 	s3, fake := newFakeS3Admin(t, "pol")
 
-	desired := BuildIsolationPolicy("pol", "urn:admin", "urn:workload")
+	desired := BuildIsolationPolicy("pol", "urn:admin", "urn:workload", nil)
 	if err := s3.SetBucketPolicy(ctx, "pol", desired); err != nil {
 		t.Fatalf("SetBucketPolicy: %v", err)
 	}

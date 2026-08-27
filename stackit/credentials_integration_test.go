@@ -26,7 +26,7 @@ import (
 // exercises the exact document the operator writes (single source of truth in
 // s3.go). See BuildIsolationPolicy for the isolation rationale.
 func bucketIsolationPolicy(bucket, adminURN, workloadURN string) string {
-	return BuildIsolationPolicy(bucket, adminURN, workloadURN)
+	return BuildIsolationPolicy(bucket, adminURN, workloadURN, nil)
 }
 
 func newMinio(t *testing.T, endpoint string, ak AccessKey) *minio.Client {

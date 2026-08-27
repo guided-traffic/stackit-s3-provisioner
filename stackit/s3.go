@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/minio/minio-go/v7"
@@ -12,11 +13,49 @@ import (
 )
 
 const (
-	// effectDeny is the S3 policy Effect used by both isolation statements.
+	// effectDeny is the S3 policy Effect used by every isolation statement.
 	effectDeny = "Deny"
 	// actionAll is the wildcard action of statement 1: every principal outside
-	// the admin/workload pair is denied everything on the bucket.
+	// the exempted set is denied everything on the bucket.
 	actionAll = "s3:*"
+)
+
+// JSON keys of an S3 policy statement, named so the same key spelled two ways
+// cannot slip into different statements of the same document.
+const (
+	keySid          = "Sid"
+	keyEffect       = "Effect"
+	keyPrincipal    = "Principal"
+	keyNotPrincipal = "NotPrincipal"
+	keyAction       = "Action"
+	keyNotAction    = "NotAction"
+	keyResource     = "Resource"
+	keyAWS          = "AWS"
+)
+
+// S3 action names that appear in more than one of the action lists below.
+// Naming them makes a typo in one list a build failure rather than a silently
+// over- or under-permissive policy, and keeps the two lists spelling the same
+// action the same way.
+//
+// It does NOT enforce that readerAllowedActions stays a read-only subset of
+// workloadAllowedActions: any of these constants — including the multipart ones
+// the reader list deliberately omits — could be added to either list and still
+// compile. That invariant is enforced by TestReaderAllowedActions_ReadOnly.
+const (
+	actGetObject                        = "s3:GetObject"
+	actGetObjectVersion                 = "s3:GetObjectVersion"
+	actListBucket                       = "s3:ListBucket"
+	actListBucketVersions               = "s3:ListBucketVersions"
+	actGetBucketLocation                = "s3:GetBucketLocation"
+	actGetObjectTagging                 = "s3:GetObjectTagging"
+	actGetObjectVersionTagging          = "s3:GetObjectVersionTagging"
+	actGetBucketVersioning              = "s3:GetBucketVersioning"
+	actGetBucketObjectLockConfiguration = "s3:GetBucketObjectLockConfiguration"
+
+	actListBucketMultipartUploads = "s3:ListBucketMultipartUploads"
+	actListMultipartUploadParts   = "s3:ListMultipartUploadParts"
+	actAbortMultipartUpload       = "s3:AbortMultipartUpload"
 )
 
 // workloadAllowedActions is the exemption list of statement 2 in
@@ -40,16 +79,16 @@ var workloadAllowedActions = []string{
 	// tags). Without it a plain PutObject on an existing key fails with
 	// AccessDenied — which breaks every client that rewrites a key, e.g. barman
 	// (CNPG backups write base/<id>/backup.info twice per backup).
-	"s3:GetObject", "s3:PutObject", "s3:PutOverwriteObject", "s3:DeleteObject",
+	actGetObject, "s3:PutObject", "s3:PutOverwriteObject", "s3:DeleteObject",
 
 	// Listing and endpoint discovery.
-	"s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketLocation",
+	actListBucket, actListBucketVersions, actGetBucketLocation,
 
 	// Multipart management. Uploading parts itself maps to s3:PutObject, but
 	// clients that resume or clean up chunked uploads call these distinct
 	// actions (the Docker/GitLab registry S3 driver lists in-progress multipart
 	// uploads on every blob commit and 500s without them).
-	"s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:AbortMultipartUpload",
+	actListBucketMultipartUploads, actListMultipartUploadParts, actAbortMultipartUpload,
 
 	// Object tagging. Commonly set in passing by rclone --metadata, Velero and
 	// `aws s3 cp --tagging`.
@@ -58,17 +97,52 @@ var workloadAllowedActions = []string{
 	// (s3:ExistingObjectTag/*, s3:RequestObjectTag/*). Granting the workload
 	// s3:PutObjectTagging is only harmless because no access decision depends on
 	// tags; with such a condition the workload could rewrite its own permissions.
-	"s3:GetObjectTagging", "s3:PutObjectTagging", "s3:DeleteObjectTagging",
+	actGetObjectTagging, "s3:PutObjectTagging", "s3:DeleteObjectTagging",
 
 	// Version-aware *reads*. Dormant while versioning is off (the workload
 	// cannot enable it — s3:PutBucketVersioning is denied), but harmless and
 	// present so a later versioning feature does not need another policy fix.
-	"s3:GetObjectVersion", "s3:GetObjectVersionTagging",
+	actGetObjectVersion, actGetObjectVersionTagging,
 
 	// Read-only bucket configuration probes issued by several SDKs before a
 	// write. They expose no secret; denying them only produces confusing
 	// AccessDenied errors on the client side.
-	"s3:GetBucketVersioning", "s3:GetBucketObjectLockConfiguration",
+	actGetBucketVersioning, actGetBucketObjectLockConfiguration,
+}
+
+// readerAllowedActions is the exemption list of the optional third statement in
+// BuildIsolationPolicy (see the readerURNs parameter). Like statement 2 it is a
+// Deny with NotAction, so this is an inverted whitelist: a granted reader may do
+// exactly what is listed here and nothing else.
+//
+// It is the strict read-only subset of workloadAllowedActions. Every entry was
+// checked against that list: an action only qualifies if it cannot create,
+// modify or destroy state — neither object data nor metadata, tags, versions or
+// bucket configuration. Consequences of that rule, recorded so extending the
+// list stays a conscious decision:
+//
+//   - No s3:PutObject / PutOverwriteObject / DeleteObject / *ObjectTagging
+//     writes: a reader must never be able to alter the grantor's data. This is
+//     the whole point of the grant being read-only.
+//   - No s3:ListBucketMultipartUploads / ListMultipartUploadParts: they expose
+//     the *owner's* in-flight uploads (key names and part layout of data that is
+//     not yet committed). Reading finished objects does not require them, and
+//     s3cmd/aws-cli only issue them for their own uploads.
+//   - No s3:AbortMultipartUpload: it destroys the owner's in-flight upload.
+//
+// s3:GetBucketLocation is included because SigV4 clients (s3cmd, aws-cli, minio)
+// resolve the bucket region before the first request and fail confusingly
+// without it. It leaks nothing beyond the region the reader already addresses.
+var readerAllowedActions = []string{
+	// Object reads, current and historic versions.
+	actGetObject, actGetObjectVersion,
+
+	// Listing and endpoint discovery.
+	actListBucket, actListBucketVersions, actGetBucketLocation,
+
+	// Read-only metadata probes several SDKs issue before a GET.
+	actGetObjectTagging, actGetObjectVersionTagging,
+	actGetBucketVersioning, actGetBucketObjectLockConfiguration,
 }
 
 // Denied by design — actions deliberately absent from workloadAllowedActions,
@@ -92,10 +166,11 @@ var workloadAllowedActions = []string{
 //   - s3:GetObjectAcl / GetBucketAcl — not needed; ACLs are unused here.
 
 // BuildIsolationPolicy returns the validated per-bucket S3 bucket policy (see
-// INIT-SETUP.md §4.1). It confines the bucket to exactly two principals:
+// INIT-SETUP.md §4.1). It confines the bucket to a small, explicit principal set:
 //
 //   - adminURN keeps full control (lockout protection + management/cleanup),
-//   - workloadURN is restricted to object operations only.
+//   - workloadURN is restricted to object operations only,
+//   - each entry of readerURNs is restricted to read-only operations.
 //
 // STACKIT/StorageGRID default access is *open* within a project, so isolation
 // requires explicit Deny statements: statement 1 (Deny + NotPrincipal) locks out
@@ -103,30 +178,107 @@ var workloadAllowedActions = []string{
 // workload group to object operations, overriding the implicit project-wide
 // Allow. The admin group is always kept in NotPrincipal to avoid a lockout.
 //
+// readerURNs implements spec.grantReadAccess: the workload groups of other
+// Bucket CRs in the grantor's namespace that were granted read-only access. It
+// is optional — with no readers the returned document is byte-identical to the
+// two-statement policy that predates the feature, so enabling the feature never
+// rewrites the policy of a bucket that does not use it.
+//
+// SECURITY: readerURNs is sanitized here rather than only at the call site,
+// because the consequences of a bad entry are severe and irreversible-ish:
+//
+//   - The admin URN appearing as a reader would confine the operator's own key
+//     to read-only on this bucket — including PutBucketPolicy, i.e. a permanent
+//     lockout that no later reconcile could repair (StorageGRID can lock out
+//     even the account root, see the NotPrincipal invariant above).
+//   - The workload URN appearing as a reader would add a second, *narrower*
+//     Deny on the bucket owner. Deny is not overridden by another statement, so
+//     the intersection wins and the owner would silently lose write access to
+//     its own bucket.
+//
+// Both are therefore filtered out unconditionally, which also makes a
+// self-grant (a Bucket naming itself in spec.grantReadAccess) a harmless no-op.
+// Empty entries are dropped, duplicates collapsed and the result sorted so the
+// document is deterministic and the drift check in ensureBucketPolicy does not
+// see spurious changes from map/slice ordering.
+//
 // This is the single source of truth for the policy shape; the Layer-2
 // integration test delegates to it.
-func BuildIsolationPolicy(bucket, adminURN, workloadURN string) string {
+func BuildIsolationPolicy(bucket, adminURN, workloadURN string, readerURNs []string) string {
 	res := []string{"arn:aws:s3:::" + bucket, "arn:aws:s3:::" + bucket + "/*"}
-	doc := map[string]any{
-		"Statement": []any{
-			map[string]any{
-				"Sid":          "deny-all-except-admin-and-workload",
-				"Effect":       effectDeny,
-				"NotPrincipal": map[string]any{"AWS": []string{adminURN, workloadURN}},
-				"Action":       []string{actionAll},
-				"Resource":     res,
-			},
-			map[string]any{
-				"Sid":       "workload-objects-only",
-				"Effect":    effectDeny,
-				"Principal": map[string]any{"AWS": workloadURN},
-				"NotAction": workloadAllowedActions,
-				"Resource":  res,
-			},
+	readers := sanitizeReaderURNs(readerURNs, adminURN, workloadURN)
+
+	// Statement 1 exempts admin, workload and every reader from the blanket deny;
+	// without the exemption a reader would be denied by this statement regardless
+	// of statement 3.
+	exempt := append([]string{adminURN, workloadURN}, readers...)
+
+	statements := []any{
+		map[string]any{
+			keySid:          "deny-all-except-admin-and-workload",
+			keyEffect:       effectDeny,
+			keyNotPrincipal: map[string]any{keyAWS: exempt},
+			keyAction:       []string{actionAll},
+			keyResource:     res,
+		},
+		map[string]any{
+			keySid:       "workload-objects-only",
+			keyEffect:    effectDeny,
+			keyPrincipal: map[string]any{keyAWS: workloadURN},
+			keyNotAction: workloadAllowedActions,
+			keyResource:  res,
 		},
 	}
+	if len(readers) > 0 {
+		statements = append(statements, map[string]any{
+			keySid:       "granted-readers-read-only",
+			keyEffect:    effectDeny,
+			keyPrincipal: map[string]any{keyAWS: readers},
+			keyNotAction: readerAllowedActions,
+			keyResource:  res,
+		})
+	}
+
+	doc := map[string]any{"Statement": statements}
 	b, _ := json.Marshal(doc)
 	return string(b)
+}
+
+// sanitizeReaderURNs normalizes the reader principal list of
+// BuildIsolationPolicy: it drops empty entries, drops the admin and workload
+// URNs (see the SECURITY note there), collapses duplicates and sorts the rest.
+// It returns nil for an empty result so callers can test with len() and the
+// policy stays two statements.
+func sanitizeReaderURNs(readerURNs []string, adminURN, workloadURN string) []string {
+	if len(readerURNs) == 0 {
+		return nil
+	}
+	// Compare trimmed against trimmed. The candidate is trimmed anyway (a URN
+	// with surrounding whitespace is the same principal to StorageGRID), so
+	// comparing it against a raw adminURN would let a padded value slip past the
+	// exclusion that guards against the admin lockout — adminFromSecret reads the
+	// admin URN straight out of Secret data and does not trim it either.
+	adminURN = strings.TrimSpace(adminURN)
+	workloadURN = strings.TrimSpace(workloadURN)
+
+	seen := make(map[string]struct{}, len(readerURNs))
+	out := make([]string, 0, len(readerURNs))
+	for _, urn := range readerURNs {
+		urn = strings.TrimSpace(urn)
+		if urn == "" || urn == adminURN || urn == workloadURN {
+			continue
+		}
+		if _, dup := seen[urn]; dup {
+			continue
+		}
+		seen[urn] = struct{}{}
+		out = append(out, urn)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
 }
 
 // PoliciesEquivalent reports whether two bucket-policy JSON documents are

@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -126,6 +127,20 @@ type BucketReconciler struct {
 	// change shipped in an operator upgrade would otherwise never reach an
 	// already-provisioned, otherwise-unchanged bucket. Zero disables the requeue.
 	DriftResyncInterval time.Duration
+
+	// ProviderDegradedGrace, when > 0, is how long an already-provisioned Bucket
+	// keeps its Ready state while reconciles fail for a non-definitive reason —
+	// an unreachable provider, a gateway error page, a Kubernetes API blip.
+	// Ready describes the last verified state of the bucket, not the outcome of
+	// the last attempt to verify it, so a short provider outage no longer marks
+	// every Bucket in the cluster unhealthy at once and no longer cascades into
+	// the health checks that watch them.
+	//
+	// Once the grace elapses the Bucket drops to Failed as before, so a real
+	// outage still becomes visible; the window only decides how fast. Zero
+	// disables the hold entirely and restores the previous behavior, which makes
+	// it a values-only rollback that needs no new image.
+	ProviderDegradedGrace time.Duration
 
 	adminMu sync.Mutex
 	admin   *adminCreds // cached after the first successful bootstrap
@@ -282,10 +297,14 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	b.Status.CredentialsGroupID = creds.gid
 	b.Status.CredentialsGroupURN = creds.urn
 	b.Status.AccessKeyID = creds.accessKeyID
+	b.Status.GrantedReadTo = creds.grantedTo
 	b.Status.ObservedGeneration = b.Generation
 	b.Status.OperatorVersion = r.OperatorVersion
 	b.Status.Phase = s3v1.PhaseReady
 	b.Status.Message = fmt.Sprintf("bucket %q provisioned with isolated workload credentials", name)
+	// The provider answered for every step of this pass, so any held-over
+	// degradation is over.
+	clearDegraded(b)
 	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{
 		Type:    s3v1.ConditionReady,
 		Status:  metav1.ConditionTrue,
@@ -329,6 +348,11 @@ func (r *BucketReconciler) specGuardError(b *s3v1.Bucket) error {
 // Bucket status after a successful reconcile.
 type workloadCreds struct {
 	gid, urn, accessKeyID string
+
+	// grantedTo are the spec.grantReadAccess entries that actually made it into
+	// the bucket policy, recorded in status so a pending or revoked grant is
+	// visible without reading the policy back from S3.
+	grantedTo []string
 }
 
 // provisionCredentialsAndClone runs the credential half of the provisioning
@@ -359,8 +383,47 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 	if err != nil {
 		return failed(fmt.Errorf("ensure credentials group: %w", err))
 	}
+	// Publish the group identity as soon as it exists rather than only on the
+	// terminal status write. It is the signal grantors watch for
+	// (granteeCredentialsPredicate), and a Bucket that is itself still cloning
+	// never reaches that terminal write — its grantors would then wait for the
+	// drift resync instead of being woken.
+	b.Status.CredentialsGroupID = creds.gid
+	b.Status.CredentialsGroupURN = creds.urn
 
-	if err := r.ensureBucketPolicy(ctx, name, admin, creds.urn); err != nil {
+	// Resolve read grants before the policy is written so a newly added grantee
+	// is part of the very first policy the bucket ever gets. Unresolvable
+	// entries are skipped (not fatal): a data bucket must not lose its own
+	// Ready state because a consumer bucket is missing or not provisioned yet.
+	readerURNs, grantedTo, err := r.resolveReadGrants(ctx, b)
+	if err != nil {
+		return failed(fmt.Errorf("resolve read grants: %w", err))
+	}
+
+	// applyPolicy writes the isolation policy with the given reader set and keeps
+	// status in step with it. status.grantedReadTo documents who can read the
+	// bucket, so it is recorded here, next to the write that makes it true, and
+	// not only on the terminal path in reconcileNormal — a pending clone returns
+	// before that path, and so does any later failure.
+	applyPolicy := func(readers, granted []string) error {
+		creds.grantedTo = granted
+		b.Status.GrantedReadTo = granted
+		return r.ensureBucketPolicy(ctx, name, admin, creds.urn, readers)
+	}
+
+	// While a clone is still populating the bucket, granted readers stay out of
+	// the policy. holdSecretUntilCloned exists so no workload starts against a
+	// half-copied bucket, but it only covers the bucket's OWN workload: a granted
+	// reader already holds working credentials of its own, so the policy is the
+	// only thing that can hold it back. The isolation policy itself is still
+	// written first, so the bucket is never open to the rest of the project while
+	// it fills up.
+	cloning := b.ClonePending()
+	if cloning {
+		if err := applyPolicy(nil, nil); err != nil {
+			return failed(fmt.Errorf("ensure bucket policy: %w", err))
+		}
+	} else if err := applyPolicy(readerURNs, grantedTo); err != nil {
 		return failed(fmt.Errorf("ensure bucket policy: %w", err))
 	}
 
@@ -369,7 +432,7 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 		return creds, false, res, rerr
 	}
 
-	if b.ClonePending() {
+	if cloning {
 		if !b.Spec.CloneFrom.HoldSecret() {
 			creds.accessKeyID, err = r.ensureAccessKeyAndSecret(ctx, b, creds.gid, host, bucketURL)
 			if err != nil {
@@ -384,6 +447,12 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 		done, res, cerr := r.ensureClone(ctx, b, name, endpointURLFromBucketURL(bucketURL, name))
 		if !done {
 			return creds, false, res, cerr
+		}
+		// The copy finished in this very pass, so the reader hold above is over:
+		// re-apply the policy, now including the granted readers. Without this the
+		// grants would only land on the next reconcile.
+		if err := applyPolicy(readerURNs, grantedTo); err != nil {
+			return failed(fmt.Errorf("ensure bucket policy: %w", err))
 		}
 	}
 
@@ -546,6 +615,14 @@ type ownershipCollisionError struct {
 	detail string
 }
 
+// errCredentialDestroyed marks a failure that happened AFTER the workload's live
+// access key was deleted and before a replacement was published. Unlike an
+// unreachable provider, this is something the operator knows for certain about
+// this Bucket: the credential in the Secret no longer works. It therefore drops
+// Ready immediately instead of entering the degraded hold — the same treatment
+// the failNoRequeue faults get, only established mid-pass rather than up front.
+var errCredentialDestroyed = errors.New("workload credential destroyed and not replaced")
+
 func (e *ownershipCollisionError) Error() string {
 	return fmt.Sprintf("bucket %q already exists and is not owned by this operator (%s); refusing to adopt", e.name, e.detail)
 }
@@ -560,6 +637,10 @@ func (e *ownershipCollisionError) Error() string {
 // a key, nothing changes. Otherwise the group's keys are cleared (their secrets
 // are unrecoverable) and a fresh key is created and written — this heals a lost
 // Secret and, because clearing precedes creation, never leaves an orphan key.
+//
+// Errors raised after the clear are wrapped in errCredentialDestroyed: from that
+// point the workload's published credential is known dead, which the degraded
+// hold must not paper over.
 func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1.Bucket, groupID, host, bucketURL string) (string, error) {
 	secretKey := types.NamespacedName{Name: b.Spec.SecretRef.Name, Namespace: b.SecretNamespace()}
 
@@ -587,7 +668,7 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 	}
 	ak, err := r.Stackit.CreateAccessKey(ctx, groupID)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: create replacement access key: %w", errCredentialDestroyed, err)
 	}
 	data := b.SecretData(s3v1.SecretValues{
 		AccessKeyID:     ak.AccessKeyID,
@@ -601,7 +682,7 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 		if delErr := r.Stackit.DeleteAccessKey(ctx, groupID, ak.KeyID); delErr != nil {
 			log.FromContext(ctx).Error(delErr, "failed to roll back orphaned access key", "group", groupID)
 		}
-		return "", fmt.Errorf("write credentials secret %s: %w", secretKey, err)
+		return "", fmt.Errorf("%w: write credentials secret %s: %w", errCredentialDestroyed, secretKey, err)
 	}
 	return ak.AccessKeyID, nil
 }
@@ -625,14 +706,152 @@ func (r *BucketReconciler) recordPendingRotation(ctx context.Context, b *s3v1.Bu
 	r.event(b, corev1.EventTypeNormal, reasonRotated, "workload access key rotated (rotate-credentials-at annotation)")
 }
 
+// reasonReadGrantPending is the event reason emitted when a spec.grantReadAccess
+// entry cannot be resolved yet (the referenced Bucket does not exist, is being
+// deleted, or has no credentials group). It is informational, not a failure: the
+// grant is simply left out of the policy and applied once the reference resolves.
+const reasonReadGrantPending = "ReadGrantPending"
+
+// resolveReadGrants turns spec.grantReadAccess into the credentials-group URNs
+// that BuildIsolationPolicy grants read-only access to, plus the names of the
+// grants that resolved (for status).
+//
+// SECURITY — where the URN comes from matters more than anything else here.
+// The obvious implementation reads status.credentialsGroupURN off the referenced
+// Bucket, which would be wrong: status is writable by anyone holding
+// buckets/status update in the namespace, a strictly weaker permission than
+// reading the workload Secrets. A forged URN would be pasted verbatim into this
+// bucket's policy, which allows two concrete attacks:
+//
+//   - Naming the operator's admin group would confine the admin key to read-only
+//     on this bucket, including PutBucketPolicy — an unrepairable lockout.
+//   - Naming any other group in the project would hand read access to a
+//     principal outside the namespace.
+//
+// So the URN is never taken from the referenced object. Only the reference's
+// *name* is used, and it is used to derive the group display name the operator
+// itself would have created (workloadGroupName, deterministic over
+// namespace/name), which is then looked up against the control plane. Nothing an
+// unprivileged status writer controls reaches the policy. BuildIsolationPolicy
+// additionally filters the admin and workload URNs as a second line of defense.
+//
+// The reference is resolved with the grantor's own namespace, so it can only
+// ever address a Bucket in that namespace — a same-named Bucket elsewhere in the
+// cluster is invisible here.
+//
+// LIMIT, stated precisely because the comment above is easy to over-read: what
+// reaches the policy is the group located by workloadGroupName, which is
+// "s3op-<ns>-<name>" truncated to 23 characters plus an 8-hex FNV-1a-32 suffix.
+// Distinct namespace/name pairs can be made to collide on that name, so the
+// namespace scoping above is a property of the CR lookup, not a cryptographic
+// guarantee about the principal. This is not specific to grants: the same
+// derivation already decides which credentials group a Bucket owns and adopts
+// (EnsureCredentialsGroup is find-or-create by that name). Any namespace allowed
+// to create Bucket CRs is inside the trust boundary.
+//
+// Unresolvable entries (missing Bucket, Bucket under deletion, no group yet) are
+// skipped with a warning event rather than failing the reconcile: the grantor
+// owns the data and must not lose its own provisioning because a consumer is
+// absent. The grantee watch in SetupWithManager re-queues the grantor as soon as
+// the reference materializes, and a deleted grantee drops out of the policy on
+// the next reconcile — that is the revocation path.
+//
+// One control-plane listing serves all entries, so the cost is independent of
+// the number of grants.
+func (r *BucketReconciler) resolveReadGrants(ctx context.Context, b *s3v1.Bucket) (urns, granted []string, err error) {
+	if len(b.Spec.GrantReadAccess) == 0 {
+		return nil, nil, nil
+	}
+
+	groups, err := r.Stackit.ListCredentialsGroups(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	// STACKIT does not enforce unique credentials-group display names, and the
+	// name is the only handle the operator has on a grantee's group. Two rules
+	// follow:
+	//
+	//   - First match wins, matching FindCredentialsGroupByName (stackit/client.go).
+	//     A different tie-break here would hand the grant to a group the grantee
+	//     itself does not use, i.e. read access to nobody while the intended
+	//     reader stays denied.
+	//   - A duplicated name is recorded as ambiguous and grants nothing. Guessing
+	//     which of two identically named groups the reference meant is exactly the
+	//     kind of silent, wrong principal a read grant must never produce.
+	urnByName := make(map[string]string, len(groups))
+	ambiguous := make(map[string]bool)
+	for _, g := range groups {
+		if _, dup := urnByName[g.DisplayName]; dup {
+			ambiguous[g.DisplayName] = true
+			continue
+		}
+		urnByName[g.DisplayName] = g.URN
+	}
+
+	logger := log.FromContext(ctx)
+	for _, ref := range b.Spec.GrantReadAccess {
+		// A Bucket cannot grant to itself; BuildIsolationPolicy would filter the
+		// resulting URN anyway, but skipping here keeps status truthful.
+		if ref.Name == b.Name {
+			r.event(b, corev1.EventTypeWarning, reasonReadGrantPending,
+				fmt.Sprintf("ignoring self-reference %q in spec.grantReadAccess", ref.Name))
+			continue
+		}
+
+		var grantee s3v1.Bucket
+		key := types.NamespacedName{Namespace: b.Namespace, Name: ref.Name}
+		if getErr := r.Get(ctx, key, &grantee); getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				logger.Info("read grant pending: referenced Bucket not found", "grantee", key)
+				r.event(b, corev1.EventTypeWarning, reasonReadGrantPending,
+					fmt.Sprintf("Bucket %q referenced in spec.grantReadAccess does not exist (yet); read access not granted", ref.Name))
+				continue
+			}
+			return nil, nil, fmt.Errorf("get referenced Bucket %s: %w", key, getErr)
+		}
+
+		// A grantee under deletion is losing its credentials group; revoke early
+		// rather than leaving a soon-to-be-dangling principal in the policy.
+		if !grantee.DeletionTimestamp.IsZero() {
+			r.event(b, corev1.EventTypeWarning, reasonReadGrantPending,
+				fmt.Sprintf("Bucket %q referenced in spec.grantReadAccess is being deleted; read access revoked", ref.Name))
+			continue
+		}
+
+		groupName := workloadGroupName(&grantee)
+		if ambiguous[groupName] {
+			logger.Info("read grant refused: credentials-group name is ambiguous", "grantee", key, "group", groupName)
+			r.event(b, corev1.EventTypeWarning, reasonReadGrantPending,
+				fmt.Sprintf("Bucket %q referenced in spec.grantReadAccess resolves to credentials-group name %q, "+
+					"which exists more than once in the project; refusing to grant read access to an ambiguous principal",
+					ref.Name, groupName))
+			continue
+		}
+		urn, ok := urnByName[groupName]
+		if !ok {
+			logger.Info("read grant pending: grantee credentials group not provisioned", "grantee", key)
+			r.event(b, corev1.EventTypeWarning, reasonReadGrantPending,
+				fmt.Sprintf("Bucket %q referenced in spec.grantReadAccess has no credentials group yet; read access not granted", ref.Name))
+			continue
+		}
+		urns = append(urns, urn)
+		granted = append(granted, ref.Name)
+	}
+	return urns, granted, nil
+}
+
 // ensureBucketPolicy applies the isolation policy (INIT-SETUP.md §4.1) via the
 // admin S3 key, re-writing it only when it drifts from the desired document.
-func (r *BucketReconciler) ensureBucketPolicy(ctx context.Context, name string, admin *adminCreds, workloadURN string) error {
+// readerURNs carries the resolved spec.grantReadAccess principals; nil keeps the
+// policy at its two original statements.
+func (r *BucketReconciler) ensureBucketPolicy(
+	ctx context.Context, name string, admin *adminCreds, workloadURN string, readerURNs []string,
+) error {
 	s3admin, err := r.newS3Admin(ctx, name, admin)
 	if err != nil {
 		return err
 	}
-	desired := stackit.BuildIsolationPolicy(name, admin.urn, workloadURN)
+	desired := stackit.BuildIsolationPolicy(name, admin.urn, workloadURN, readerURNs)
 	if current, err := s3admin.GetBucketPolicy(ctx, name); err == nil && stackit.PoliciesEquivalent(current, desired) {
 		return nil
 	}
@@ -960,18 +1179,121 @@ func (r *BucketReconciler) deleteSecret(ctx context.Context, b *s3v1.Bucket) err
 	return nil
 }
 
-// fail records a failed reconcile (Ready=False, reason Failed) and requeues via
-// the returned error so the controller retries with backoff.
+// fail records a failed reconcile and requeues via the returned error so the
+// controller retries with backoff.
+//
+// An already-provisioned Bucket keeps its Ready state instead of dropping to
+// Failed while the failure is non-definitive and the grace window has not
+// elapsed — see degrade. The error is returned either way, so the retry, the
+// Warning event and controller_runtime_reconcile_errors_total are unaffected;
+// only the Bucket's advertised health changes.
 func (r *BucketReconciler) fail(ctx context.Context, b *s3v1.Bucket, err error) (ctrl.Result, error) {
-	r.markFailed(ctx, b, err)
+	if !r.degrade(ctx, b, err) {
+		r.markFailed(ctx, b, err)
+	}
 	return ctrl.Result{}, err
 }
 
 // failNoRequeue records a failed reconcile without returning an error, for
 // configuration faults that a retry cannot fix (they re-reconcile on spec change).
+//
+// These are the definitive faults — a Secret key collision, a secretRef aimed at
+// the admin Secret, a wrong region, an invalid composed name, an ownership
+// collision, an unusable clone source. Every one of them is a statement about
+// this Bucket that the operator established locally, so they always drop Ready
+// and never take the degraded path.
 func (r *BucketReconciler) failNoRequeue(ctx context.Context, b *s3v1.Bucket, err error) (ctrl.Result, error) {
 	r.markFailed(ctx, b, err)
 	return ctrl.Result{}, nil
+}
+
+// degrade holds a provisioned Bucket's Ready state through a reconcile failure
+// that says nothing about the Bucket, recording the degradation in
+// ConditionProviderReachable and status.degradedSince instead. It reports
+// whether it took ownership of the failure; false means the caller must fall
+// back to markFailed.
+//
+// The classification is by origin, not by parsing the error: everything routed
+// here failed while talking to the StackIT API, the S3 data plane or the
+// Kubernetes API, and an unrecognised failure of those is treated as "could not
+// verify" rather than "verified bad". That default is deliberate. Getting it
+// wrong in this direction costs a delayed signal, bounded by the grace window;
+// getting it wrong in the other direction marks every Bucket in the cluster
+// unhealthy on the first blip, which is the incident this exists to prevent.
+func (r *BucketReconciler) degrade(ctx context.Context, b *s3v1.Bucket, err error) bool {
+	if !r.holdsReadyThrough(b, err) {
+		return false
+	}
+
+	now := metav1.Now()
+	if b.Status.DegradedSince == nil {
+		b.Status.DegradedSince = &now
+	} else if now.Sub(b.Status.DegradedSince.Time) >= r.ProviderDegradedGrace {
+		// The provider has been unreachable for longer than the operator is
+		// willing to vouch for a state it can no longer verify. Hand back to
+		// markFailed, keeping degradedSince so the status records when it began.
+		return false
+	}
+
+	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{
+		Type:    s3v1.ConditionProviderReachable,
+		Status:  metav1.ConditionFalse,
+		Reason:  s3v1.ReasonProviderUnreachable,
+		Message: err.Error(),
+	})
+	b.Status.Message = err.Error()
+	b.Status.OperatorVersion = r.OperatorVersion
+	// The same Warning event as a hard failure: the degradation stays as visible
+	// in the event stream as it was before, only the condition differs.
+	r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed, err.Error())
+	if uerr := r.Status().Update(ctx, b); uerr != nil {
+		log.FromContext(ctx).V(1).Info("status update after degradation did not apply", "error", uerr.Error())
+	}
+	return true
+}
+
+// holdsReadyThrough reports whether b's Ready state may survive err.
+func (r *BucketReconciler) holdsReadyThrough(b *s3v1.Bucket, err error) bool {
+	if r.ProviderDegradedGrace <= 0 {
+		return false
+	}
+	// A Bucket being torn down has no Ready state worth defending, and showing
+	// one would hide a teardown blocked by the non-empty data-loss guard.
+	if !b.DeletionTimestamp.IsZero() {
+		return false
+	}
+	// A structured refusal is the provider's own answer, not a failure to reach
+	// it: a 401/403 from the API, or the token endpoint rejecting the
+	// service-account key with 400 invalid_grant. The latter is how a revoked or
+	// deleted key surfaces — it never reaches the Object Storage API at all — and
+	// masking either for the length of the grace window would blind exactly the
+	// response that matters most. A gateway page carrying the same status code
+	// does not match, see stackit.ProviderRefused.
+	if stackit.ProviderRefused(err) {
+		return false
+	}
+	// The operator deleted this workload's live access key in this very pass and
+	// could not publish a replacement. That is local certainty that the credential
+	// in the Secret is dead, not an unverifiable provider state, so the Bucket must
+	// stop advertising Ready at once.
+	if errors.Is(err, errCredentialDestroyed) {
+		return false
+	}
+	// Only a Bucket that has converged on its current spec has a verified Ready
+	// state to hold. If the user changed the spec and the new state cannot be
+	// reached, Ready=False is the honest answer.
+	return b.Status.ObservedGeneration == b.Generation &&
+		b.Status.Phase == s3v1.PhaseReady &&
+		meta.IsStatusConditionTrue(b.Status.Conditions, s3v1.ConditionReady)
+}
+
+// clearDegraded removes the degradation markers after a successful reconcile.
+// The condition is removed rather than set to True so that a Bucket which never
+// degraded and one which recovered look identical, and so an operator upgrade
+// writes nothing to Buckets that are simply healthy.
+func clearDegraded(b *s3v1.Bucket) {
+	b.Status.DegradedSince = nil
+	meta.RemoveStatusCondition(&b.Status.Conditions, s3v1.ConditionProviderReachable)
 }
 
 func (r *BucketReconciler) markFailed(ctx context.Context, b *s3v1.Bucket, err error) {
@@ -1018,6 +1340,13 @@ func (r *BucketReconciler) event(b *s3v1.Bucket, eventtype, reason, note string)
 // completion re-queues the owning Bucket without waiting for the next poll
 // (a cross-namespace owner reference is not permitted, hence the annotation
 // mapping).
+//
+// Buckets are additionally watched a second time, as *grantees*: a Bucket named
+// in another Bucket's spec.grantReadAccess wakes that grantor when it appears,
+// finishes provisioning its credentials group, or starts being deleted, so a
+// read grant is applied and revoked without waiting for the drift resync. That
+// watch carries its own narrow predicate — see granteeCredentialsPredicate for
+// why ordinary status churn must not pass it.
 func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("bucket-controller")
@@ -1038,7 +1367,78 @@ func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(bucketsForCloneJob),
 			builder.WithPredicates(predicate.NewPredicateFuncs(isCloneJob)),
 		).
+		Watches(
+			&s3v1.Bucket{},
+			handler.EnqueueRequestsFromMapFunc(r.bucketsGrantingTo),
+			builder.WithPredicates(granteeCredentialsPredicate),
+		).
 		Complete(r)
+}
+
+// granteeCredentialsPredicate scopes the grantee watch to the events that can
+// change a read grant's outcome: a Bucket appearing, disappearing, or gaining
+// (or losing) the credentials group its grantors reference.
+//
+// Filtering updates on status.credentialsGroupURN is what keeps this watch from
+// looping. The Bucket watch is otherwise generation/annotation-filtered, so
+// status writes do not re-trigger a reconcile; this second watch on the same
+// kind would reintroduce exactly that unless it ignores ordinary status churn
+// (clone progress in particular writes status every 15s). It also forecloses the
+// mutual-grant cycle — two Buckets granting to each other would otherwise wake
+// one another on every status write forever.
+var granteeCredentialsPredicate = predicate.Funcs{
+	CreateFunc:  func(event.CreateEvent) bool { return true },
+	DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	GenericFunc: func(event.GenericEvent) bool { return false },
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		oldB, okOld := e.ObjectOld.(*s3v1.Bucket)
+		newB, okNew := e.ObjectNew.(*s3v1.Bucket)
+		if !okOld || !okNew {
+			return false
+		}
+		// A deletion that is still blocked by the finalizer only shows up as an
+		// update; grantors must see it so they revoke early (resolveReadGrants
+		// skips a grantee under deletion).
+		if oldB.DeletionTimestamp.IsZero() != newB.DeletionTimestamp.IsZero() {
+			return true
+		}
+		return oldB.Status.CredentialsGroupURN != newB.Status.CredentialsGroupURN
+	},
+}
+
+// bucketsGrantingTo maps an event on a Bucket to the Buckets in the same
+// namespace that name it in spec.grantReadAccess, so a grantor re-reconciles
+// (and re-writes its policy) when a grantee is created, provisioned or deleted.
+//
+// The listing is namespace-scoped, matching the resolution rule in
+// resolveReadGrants: a Bucket in another namespace with the same name is not a
+// grantee and must not be woken. Like bucketsForSecret this filters in Go rather
+// than through a field index — the list is served from the controller's cache
+// and a namespace holds few Buckets, so an index would add wiring (and a
+// fake-client dependency in tests) for no measurable gain.
+func (r *BucketReconciler) bucketsGrantingTo(ctx context.Context, obj client.Object) []ctrl.Request {
+	var buckets s3v1.BucketList
+	if err := r.List(ctx, &buckets, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.FromContext(ctx).Error(err, "listing buckets for grant-triggered reconcile",
+			"grantee", client.ObjectKeyFromObject(obj))
+		return nil
+	}
+	var reqs []ctrl.Request
+	for i := range buckets.Items {
+		b := &buckets.Items[i]
+		if b.Name == obj.GetName() {
+			continue // self-reference: nothing to re-evaluate
+		}
+		for _, ref := range b.Spec.GrantReadAccess {
+			if ref.Name == obj.GetName() {
+				reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
+					Namespace: b.Namespace, Name: b.Name,
+				}})
+				break
+			}
+		}
+	}
+	return reqs
 }
 
 // isCloneJob reports whether an object is a clone Job provisioned by this

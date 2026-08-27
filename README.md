@@ -17,8 +17,10 @@ The operator runs on any Kubernetes cluster, but it is designed and tuned for
 A `Bucket` custom resource maps to one isolated workload: a StackIT bucket, a
 dedicated credentials group, an S3 access key, and a deny-based bucket policy that
 isolates workloads from each other (Layer 2). Cross-project isolation (Layer 1) is
-structurally guaranteed by StackIT itself. See [`CLAUDE.md`](CLAUDE.md) and
-[`INIT-SETUP.md`](INIT-SETUP.md) for the architecture and security invariants.
+structurally guaranteed by StackIT itself. A bucket can optionally
+[share itself read-only](#sharing-a-bucket-read-only) with other Buckets in its
+namespace. See [`CLAUDE.md`](CLAUDE.md) and [`INIT-SETUP.md`](INIT-SETUP.md) for
+the architecture and security invariants.
 
 ```yaml
 apiVersion: stackit-bucket.gtrfc.com/v1
@@ -117,9 +119,19 @@ my-bucket   my-bucket   Ready   True    provisioned          eu01     2m
   `spec.region` that differs from the operator's region, a bucket-name/secret-key
   collision, or a bucket owned by someone else) set `Ready=Failed` **without**
   requeue-hammering — fix the CR and the next generation reconciles.
+- **`ProviderReachable` condition** — `False` while a provisioned Bucket's
+  `Ready` state is being *held* through repeated provider failures, see
+  [Ready during provider outages](#ready-during-provider-outages). Absent on a
+  healthy Bucket.
 - Other status fields: `resolvedBucketName`, `bucketURL`, `credentialsGroupID`,
   `credentialsGroupURN`, `accessKeyID` (never the secret), `observedGeneration`,
-  `operatorVersion`.
+  `operatorVersion`, `degradedSince` (see
+  [Ready during provider outages](#ready-during-provider-outages)),
+  `grantedReadTo` (see
+  [Sharing a bucket read-only](#sharing-a-bucket-read-only)), `clone` (see
+  [Cloning an existing bucket](#cloning-an-existing-bucket)),
+  `lastRotationTrigger` / `lastRotationTime` (see
+  [Credentials rotation](#credentials-rotation)).
 
 Each `Bucket` is stamped with S3 ownership tags (`managed-by` + `owner=<ns>/<name>`)
 so the operator adopts only buckets it owns and refuses to clobber a pre-existing
@@ -127,6 +139,74 @@ foreign or non-empty bucket. On bootstrap the operator creates a shared
 `operator-admin` credentials group + S3 key (persisted in its own admin Secret,
 default `stackit-s3-provisioner-admin`); that group's URN sits in every bucket
 policy's exemption list as a lockout safeguard.
+
+## Ready during provider outages
+
+`Ready` on a provisioned `Bucket` describes the **last verified state of the
+bucket**, not the outcome of the last attempt to verify it. When a reconcile of
+an already-`Ready` Bucket fails for a reason that says nothing about the bucket —
+the StackIT API unreachable, a gateway or WAF answering with an error page, a
+Kubernetes API blip — the operator keeps `Ready=True` and records the
+degradation instead:
+
+```
+NAME        PHASE   READY   STATUS                             AGE
+my-bucket   Ready   True    ensure bucket: unexpected EOF       3h
+```
+
+```yaml
+status:
+  phase: Ready
+  degradedSince: "2026-08-25T08:13:04Z"   # when the failures started
+  conditions:
+    - type: Ready
+      status: "True"                      # held: last VERIFIED state
+      reason: Provisioned
+    - type: ProviderReachable
+      status: "False"
+      reason: ProviderUnreachable
+      message: 'ensure bucket: unexpected EOF'
+```
+
+Why: without this, one failed control-plane call flips a healthy Bucket to
+`Failed` immediately. A short provider blip therefore marked every Bucket on the
+cluster non-ready at once, which cascaded into everything health-checking them
+(Flux `Kustomization` health checks in particular) and produced a cluster-wide
+alert storm out of a two-minute outage.
+
+The hold is **bounded** by `providerDegradedGrace` (default `30m`). Once it
+elapses the Bucket drops to `Failed` exactly as before, so a real outage still
+becomes visible in the Bucket's own status — the window only decides how fast.
+
+What is **not** held, and drops `Ready` immediately regardless of the grace:
+
+| Case | Why |
+| ---- | --- |
+| A structured `400`/`401`/`403` **from the provider** | The provider refusing the request, not failing to answer. `401`/`403` is the Object Storage API; **`400` is how a revoked service-account key surfaces** — the key flow never reaches the API, and the token endpoint answers `400 invalid_grant`. A gateway error page carrying any of those codes has a non-JSON body and *is* held. |
+| A workload credential the operator destroyed | The old access key was deleted and the replacement could not be published (a rotation or a re-created Secret hitting a provider failure). The operator knows the published credential is dead — that is local certainty, not an unverifiable provider state. |
+| Config faults (the `failNoRequeue` family above) | Statements about *this* Bucket that the operator established locally. |
+| A Bucket that has never been `Ready` | There is no verified state to defend; initial provisioning failures surface at once. |
+| A Bucket whose spec changed (`observedGeneration != generation`) | The user asked for something new and it was not achieved. |
+| A Bucket being deleted | Holding `Ready` would hide a teardown blocked by the non-empty data-loss guard. |
+
+Independently of the hold, the reconcile still returns an error, so the retry
+backoff, the `Warning` events and `controller_runtime_reconcile_errors_total` are
+unchanged — the `StackitS3ReconcileErrors` alert fires immediately as before, and
+`StackitS3BucketProviderDegraded` fires while a hold is in effect (see
+[Monitoring](#monitoring)).
+
+```yaml
+# values.yaml
+providerDegradedGrace: "30m"   # default; "0" disables the hold entirely
+```
+
+Setting it to `"0"` restores the previous behavior without deploying a different
+image.
+
+> Trade-off: while `Ready` is held, a bucket that really did break stays green
+> for up to the grace window. That is deliberate — a delayed signal is bounded
+> and recoverable, whereas marking the whole fleet unhealthy on the first blip is
+> neither.
 
 ## Cloning an existing bucket
 
@@ -256,6 +336,72 @@ Both commands operate on the current namespace; add `-n <namespace>` or
 `--all-namespaces` (with `kubectl annotate buckets --all-namespaces -l …`) as
 needed.
 
+## Sharing a bucket read-only
+
+By default a bucket is reachable by exactly one credential: its own. A bucket
+can additionally grant **read-only** access to other `Bucket` CRs in the **same
+namespace** via `spec.grantReadAccess`. The grant is declared on the bucket that
+owns the data, so a bucket's full access list is visible in its own spec:
+
+```yaml
+apiVersion: stackit-bucket.gtrfc.com/v1
+kind: Bucket
+metadata:
+  name: gitlab-artifacts
+  namespace: gitlab
+spec:
+  bucketName: gitlab-artifacts
+  secretRef:
+    name: gitlab-artifacts-s3
+  grantReadAccess:            # optional, default: no additional access
+    - name: gitlab-backups    # metadata.name of a Bucket CR in namespace gitlab
+```
+
+The credentials in `gitlab-backups-s3` can now list `gitlab-artifacts` and get
+its objects. They still cannot write to it, delete from it, or touch its
+configuration.
+
+| Granted to a reader | Denied to a reader |
+| ------------------- | ------------------ |
+| `ListBucket`, `ListBucketVersions` | every `Put*`, `Delete*` and `Create*` action |
+| `GetObject`, `GetObjectVersion` | multipart listing/abort (would expose or destroy the owner's in-flight uploads) |
+| `GetObjectTagging`, `GetObjectVersionTagging` | bucket policy, replication, notifications, lifecycle, object lock |
+| `GetBucketLocation`, `GetBucketVersioning`, `GetBucketObjectLockConfiguration` | anything at all on buckets that did not grant it |
+
+Rules worth knowing:
+
+- **Namespace-scoped.** Entries name a `Bucket` CR and are resolved in the
+  granting Bucket's own namespace, so a Bucket in another namespace cannot be
+  named here and a same-named Bucket elsewhere resolves to a different
+  credentials group. Note that the principal written into the policy is located
+  by the operator's derived credentials-group name, which is what already decides
+  which group a Bucket owns — a namespace allowed to create `Bucket` resources is
+  inside the trust boundary either way.
+- **Never blocking.** A referenced Bucket that does not exist yet (or is not
+  finished provisioning) is skipped with a `ReadGrantPending` warning event; the
+  granting bucket still becomes `Ready`. The grant is applied automatically as
+  soon as the reference resolves.
+- **Revocation is automatic.** Deleting a referenced Bucket removes it from the
+  policy on the granting bucket's next reconcile. Removing the entry from
+  `spec.grantReadAccess` does the same, immediately.
+- **Self-references are rejected** by the CRD schema.
+- **A bucket being filled by a clone shares nothing yet.** While
+  [`spec.cloneFrom`](#cloning-an-existing-bucket) is still copying, granted
+  readers stay out of the policy and are added the moment the copy succeeds — the
+  same reason the bucket's own credentials Secret is held back by default.
+- **An ambiguous reference grants nothing.** If the credentials-group name a
+  reference resolves to exists more than once in the StackIT project, the grant
+  is refused with a `ReadGrantPending` event rather than pointed at a guess.
+- Whatever is currently in effect is listed in `status.grantedReadTo`:
+
+  ```console
+  $ kubectl get bucket gitlab-artifacts -o jsonpath='{.status.grantedReadTo}'
+  ["gitlab-backups"]
+  ```
+
+Leaving `grantReadAccess` unset keeps the previous behavior exactly — the
+bucket policy is then identical to that of a bucket that never used the feature.
+
 ## Deletion behavior
 
 Deleting a `Bucket` CR tears down the access key, credentials group, bucket and
@@ -291,6 +437,8 @@ the standard controller-runtime and Go collectors plus its own metrics:
 | `stackit_s3_provisioner_buckets{phase}` | gauge | Number of `Bucket` resources per `status.phase` (`Pending`, `Provisioning`, `Ready`, `Failed`, `Deleting`; `Unknown` for CRs without a status yet). All phases are always exported. |
 | `stackit_s3_provisioner_buckets_clone{phase}` | gauge | Number of `Bucket` resources per clone phase (`Running`, `Completed`, `Failed`); only Buckets with a clone are counted |
 | `stackit_s3_provisioner_buckets_wipe_on_delete` | gauge | Number of `Bucket` resources with `spec.wipeOnDelete: true` |
+| `stackit_s3_provisioner_buckets_provider_degraded` | gauge | Number of `Bucket` resources whose `Ready` state is being [held through provider failures](#ready-during-provider-outages) |
+| `stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds{namespace,name}` | gauge | Unix time at which this Bucket started degrading; **absent** for Buckets that are not degraded — so `time() - <series>` is the age of the degradation wherever the series exists |
 | `stackit_s3_provisioner_skeleton_mode` | gauge | `1` while the operator runs without a StackIT service-account key (provisions nothing) |
 | `stackit_s3_provisioner_wipe_on_delete_gate_enabled` | gauge | `1` while the operator-wide `--enable-wipe-on-delete` feature gate is on |
 | `stackit_s3_provisioner_credentials_last_rotation_timestamp_seconds{namespace,name}` | gauge | Unix time of the Bucket's last [credentials rotation](#credentials-rotation); absent for never-rotated Buckets |
@@ -323,6 +471,7 @@ monitoring:
       skeletonMode:                 { enabled: true }
       wipeRequestedButGateDisabled: { enabled: true }
       reconcileErrors:              { enabled: true }
+      bucketProviderDegraded:       { enabled: true }
 ```
 
 Some kube-prometheus-stack installs only discover `ServiceMonitor`/
@@ -341,6 +490,7 @@ Shipped alerts — every toggle lives under `monitoring.prometheusRule.alerts.<n
 | `StackitS3BucketsWipeOnDelete` | `bucketsWipeOnDelete` | `warning` | at least one `Bucket` carries `spec.wipeOnDelete: true` for 5m — deleting such a CR irreversibly wipes all objects in its bucket |
 | `StackitS3WipeRequestedButGateDisabled` | `wipeRequestedButGateDisabled` | `warning` | Buckets request `spec.wipeOnDelete` while the operator-wide gate (`wipeOnDelete.enabled`) is off — deletion would silently degrade to the empty-only guard |
 | `StackitS3ReconcileErrors` | `reconcileErrors` | `warning` | more than 3 reconcile errors within 15m (controller-runtime's built-in `controller_runtime_reconcile_errors_total`) |
+| `StackitS3BucketProviderDegraded` | `bucketProviderDegraded` | `warning` | a Bucket's `Ready` state has been [held through provider failures](#ready-during-provider-outages) for 10m. These Buckets still report `Ready=True` to health checks, so this alert is the only signal until the grace elapses. |
 
 ## Install (FluxCD)
 
