@@ -37,6 +37,11 @@ spec:
       jsonPath: .spec.region
       name: Region
       type: string
+    - description: Since when reconciles keep failing while Ready is held
+      jsonPath: .status.degradedSince
+      name: Degraded
+      priority: 1
+      type: string
     - description: Clone transfer progress
       jsonPath: .status.clone.progress
       name: Clone
@@ -441,6 +446,23 @@ spec:
                 description: |-
                   CredentialsGroupURN is the credentials-group URN used as the bucket-policy
                   principal for workload isolation (INIT-SETUP.md §4.1).
+                type: string
+              degradedSince:
+                description: |-
+                  DegradedSince is when the operator first failed to reconcile this already
+                  provisioned Bucket for a reason that carries no information about the
+                  Bucket itself — an unreachable provider, a gateway error page, a
+                  Kubernetes API blip. While it is set, Ready is deliberately held at its
+                  last verified value and ConditionProviderReachable is False; the Bucket
+                  only drops to Failed once the degradation outlives the operator's grace
+                  window (--provider-degraded-grace). It is cleared on the next successful
+                  reconcile.
+
+                  A reconcile can therefore report Ready while the provider is unreachable.
+                  That is the intended trade: Ready describes the last verified state of the
+                  bucket, not the outcome of the last attempt to verify it, so a provider
+                  blip no longer marks every Bucket in the cluster unhealthy at once.
+                format: date-time
                 type: string
               grantedReadTo:
                 description: |-

@@ -67,6 +67,68 @@ func TestEnsureService(t *testing.T) {
 			t.Fatal("EnsureService succeeded, want error")
 		}
 	})
+
+	t.Run("caches a verified enabled service", func(t *testing.T) {
+		c, fake := newFakeClient(t)
+		for i := 0; i < 5; i++ {
+			if err := c.EnsureService(ctx); err != nil {
+				t.Fatalf("EnsureService (%d): %v", i+1, err)
+			}
+		}
+		// Without the cache this was one status read per Bucket per reconcile:
+		// pure overhead, and a needless exposure to provider blips.
+		if got := fake.Calls("ServiceStatus"); got != 1 {
+			t.Errorf("ServiceStatus called %d times, want exactly 1 after the first success", got)
+		}
+	})
+
+	t.Run("an unknown status never triggers enabling", func(t *testing.T) {
+		// The 2026-08-25 08:13 incident in miniature: the status read fails for a
+		// reason that says nothing about whether the service is enabled, and the
+		// old code answered by trying to enable it — once per Bucket, per
+		// reconcile, for the whole outage.
+		tests := []struct {
+			name  string
+			arm   func(fake *stackitfake.Server)
+			calls int
+		}{
+			{"structured 403", func(f *stackitfake.Server) { f.FailNext("ServiceStatus", 403) }, 1},
+			{"structured 500", func(f *stackitfake.Server) { f.FailNext("ServiceStatus", 500) }, 1},
+			{"gateway HTML page carrying 403", func(f *stackitfake.Server) {
+				f.FailNextRaw("ServiceStatus", 403, "text/html", "<html><body>403 Forbidden</body></html>")
+			}, 1},
+			{"gateway HTML page carrying 404", func(f *stackitfake.Server) {
+				// The dangerous one: a 404 by status code, but not from the API.
+				f.FailNextRaw("ServiceStatus", 404, "text/html", "<html><body>404 Not Found</body></html>")
+			}, 1},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				c, fake := newFakeClient(t)
+				tc.arm(fake)
+				if err := c.EnsureService(ctx); err == nil {
+					t.Fatal("EnsureService succeeded, want the unknown status reported")
+				}
+				if got := fake.Calls("EnableService"); got != 0 {
+					t.Errorf("EnableService called %d times; an unknown status must never trigger a write", got)
+				}
+				if got := fake.Calls("ServiceStatus"); got != tc.calls {
+					t.Errorf("ServiceStatus called %d times, want %d", got, tc.calls)
+				}
+			})
+		}
+	})
+
+	t.Run("a structured 404 does trigger enabling", func(t *testing.T) {
+		c, fake := newFakeClient(t)
+		fake.DisableService()
+		if err := c.EnsureService(ctx); err != nil {
+			t.Fatalf("EnsureService: %v", err)
+		}
+		if got := fake.Calls("EnableService"); got != 1 {
+			t.Errorf("EnableService called %d times, want exactly 1", got)
+		}
+	})
 }
 
 func TestBucketLifecycle(t *testing.T) {

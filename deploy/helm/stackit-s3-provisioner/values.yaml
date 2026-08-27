@@ -72,6 +72,40 @@ leaderElection:
 # events only.
 driftResyncInterval: "10m"
 
+# providerDegradedGrace controls how long an already-provisioned Bucket keeps its
+# Ready state while reconciles keep failing for a reason that says nothing about
+# the bucket itself: the StackIT API unreachable, a gateway or WAF answering with
+# an error page, a Kubernetes API blip. Ready then describes the last VERIFIED
+# state of the bucket rather than the outcome of the last attempt to verify it.
+#
+# Why this exists: without it, a single failed control-plane call flips a healthy
+# Bucket to Failed on the spot. A two-minute provider blip therefore marked every
+# Bucket on the cluster non-ready at once, which cascaded into every Flux
+# Kustomization health-checking them and produced a cluster-wide alert storm.
+#
+# The hold is bounded, so a real outage still surfaces — only later. Once the
+# grace elapses the Bucket drops to Failed exactly as before. While it is held,
+# status.degradedSince and the ProviderReachable condition carry the degradation,
+# the Warning events are unchanged, and the operator keeps returning reconcile
+# errors, so controller_runtime_reconcile_errors_total and the
+# StackitS3ReconcileErrors alert below still fire immediately.
+#
+# NOT held (these drop Ready immediately, whatever the grace):
+#   - A structured 400/401/403 from the provider. 401/403 is the Object Storage
+#     API refusing an authenticated request; 400 is how a REVOKED service-account
+#     key surfaces — the key flow never reaches the API at all and the token
+#     endpoint answers 400 invalid_grant (measured live 2026-08-25). A gateway
+#     error page carrying any of those codes is told apart by its body (not valid
+#     JSON) and is still held.
+#   - A workload credential the operator itself destroyed: the old access key was
+#     deleted and the replacement could not be published. That is local certainty
+#     that the Secret is dead, not an unverifiable provider state.
+#
+# Must be a Go duration string WITH A UNIT (e.g. "30m", "1h"); a bare number is
+# rejected and crash-loops the operator at startup. Set to "0" to disable the
+# hold and restore the previous behavior without deploying a different image.
+providerDegradedGrace: "30m"
+
 # bucketNaming controls how the operator composes the physical StackIT bucket
 # name from a Bucket CR. The rule is applied when a bucket is first provisioned
 # and then frozen per CR (recorded in status + an annotation): changing prefix or
@@ -200,6 +234,13 @@ monitoring:
       # reconcileErrors fires (warning) on more than 3 reconcile errors within
       # 15m (controller-runtime's built-in error counter).
       reconcileErrors:
+        enabled: true
+      # bucketProviderDegraded fires (warning) while a Bucket's Ready state is
+      # being HELD through repeated non-definitive reconcile failures
+      # (providerDegradedGrace above). Ready still reports True, so without this
+      # alert the hold is invisible until the grace elapses and the Bucket drops
+      # to Failed. Fires well inside a 30m grace so the hold is never silent.
+      bucketProviderDegraded:
         enabled: true
 
 # stackit configures the operator's binding to a StackIT project.

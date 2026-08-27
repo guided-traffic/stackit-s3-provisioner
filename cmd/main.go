@@ -51,6 +51,7 @@ func main() {
 	var enableWipeOnDelete bool
 	var cloneImage string
 	var driftResyncInterval time.Duration
+	var providerDegradedGrace time.Duration
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -92,6 +93,15 @@ func main() {
 		envOrDefault("CLONE_IMAGE", controller.DefaultCloneImage),
 		"Container image run by clone Jobs (spec.cloneFrom); an rclone image. "+
 			"Can also be set via CLONE_IMAGE.")
+	flag.DurationVar(&providerDegradedGrace, "provider-degraded-grace",
+		envDurationOrDefault("PROVIDER_DEGRADED_GRACE", 30*time.Minute),
+		"How long an already-provisioned Bucket keeps its Ready state while reconciles "+
+			"fail for a non-definitive reason (unreachable StackIT API, gateway error page, "+
+			"Kubernetes API blip). Ready reflects the last verified state of the bucket, not "+
+			"the outcome of the last attempt to verify it, so a short provider outage no longer "+
+			"marks every Bucket unhealthy at once. After the grace the Bucket drops to Failed as "+
+			"before. A structured 401/403 from the API is definitive and never held. Set to 0 to "+
+			"disable the hold. Can also be set via PROVIDER_DEGRADED_GRACE.")
 	flag.DurationVar(&driftResyncInterval, "drift-resync-interval",
 		envDurationOrDefault("DRIFT_RESYNC_INTERVAL", 10*time.Minute),
 		"How often a provisioned Bucket is re-reconciled so configuration drift "+
@@ -122,6 +132,7 @@ func main() {
 		"ownershipName", ownershipName,
 		"enableWipeOnDelete", enableWipeOnDelete,
 		"driftResyncInterval", driftResyncInterval,
+		"providerDegradedGrace", providerDegradedGrace,
 	)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -178,18 +189,19 @@ func main() {
 	}
 
 	if err = (&controller.BucketReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Stackit:              stackitClient,
-		OperatorVersion:      version,
-		Naming:               naming,
-		AdminSecretName:      adminSecretName,
-		AdminSecretNamespace: operatorNamespace,
-		OwnershipName:        ownershipName,
-		EnableWipeOnDelete:   enableWipeOnDelete,
-		CloneImage:           cloneImage,
-		CloneJobResources:    cloneResources,
-		DriftResyncInterval:  driftResyncInterval,
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		Stackit:               stackitClient,
+		OperatorVersion:       version,
+		Naming:                naming,
+		AdminSecretName:       adminSecretName,
+		AdminSecretNamespace:  operatorNamespace,
+		OwnershipName:         ownershipName,
+		EnableWipeOnDelete:    enableWipeOnDelete,
+		CloneImage:            cloneImage,
+		CloneJobResources:     cloneResources,
+		DriftResyncInterval:   driftResyncInterval,
+		ProviderDegradedGrace: providerDegradedGrace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Bucket")
 		os.Exit(1)
