@@ -2,8 +2,33 @@ apiVersion: v1
 entries:
   stackit-s3-provisioner:
   - apiVersion: v2
+    appVersion: 1.12.5
+    created: "2026-09-01T03:50:03.49721461Z"
+    description: A Kubernetes operator that provisions StackIT Object Storage buckets,
+      workload credentials and isolation policies
+    digest: 31a6049b11f944ea9c98b013300179bfeada402b3b72f072b76a4715245640dd
+    home: https://github.com/guided-traffic/stackit-s3-provisioner
+    keywords:
+    - stackit
+    - object-storage
+    - s3
+    - bucket
+    - provisioner
+    - operator
+    - kubernetes
+    maintainers:
+    - name: Guided Traffic
+      url: https://github.com/guided-traffic
+    name: stackit-s3-provisioner
+    sources:
+    - https://github.com/guided-traffic/stackit-s3-provisioner
+    type: application
+    urls:
+    - https://guided-traffic.github.io/stackit-s3-provisioner/stackit-s3-provisioner-1.12.5.tgz
+    version: 1.12.5
+  - apiVersion: v2
     appVersion: 1.12.4
-    created: "2026-08-29T05:54:41.443045016Z"
+    created: "2026-09-01T03:50:03.496041837Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 60c4d8d8de3d66f377e98bde00642d8c122e291c620c060a83d44478ef3ce3ef
@@ -28,7 +53,7 @@ entries:
     version: 1.12.4
   - apiVersion: v2
     appVersion: 1.12.3
-    created: "2026-08-29T05:54:41.442258979Z"
+    created: "2026-09-01T03:50:03.495084522Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: f53e507a7e7e07010db2409559a98e5ae382f0b96d68423cad5bdb6f607633d1
@@ -53,7 +78,7 @@ entries:
     version: 1.12.3
   - apiVersion: v2
     appVersion: 1.12.2
-    created: "2026-08-29T05:54:41.441557461Z"
+    created: "2026-09-01T03:50:03.494077351Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: b1df511a3ac16d50c94cf8bf7b6fad9bcb872915a130a94d2127a55cf4d96ed6
@@ -78,7 +103,7 @@ entries:
     version: 1.12.2
   - apiVersion: v2
     appVersion: 1.12.1
-    created: "2026-08-29T05:54:41.440685572Z"
+    created: "2026-09-01T03:50:03.493076793Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 9d572b7859e95101ee38aaa2edec7340af69cef9624db9471ff43a0fd7503beb
@@ -103,7 +128,7 @@ entries:
     version: 1.12.1
   - apiVersion: v2
     appVersion: 1.12.0
-    created: "2026-08-29T05:54:41.439826398Z"
+    created: "2026-09-01T03:50:03.491843477Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 5eeef10edb0ee8f00da1369409b08b13d1c543024d69fa8b72956335c1b84341
@@ -128,7 +153,7 @@ entries:
     version: 1.12.0
   - apiVersion: v2
     appVersion: 1.11.1
-    created: "2026-08-29T05:54:41.438901066Z"
+    created: "2026-09-01T03:50:03.489212863Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 45339790bbf0c418a0a405996c35beef2c84dcd3e66ec9256b5d69ac674bd124
@@ -153,7 +178,7 @@ entries:
     version: 1.11.1
   - apiVersion: v2
     appVersion: 1.11.0
-    created: "2026-08-29T05:54:41.437915753Z"
+    created: "2026-09-01T03:50:03.488002109Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 2b8bdc80b82666d29f4df3c243eae18c96477eaf826e0899bb62919e33dc644d
@@ -178,7 +203,7 @@ entries:
     version: 1.11.0
   - apiVersion: v2
     appVersion: 1.10.21
-    created: "2026-08-29T05:54:41.419786568Z"
+    created: "2026-09-01T03:50:03.479134067Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 16c92f9a274be84dffb029566d3b77298f5ccf9322837cecc5f286b275cb689c
@@ -203,7 +228,7 @@ entries:
     version: 1.10.21
   - apiVersion: v2
     appVersion: 1.10.20
-    created: "2026-08-29T05:54:41.417749715Z"
+    created: "2026-09-01T03:50:03.47834581Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 88f46e13d47ce0b0da3bf79dc423790ac84ec96f698a178c66f907ff88e161cf
@@ -228,7 +253,7 @@ entries:
     version: 1.10.20
   - apiVersion: v2
     appVersion: 1.10.19
-    created: "2026-08-29T05:54:41.413767061Z"
+    created: "2026-09-01T03:50:03.476415898Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 312522324fa9a0d2adadec5454c90c8c055eb47f7c2eb6d7806a9168388cc9f1
@@ -253,7 +278,7 @@ entries:
     version: 1.10.19
   - apiVersion: v2
     appVersion: 1.10.18
-    created: "2026-08-29T05:54:41.412243308Z"
+    created: "2026-09-01T03:50:03.475612864Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: e21e5f72f10b286ad7f2109039e806e37ad176016efe342e7baaf034d6075ead
@@ -278,7 +303,7 @@ entries:
     version: 1.10.18
   - apiVersion: v2
     appVersion: 1.10.17
-    created: "2026-08-29T05:54:41.411288853Z"
+    created: "2026-09-01T03:50:03.47414308Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: f7458f249fbc01054263aac1975f61f0ab956ac3cefb89ef444ac88fae1fe2ec
@@ -303,7 +328,7 @@ entries:
     version: 1.10.17
   - apiVersion: v2
     appVersion: 1.10.16
-    created: "2026-08-29T05:54:41.410085216Z"
+    created: "2026-09-01T03:50:03.47248922Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: b721481dbfeceabf1156be45d7ed453d1bff657e7cf08f73cbabd32a88f7958c
@@ -328,7 +353,7 @@ entries:
     version: 1.10.16
   - apiVersion: v2
     appVersion: 1.10.15
-    created: "2026-08-29T05:54:41.40521296Z"
+    created: "2026-09-01T03:50:03.46911316Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: f94a0d96f748b0208608c5105a2d1fe5170191b6ac27cced2523cdef18657785
@@ -353,7 +378,7 @@ entries:
     version: 1.10.15
   - apiVersion: v2
     appVersion: 1.10.14
-    created: "2026-08-29T05:54:41.403746444Z"
+    created: "2026-09-01T03:50:03.46378706Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: e6915c97345b5fe34f38b0c29141f6d66da7ddaffc46c456ab57ec7ac9e91578
@@ -378,7 +403,7 @@ entries:
     version: 1.10.14
   - apiVersion: v2
     appVersion: 1.10.13
-    created: "2026-08-29T05:54:41.399749674Z"
+    created: "2026-09-01T03:50:03.460817387Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 96faf00a463e492da01216cc032df7faf6e9529db74af7a8dbe18ee80c490b6d
@@ -403,7 +428,7 @@ entries:
     version: 1.10.13
   - apiVersion: v2
     appVersion: 1.10.12
-    created: "2026-08-29T05:54:41.396521346Z"
+    created: "2026-09-01T03:50:03.459508298Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 74bd40a41796852c26ebdaaeb38af0b122c673925c204c71b4a9489d7e9c49b6
@@ -428,7 +453,7 @@ entries:
     version: 1.10.12
   - apiVersion: v2
     appVersion: 1.10.11
-    created: "2026-08-29T05:54:41.394209634Z"
+    created: "2026-09-01T03:50:03.458394597Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 190cd1e77a2911e3dbd49d35bc97992e08133679da95b3054e14ae6a5d7cfa91
@@ -453,7 +478,7 @@ entries:
     version: 1.10.11
   - apiVersion: v2
     appVersion: 1.10.10
-    created: "2026-08-29T05:54:41.393554144Z"
+    created: "2026-09-01T03:50:03.457283631Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: ab98d3e297a271300cae42162216eddcbf8421fb62dbe9d56fc37be2932ba073
@@ -478,7 +503,7 @@ entries:
     version: 1.10.10
   - apiVersion: v2
     appVersion: 1.10.9
-    created: "2026-08-29T05:54:41.436102583Z"
+    created: "2026-09-01T03:50:03.487131376Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 0923bc7570c53d02dd34f0644a9052131525e54e2df44465eaecf84e48580245
@@ -503,7 +528,7 @@ entries:
     version: 1.10.9
   - apiVersion: v2
     appVersion: 1.10.8
-    created: "2026-08-29T05:54:41.433242272Z"
+    created: "2026-09-01T03:50:03.486187946Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 22cc0f83450644f2fa831fe264d3d986a355bd008f9b27d6420b1157b10c0264
@@ -528,7 +553,7 @@ entries:
     version: 1.10.8
   - apiVersion: v2
     appVersion: 1.10.7
-    created: "2026-08-29T05:54:41.431569727Z"
+    created: "2026-09-01T03:50:03.485355365Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: a6891ed40c18742b036989c812941fbaa207a4fdad43a9303731d2de6215a85c
@@ -553,7 +578,7 @@ entries:
     version: 1.10.7
   - apiVersion: v2
     appVersion: 1.10.6
-    created: "2026-08-29T05:54:41.430106439Z"
+    created: "2026-09-01T03:50:03.484457742Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 287e46ddc35fda4791e17b344db647a4b06c9e18ea44f8fa649c643d36372df5
@@ -578,7 +603,7 @@ entries:
     version: 1.10.6
   - apiVersion: v2
     appVersion: 1.10.5
-    created: "2026-08-29T05:54:41.428449526Z"
+    created: "2026-09-01T03:50:03.483570236Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 8552fd2a1f5a280752ec0620f26dec969905dbafefa103fd4c607a94cf874933
@@ -603,7 +628,7 @@ entries:
     version: 1.10.5
   - apiVersion: v2
     appVersion: 1.10.4
-    created: "2026-08-29T05:54:41.426741754Z"
+    created: "2026-09-01T03:50:03.482556425Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 850ad5a86249c53b06ee6ded28587d3202e450979a0dbc34f24e2f18e6a12b57
@@ -628,7 +653,7 @@ entries:
     version: 1.10.4
   - apiVersion: v2
     appVersion: 1.10.3
-    created: "2026-08-29T05:54:41.421512382Z"
+    created: "2026-09-01T03:50:03.480110349Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 9e80bc4b13fbd5f443cc4ac1dd2534e44aad67ff7c1bb6448913fb83cc0469e4
@@ -653,7 +678,7 @@ entries:
     version: 1.10.3
   - apiVersion: v2
     appVersion: 1.10.2
-    created: "2026-08-29T05:54:41.415880198Z"
+    created: "2026-09-01T03:50:03.477352175Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 03b051e36b176e50f6f2e7299eba6df162b75b07394f5176b5ea402b74736593
@@ -678,7 +703,7 @@ entries:
     version: 1.10.2
   - apiVersion: v2
     appVersion: 1.10.1
-    created: "2026-08-29T05:54:41.3928334Z"
+    created: "2026-09-01T03:50:03.455548005Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 6263e330e682f109669067b14a121ffa037d0a31414ee2fe8b779977efa6a28c
@@ -703,7 +728,7 @@ entries:
     version: 1.10.1
   - apiVersion: v2
     appVersion: 1.10.0
-    created: "2026-08-29T05:54:41.392094573Z"
+    created: "2026-09-01T03:50:03.452776687Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 2c7b190700115fde4bda852114fd8fd174177be69aedf1e0f8f0e8284f9cbb42
@@ -728,7 +753,7 @@ entries:
     version: 1.10.0
   - apiVersion: v2
     appVersion: 1.9.1
-    created: "2026-08-29T05:54:41.455696298Z"
+    created: "2026-09-01T03:50:03.51533494Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: af1379dc90e4e96db5f205e4536c86d0fe412a3c0e9536e265c3391915264f48
@@ -753,7 +778,7 @@ entries:
     version: 1.9.1
   - apiVersion: v2
     appVersion: 1.9.0
-    created: "2026-08-29T05:54:41.454855428Z"
+    created: "2026-09-01T03:50:03.513855648Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: d2e650a47e064c2702dd301ddad7d64961cf51c07e16772f91dabbf4c7b04972
@@ -778,7 +803,7 @@ entries:
     version: 1.9.0
   - apiVersion: v2
     appVersion: 1.8.4
-    created: "2026-08-29T05:54:41.453136216Z"
+    created: "2026-09-01T03:50:03.512268574Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: edcb8b912631c486d7d1542379860c898bd82b1f611def515fd34c59ac0e68c4
@@ -803,7 +828,7 @@ entries:
     version: 1.8.4
   - apiVersion: v2
     appVersion: 1.8.3
-    created: "2026-08-29T05:54:41.452663331Z"
+    created: "2026-09-01T03:50:03.511023665Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: c532d40e7767b6fb3ba63161a33ea1bd5673c24aa5271ca932b5ec138976dc16
@@ -828,7 +853,7 @@ entries:
     version: 1.8.3
   - apiVersion: v2
     appVersion: 1.8.2
-    created: "2026-08-29T05:54:41.452265698Z"
+    created: "2026-09-01T03:50:03.509079988Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: e356ce468bfbc40ae58b18b2c16ad1a6360c43f61ed4524547d79fc9e3620aba
@@ -853,7 +878,7 @@ entries:
     version: 1.8.2
   - apiVersion: v2
     appVersion: 1.8.1
-    created: "2026-08-29T05:54:41.451820867Z"
+    created: "2026-09-01T03:50:03.508339049Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: ecd0ea1a31c7a606fbb46301882b81346052c9dd4ed6c9569c4dde321e142365
@@ -878,7 +903,7 @@ entries:
     version: 1.8.1
   - apiVersion: v2
     appVersion: 1.8.0
-    created: "2026-08-29T05:54:41.451307756Z"
+    created: "2026-09-01T03:50:03.507661541Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 5a1e4f0bb0aecaa254665b385b77e324478d848daf2ebb130a9255f1bedb3948
@@ -903,7 +928,7 @@ entries:
     version: 1.8.0
   - apiVersion: v2
     appVersion: 1.7.0
-    created: "2026-08-29T05:54:41.450736526Z"
+    created: "2026-09-01T03:50:03.507021194Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 3919fec0b8eeb4d5afbc739c9234d0f8446513238172fdfaba4d187f484e49c0
@@ -928,7 +953,7 @@ entries:
     version: 1.7.0
   - apiVersion: v2
     appVersion: 1.6.1
-    created: "2026-08-29T05:54:41.450198539Z"
+    created: "2026-09-01T03:50:03.506441099Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 635f1697bf648013bcbd53bf8f3b2569828eaf5be0ca36ac2faa7f5fab9c212d
@@ -953,7 +978,7 @@ entries:
     version: 1.6.1
   - apiVersion: v2
     appVersion: 1.6.0
-    created: "2026-08-29T05:54:41.449781159Z"
+    created: "2026-09-01T03:50:03.505963467Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 88406c516ddf24394467296e69da9623f3a0b4522f01401fef1a14c7bbbe84a0
@@ -978,7 +1003,7 @@ entries:
     version: 1.6.0
   - apiVersion: v2
     appVersion: 1.5.4
-    created: "2026-08-29T05:54:41.449360914Z"
+    created: "2026-09-01T03:50:03.505470537Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 7e90e9c2db1012e37899eb211d91481cf78073a8458c09ad73ed706f557f0daf
@@ -1003,7 +1028,7 @@ entries:
     version: 1.5.4
   - apiVersion: v2
     appVersion: 1.5.3
-    created: "2026-08-29T05:54:41.448976046Z"
+    created: "2026-09-01T03:50:03.505024035Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 3d67b59cdd5589bce250e391172d1eb7d6c49c9889af709cf5f5cbc6931ef280
@@ -1028,7 +1053,7 @@ entries:
     version: 1.5.3
   - apiVersion: v2
     appVersion: 1.5.2
-    created: "2026-08-29T05:54:41.448524311Z"
+    created: "2026-09-01T03:50:03.504392724Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 4fe647d7317e9bb95e78ec469a2f8c09e073abdd7aef44268431700ce9b7bace
@@ -1053,7 +1078,7 @@ entries:
     version: 1.5.2
   - apiVersion: v2
     appVersion: 1.5.1
-    created: "2026-08-29T05:54:41.447643635Z"
+    created: "2026-09-01T03:50:03.503753808Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 4ea0be5788a04ad4f80cf9d522aca034c5136761ea1eb7f9aa3693f748b04601
@@ -1078,7 +1103,7 @@ entries:
     version: 1.5.1
   - apiVersion: v2
     appVersion: 1.5.0
-    created: "2026-08-29T05:54:41.44649934Z"
+    created: "2026-09-01T03:50:03.503174735Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: a5e81769d1cb5ff109f8aa87afc0af87a4b3eea9c12debe5d723ffb22c7899dc
@@ -1103,7 +1128,7 @@ entries:
     version: 1.5.0
   - apiVersion: v2
     appVersion: 1.4.0
-    created: "2026-08-29T05:54:41.446011006Z"
+    created: "2026-09-01T03:50:03.502230795Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 8a0e4ac531803af9ef0180dd2cf4ab81dcae420bc700ea5b3418de25d7b26f08
@@ -1128,7 +1153,7 @@ entries:
     version: 1.4.0
   - apiVersion: v2
     appVersion: 1.3.2
-    created: "2026-08-29T05:54:41.445594338Z"
+    created: "2026-09-01T03:50:03.50099863Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: f5c9fb5a981700c7f86b128107a2055a1978a68788c4c6aba05fd22c37a7791e
@@ -1153,7 +1178,7 @@ entries:
     version: 1.3.2
   - apiVersion: v2
     appVersion: 1.3.1
-    created: "2026-08-29T05:54:41.445127225Z"
+    created: "2026-09-01T03:50:03.499082435Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 534c8b321c46c81a8d00dfe0ef62cb3dfb1ce5f7e223d835ced2819ea176ea92
@@ -1178,7 +1203,7 @@ entries:
     version: 1.3.1
   - apiVersion: v2
     appVersion: 1.3.0
-    created: "2026-08-29T05:54:41.444551385Z"
+    created: "2026-09-01T03:50:03.49858723Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 10a5cdd944ab203561a56ed2a1ac9a941925adbf0fd519b10164dd1cc0f9e505
@@ -1203,7 +1228,7 @@ entries:
     version: 1.3.0
   - apiVersion: v2
     appVersion: 1.2.1
-    created: "2026-08-29T05:54:41.443999582Z"
+    created: "2026-09-01T03:50:03.498097096Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 3e63a01f300a9d9f13a7919b4bfe8ea5035cf9ee6b29003a589812359c90a76a
@@ -1228,7 +1253,7 @@ entries:
     version: 1.2.1
   - apiVersion: v2
     appVersion: 1.2.0
-    created: "2026-08-29T05:54:41.443414614Z"
+    created: "2026-09-01T03:50:03.497661244Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 01ab18ec2e7bc7c5f98c22ff1882dc11083d9b6d9b46a5b5f0d3d457dfc3a737
@@ -1253,7 +1278,7 @@ entries:
     version: 1.2.0
   - apiVersion: v2
     appVersion: 1.1.1
-    created: "2026-08-29T05:54:41.39063884Z"
+    created: "2026-09-01T03:50:03.451815904Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 26482875f789a4389e84b02cfc2504a9f53ac82f32816558598e3f9ff6d02176
@@ -1278,7 +1303,7 @@ entries:
     version: 1.1.1
   - apiVersion: v2
     appVersion: 1.1.0
-    created: "2026-08-29T05:54:41.390075854Z"
+    created: "2026-09-01T03:50:03.451365184Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: d366d5d468789b3cefad6297e5203b5b8c6bce4924ad3084c3b723a072d4526e
@@ -1303,7 +1328,7 @@ entries:
     version: 1.1.0
   - apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-08-29T05:54:41.389657943Z"
+    created: "2026-09-01T03:50:03.450754502Z"
     description: A Kubernetes operator that provisions StackIT Object Storage buckets,
       workload credentials and isolation policies
     digest: 9aeecb96afd03ed8c643807a076f2f0c98bd63099f2afe83e9fadad3a04afb58
@@ -1326,4 +1351,4 @@ entries:
     urls:
     - https://guided-traffic.github.io/stackit-s3-provisioner/stackit-s3-provisioner-1.0.0.tgz
     version: 1.0.0
-generated: "2026-08-29T05:54:41.389078237Z"
+generated: "2026-09-01T03:50:03.450051074Z"
