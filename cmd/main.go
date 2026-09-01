@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"strconv"
 	"time"
@@ -52,6 +53,15 @@ func main() {
 	var cloneImage string
 	var driftResyncInterval time.Duration
 	var providerDegradedGrace time.Duration
+	var usageEnabled bool
+	var usageDefaultEnabled bool
+	var usageInterval time.Duration
+	var usageMinInterval time.Duration
+	var usageMaxObjects int64
+	var usageIncludeVersions bool
+	var usageConcurrency int
+	var usagePrice string
+	var usageCurrency string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -109,6 +119,52 @@ func main() {
 			"watch only fires on generation/annotation changes, so a policy change "+
 			"shipped in an operator upgrade otherwise never reaches already-provisioned "+
 			"buckets. Can also be set via DRIFT_RESYNC_INTERVAL. Set to 0 to disable.")
+	flag.BoolVar(&usageEnabled, "bucket-usage-enabled",
+		envBoolOrDefault("BUCKET_USAGE_ENABLED", true),
+		"Operator-wide gate for periodic bucket size measurement. Set to false to stop all "+
+			"measurement traffic at once: no bucket is measured, whatever its CR asks for, and a "+
+			"Bucket that asked explicitly gets a warning event. Can also be set via BUCKET_USAGE_ENABLED.")
+	flag.BoolVar(&usageDefaultEnabled, "bucket-usage-default-enabled",
+		envBoolOrDefault("BUCKET_USAGE_DEFAULT_ENABLED", false),
+		"Whether Buckets that do not set spec.usage.enabled themselves are measured. This is the "+
+			"cluster-wide default; a Bucket can override it in either direction as long as the gate "+
+			"above is on. Can also be set via BUCKET_USAGE_DEFAULT_ENABLED.")
+	flag.DurationVar(&usageInterval, "bucket-usage-interval",
+		envDurationOrDefault("BUCKET_USAGE_INTERVAL", controller.DefaultUsageInterval),
+		"How often a Bucket that does not request its own interval is measured. Must be a Go "+
+			"duration string WITH A UNIT (e.g. \"1h\"). Can also be set via BUCKET_USAGE_INTERVAL.")
+	flag.DurationVar(&usageMinInterval, "bucket-usage-min-interval",
+		envDurationOrDefault("BUCKET_USAGE_MIN_INTERVAL", controller.DefaultUsageMinInterval),
+		"Lower bound for spec.usage.interval; a Bucket asking for less is clamped up to it and told "+
+			"so in status. Measuring means listing the bucket end to end (about one request per 1000 "+
+			"object keys), so this floor is what stops a single CR from turning the operator into a "+
+			"listing loop. Can also be set via BUCKET_USAGE_MIN_INTERVAL.")
+	flag.Int64Var(&usageMaxObjects, "bucket-usage-max-objects",
+		envInt64OrDefault("BUCKET_USAGE_MAX_OBJECTS", controller.DefaultUsageMaxObjects),
+		"Maximum number of listing entries one measurement consumes before it stops and reports a "+
+			"LOWER BOUND (status.usage.truncated). It bounds how long a single pass can take on a "+
+			"bucket with very many objects. 0 removes the cap. Can also be set via BUCKET_USAGE_MAX_OBJECTS.")
+	flag.BoolVar(&usageIncludeVersions, "bucket-usage-include-versions",
+		envBoolOrDefault("BUCKET_USAGE_INCLUDE_VERSIONS", false),
+		"Whether non-current object versions and delete markers are counted by default. They occupy "+
+			"billed storage but are invisible in a plain object listing, so counting them makes the "+
+			"measurement match the invoice on a versioned bucket at the price of a more expensive "+
+			"listing. Can also be set via BUCKET_USAGE_INCLUDE_VERSIONS.")
+	flag.IntVar(&usageConcurrency, "bucket-usage-concurrency",
+		envIntOrDefault("BUCKET_USAGE_CONCURRENCY", controller.DefaultUsageConcurrency),
+		"How many buckets are measured in parallel. Measurement runs in its own controller, so this "+
+			"bounds listing traffic without ever delaying provisioning. Can also be set via "+
+			"BUCKET_USAGE_CONCURRENCY.")
+	flag.StringVar(&usagePrice, "bucket-usage-price-per-gb-hour",
+		os.Getenv("BUCKET_USAGE_PRICE_PER_GB_HOUR"),
+		"Price of one gigabyte for one hour, in whole currency units, used to estimate each Bucket's "+
+			"monthly storage cost (e.g. \"0.00003697772\"). Empty or 0 disables the estimate. The "+
+			"estimate prices the measured size for a 720-hour month and is not an invoice. Can also be "+
+			"set via BUCKET_USAGE_PRICE_PER_GB_HOUR.")
+	flag.StringVar(&usageCurrency, "bucket-usage-currency",
+		envOrDefault("BUCKET_USAGE_CURRENCY", controller.DefaultUsageCurrency),
+		"Currency the cost estimate is labelled with. Display only; no conversion happens. "+
+			"Can also be set via BUCKET_USAGE_CURRENCY.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -122,6 +178,26 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The price is taken as a string and parsed here so a typo fails at startup
+	// with a clear message instead of silently producing a cost of zero.
+	pricePerGBHour, err := parseUsagePrice(usagePrice)
+	if err != nil {
+		setupLog.Error(err, "invalid bucket usage price", "value", usagePrice,
+			"expected", "a non-negative decimal number of currency units per GB per hour")
+		os.Exit(1)
+	}
+	usageConfig := controller.UsageConfig{
+		Enabled:         usageEnabled,
+		DefaultEnabled:  usageDefaultEnabled,
+		Interval:        usageInterval,
+		MinInterval:     usageMinInterval,
+		MaxObjects:      usageMaxObjects,
+		IncludeVersions: usageIncludeVersions,
+		PricePerGBHour:  pricePerGBHour,
+		Currency:        usageCurrency,
+		Concurrency:     usageConcurrency,
+	}
+
 	setupLog.Info("starting stackit-s3-provisioner",
 		"version", version,
 		"commit", commit,
@@ -133,6 +209,12 @@ func main() {
 		"enableWipeOnDelete", enableWipeOnDelete,
 		"driftResyncInterval", driftResyncInterval,
 		"providerDegradedGrace", providerDegradedGrace,
+		"bucketUsageEnabled", usageEnabled,
+		"bucketUsageDefaultEnabled", usageDefaultEnabled,
+		"bucketUsageInterval", usageInterval,
+		"bucketUsageMinInterval", usageMinInterval,
+		"bucketUsageMaxObjects", usageMaxObjects,
+		"bucketUsagePricePerGBHour", pricePerGBHour,
 	)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -207,7 +289,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	controller.RegisterBucketMetrics(mgr.GetClient(), stackitClient == nil, enableWipeOnDelete)
+	if err = (&controller.BucketUsageReconciler{
+		Client:               mgr.GetClient(),
+		Stackit:              stackitClient,
+		Config:               usageConfig,
+		AdminSecretName:      adminSecretName,
+		AdminSecretNamespace: operatorNamespace,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "BucketUsage")
+		os.Exit(1)
+	}
+
+	controller.RegisterBucketMetrics(mgr.GetClient(), stackitClient == nil, enableWipeOnDelete, usageEnabled)
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
@@ -225,6 +318,23 @@ func main() {
 	}
 }
 
+// parseUsagePrice parses the configured price of one gigabyte for one hour. An
+// empty value means "no price configured" and disables the cost estimate; a
+// negative one is rejected rather than quietly producing negative costs.
+func parseUsagePrice(raw string) (float64, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("price %q must not be negative", raw)
+	}
+	return v, nil
+}
+
 // envOrDefault returns the value of the environment variable key, or def when unset.
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -237,6 +347,24 @@ func envOrDefault(key, def string) string {
 // when it is unset or unparseable.
 func envBoolOrDefault(key string, def bool) bool {
 	if v, err := strconv.ParseBool(os.Getenv(key)); err == nil {
+		return v
+	}
+	return def
+}
+
+// envIntOrDefault parses the environment variable key as an int, returning def
+// when it is unset or unparseable.
+func envIntOrDefault(key string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
+		return v
+	}
+	return def
+}
+
+// envInt64OrDefault parses the environment variable key as an int64, returning
+// def when it is unset or unparseable.
+func envInt64OrDefault(key string, def int64) int64 {
+	if v, err := strconv.ParseInt(os.Getenv(key), 10, 64); err == nil {
 		return v
 	}
 	return def

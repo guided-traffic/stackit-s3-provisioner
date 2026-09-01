@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -482,6 +483,83 @@ type LocalBucketReference struct {
 	Name string `json:"name"`
 }
 
+// UsageSpec configures the periodic bucket-size measurement for this Bucket.
+// Every field is optional and falls back to the operator-wide default
+// (Helm bucketUsage.*), so a Bucket that omits the block entirely follows the
+// cluster policy.
+//
+// Measuring costs no money at STACKIT — Object Storage is billed per started
+// gigabyte per started hour and the price list carries no request, operation or
+// traffic component (see INIT-SETUP.md 8.3) — but it costs TIME: the size can
+// only be obtained by listing the bucket, which is one request per 1000 object
+// keys. A bucket with millions of objects therefore takes minutes per pass,
+// which is what the operator-wide interval floor and object cap bound.
+type UsageSpec struct {
+	// Enabled turns the size measurement on or off for this Bucket, overriding
+	// the operator-wide default (Helm bucketUsage.defaultEnabled). Leaving it
+	// unset inherits that default, so a cluster-wide policy change reaches this
+	// Bucket without editing it.
+	//
+	// It cannot switch the feature on when the operator-wide gate
+	// (Helm bucketUsage.enabled) is off: that gate is the hard kill switch, and
+	// a Bucket asking for a measurement under it is skipped with a warning event.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Interval overrides how often this bucket is measured. It is a Go duration
+	// string with a unit (e.g. "30m", "6h") and is clamped up to the operator's
+	// floor (Helm bucketUsage.minInterval) — a Bucket cannot ask to be measured
+	// more often than the cluster allows. Empty inherits the operator default.
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	// +optional
+	Interval string `json:"interval,omitempty"`
+
+	// IncludeVersions additionally measures non-current object versions and
+	// delete markers, which occupy billed storage but are invisible in a plain
+	// object listing. It makes the measurement match the invoice on a versioned
+	// bucket, at the price of listing every version rather than every current
+	// object. Unset inherits the operator default
+	// (Helm bucketUsage.includeVersions).
+	// +optional
+	IncludeVersions *bool `json:"includeVersions,omitempty"`
+}
+
+// UsageEnabled reports whether size measurement is requested for this Bucket,
+// given the operator-wide default for Buckets that do not decide themselves.
+func (u *UsageSpec) UsageEnabled(defaultEnabled bool) bool {
+	if u == nil || u.Enabled == nil {
+		return defaultEnabled
+	}
+	return *u.Enabled
+}
+
+// UsageIncludeVersions reports whether non-current versions count towards this
+// Bucket's size, given the operator-wide default.
+func (u *UsageSpec) UsageIncludeVersions(defaultInclude bool) bool {
+	if u == nil || u.IncludeVersions == nil {
+		return defaultInclude
+	}
+	return *u.IncludeVersions
+}
+
+// UsageInterval returns the measurement interval requested by this Bucket, or 0
+// when it does not request one (the caller then applies the operator default).
+// A syntactically invalid value is reported as an error rather than silently
+// ignored, so a typo surfaces on the CR instead of quietly restoring the default.
+func (u *UsageSpec) UsageInterval() (time.Duration, error) {
+	if u == nil || u.Interval == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(u.Interval)
+	if err != nil {
+		return 0, fmt.Errorf("spec.usage.interval %q is not a Go duration (e.g. \"30m\", \"6h\"): %w", u.Interval, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("spec.usage.interval %q must be positive", u.Interval)
+	}
+	return d, nil
+}
+
 // BucketSpec defines the desired state of a StackIT Object Storage bucket and its
 // dedicated, isolated workload credentials (one CR = one isolated workload, see
 // INIT-SETUP.md §8).
@@ -560,6 +638,93 @@ type BucketSpec struct {
 	// event is emitted.
 	// +optional
 	WipeOnDelete bool `json:"wipeOnDelete,omitempty"`
+
+	// Usage configures the periodic bucket-size measurement and the monthly cost
+	// estimate derived from it. Omitting the block follows the operator-wide
+	// policy (Helm bucketUsage.*); see UsageSpec for the individual overrides.
+	// +optional
+	Usage *UsageSpec `json:"usage,omitempty"`
+}
+
+// UsageStatus is the observed size of a bucket and the cost estimate derived
+// from it. Every value is a MEASUREMENT taken at LastMeasurementTime, not a live
+// figure: it is as old as the configured interval allows.
+type UsageStatus struct {
+	// Bytes is the total size of the bucket's current objects.
+	// +optional
+	Bytes int64 `json:"bytes,omitempty"`
+
+	// Objects is the number of current objects.
+	// +optional
+	Objects int64 `json:"objects,omitempty"`
+
+	// VersionBytes is the total size of non-current object versions. It is only
+	// measured when version counting is enabled (spec.usage.includeVersions);
+	// otherwise it stays zero and BillableBytes equals Bytes.
+	// +optional
+	VersionBytes int64 `json:"versionBytes,omitempty"`
+
+	// VersionObjects is the number of non-current object versions and delete
+	// markers. Delete markers carry no bytes but are counted here, because they
+	// are what makes a "deleted" object still occupy a version.
+	// +optional
+	VersionObjects int64 `json:"versionObjects,omitempty"`
+
+	// BillableBytes is Bytes plus VersionBytes: the figure the cost estimate is
+	// computed from. Without version counting it equals Bytes, which UNDERSTATES
+	// a versioned bucket's invoice.
+	// +optional
+	BillableBytes int64 `json:"billableBytes,omitempty"`
+
+	// HumanReadable renders BillableBytes for display (e.g. "18.0 GiB"). A
+	// measurement that hit the operator's object cap is prefixed with ">=",
+	// because the real bucket is larger than what was counted.
+	// +optional
+	HumanReadable string `json:"humanReadable,omitempty"`
+
+	// EstimatedMonthlyCost is the ESTIMATED monthly storage cost for this bucket
+	// at the price the operator is configured with (Helm bucketUsage.pricing),
+	// rendered for display (e.g. "1.23 EUR"). Empty when no price is configured.
+	//
+	// It is an estimate, not an invoice: it prices the measured size as if it
+	// were held for a whole 30-day month, uses the operator's configured list
+	// price rather than the contract actually in force, and excludes taxes and
+	// anything the bucket is not billed for by size.
+	// +optional
+	EstimatedMonthlyCost string `json:"estimatedMonthlyCost,omitempty"`
+
+	// EstimatedMonthlyCostCents is the same estimate in minor currency units
+	// (cents), which is the canonical value: the estimate is always rounded to
+	// whole cents, and EstimatedMonthlyCost is its rendering.
+	// +optional
+	EstimatedMonthlyCostCents int64 `json:"estimatedMonthlyCostCents,omitempty"`
+
+	// Currency is the currency of the estimate (Helm bucketUsage.pricing.currency).
+	// +optional
+	Currency string `json:"currency,omitempty"`
+
+	// LastMeasurementTime is when the values above were measured.
+	// +optional
+	LastMeasurementTime *metav1.Time `json:"lastMeasurementTime,omitempty"`
+
+	// MeasurementDuration is how long the last measurement took (e.g. "4.2s").
+	// A listing pass costs one request per 1000 keys, so this is the honest
+	// price of the configured interval and the number to look at before lowering it.
+	// +optional
+	MeasurementDuration string `json:"measurementDuration,omitempty"`
+
+	// Truncated reports that the measurement stopped at the operator's object cap
+	// (Helm bucketUsage.maxObjects). Every size and cost value is then a LOWER
+	// BOUND, not the bucket's actual size.
+	// +optional
+	Truncated bool `json:"truncated,omitempty"`
+
+	// Message carries a short reason when the last measurement did not succeed,
+	// or a note about the effective configuration (e.g. a clamped interval). A
+	// failed measurement leaves the previous values in place and never affects
+	// the Bucket's Ready condition.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // BucketStatus defines the observed state of Bucket.
@@ -653,6 +818,13 @@ type BucketStatus struct {
 	// +optional
 	OperatorVersion string `json:"operatorVersion,omitempty"`
 
+	// Usage is the result of the last bucket-size measurement and the monthly
+	// cost estimate derived from it. It is absent while measurement is disabled
+	// for this Bucket and is removed again when it is switched off, so a stale
+	// size never lingers on the CR.
+	// +optional
+	Usage *UsageStatus `json:"usage,omitempty"`
+
 	// Conditions represent the latest available observations of the bucket's state.
 	// +optional
 	// +listType=map
@@ -669,10 +841,14 @@ type BucketStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Whether the bucket is fully provisioned"
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.message",description="Current provisioning step or short failure reason"
 // +kubebuilder:printcolumn:name="Region",type="string",JSONPath=".spec.region",description="StackIT region"
+// +kubebuilder:printcolumn:name="Size",type="string",JSONPath=".status.usage.humanReadable",description="Measured bucket size at the last measurement"
+// +kubebuilder:printcolumn:name="Cost/Month",type="string",JSONPath=".status.usage.estimatedMonthlyCost",description="Estimated monthly storage cost at the operator's configured price"
 // +kubebuilder:printcolumn:name="Degraded",type="string",JSONPath=".status.degradedSince",description="Since when reconciles keep failing while Ready is held",priority=1
 // +kubebuilder:printcolumn:name="Clone",type="string",JSONPath=".status.clone.progress",description="Clone transfer progress",priority=1
 // +kubebuilder:printcolumn:name="Resolved",type="string",JSONPath=".status.resolvedBucketName",description="Physical bucket name in StackIT Object Storage",priority=1
 // +kubebuilder:printcolumn:name="Secret",type="string",JSONPath=".spec.secretRef.name",description="Secret holding the workload credentials",priority=1
+// +kubebuilder:printcolumn:name="Objects",type="integer",JSONPath=".status.usage.objects",description="Number of current objects at the last measurement",priority=1
+// +kubebuilder:printcolumn:name="Measured",type="date",JSONPath=".status.usage.lastMeasurementTime",description="When the bucket size was last measured",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // Bucket is the Schema for the buckets API. One Bucket maps to a StackIT bucket,

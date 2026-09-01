@@ -447,25 +447,91 @@ func (s *S3Admin) WipeBucket(ctx context.Context, bucket string) error {
 	return nil
 }
 
+// BucketStats is the measured content of a bucket: the size and number of its
+// current objects, and — when versions were counted — of the non-current
+// versions and delete markers that share the bucket's billed storage.
+type BucketStats struct {
+	// Bytes is the total size of the current objects.
+	Bytes int64
+	// Objects is the number of current objects.
+	Objects int64
+	// VersionBytes is the total size of non-current object versions. It stays
+	// zero when versions were not counted.
+	VersionBytes int64
+	// VersionObjects is the number of non-current versions and delete markers.
+	// Delete markers carry no bytes but do occupy a version.
+	VersionObjects int64
+	// Truncated reports that the listing stopped at the caller's entry cap, so
+	// every number above is a lower bound.
+	Truncated bool
+}
+
+// BillableBytes is the figure a storage bill is computed from: current objects
+// plus whatever non-current versions were counted. Without version counting it
+// equals Bytes and understates a versioned bucket.
+func (b BucketStats) BillableBytes() int64 { return b.Bytes + b.VersionBytes }
+
+// BucketStats measures a bucket by listing it. There is no cheaper way: the
+// Object Storage control-plane API exposes no usage or statistics endpoint
+// (verified against objectstorage SDK v1.9.1, INIT-SETUP.md 8.3), so the size is
+// the sum over one listing pass — roughly one request per 1000 keys.
+//
+// With includeVersions the listing switches to the version listing, which
+// returns every version and delete marker rather than only current objects. That
+// is what a versioned bucket is actually billed for, and it is proportionally
+// more expensive to walk.
+//
+// maxEntries caps how many listing entries are consumed; the pass then stops
+// early and reports Truncated, so an unexpectedly huge bucket costs a bounded
+// amount of time instead of an open-ended one. A value <= 0 means no cap.
+func (s *S3Admin) BucketStats(ctx context.Context, bucket string, includeVersions bool, maxEntries int64) (BucketStats, error) {
+	// Cancel the listing on early return (cap hit or error) so minio's producer
+	// goroutine does not block on an unread channel.
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var st BucketStats
+	var seen int64
+	for obj := range s.mc.ListObjects(lctx, bucket, minio.ListObjectsOptions{
+		Recursive:    true,
+		WithVersions: includeVersions,
+	}) {
+		if obj.Err != nil {
+			return BucketStats{}, fmt.Errorf("list objects in %q: %w", bucket, obj.Err)
+		}
+		switch {
+		case obj.IsDeleteMarker:
+			// No bytes of its own, but it is why the versions underneath survive.
+			st.VersionObjects++
+		case includeVersions && !obj.IsLatest:
+			// IsLatest is only populated by the version listing; without it every
+			// entry is a current object, which is why this arm is gated.
+			st.VersionObjects++
+			st.VersionBytes += obj.Size
+		default:
+			st.Objects++
+			st.Bytes += obj.Size
+		}
+		seen++
+		if maxEntries > 0 && seen >= maxEntries {
+			st.Truncated = true
+			break
+		}
+	}
+	return st, nil
+}
+
 // BucketUsage returns the total size in bytes of all current objects in the
 // bucket (one recursive listing pass). The clone feature measures the source
 // bucket once before copying so the progress percentage has a stable
 // denominator; S3Admin doubles as the client for arbitrary S3-compatible
 // clone-source endpoints here.
 func (s *S3Admin) BucketUsage(ctx context.Context, bucket string) (int64, error) {
-	// Cancel the listing on early return so minio's producer goroutine does not
-	// block on an unread channel.
-	lctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var total int64
-	for obj := range s.mc.ListObjects(lctx, bucket, minio.ListObjectsOptions{Recursive: true}) {
-		if obj.Err != nil {
-			return 0, fmt.Errorf("list objects in %q: %w", bucket, obj.Err)
-		}
-		total += obj.Size
+	st, err := s.BucketStats(ctx, bucket, false, 0)
+	if err != nil {
+		return 0, err
 	}
-	return total, nil
+	return st.Bytes, nil
 }
 
 // BucketEmpty reports whether the bucket holds no objects. It is used to enforce

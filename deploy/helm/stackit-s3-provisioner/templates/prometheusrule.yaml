@@ -2,7 +2,7 @@
 {{- $alerts := .Values.monitoring.prometheusRule.alerts }}
 {{- /* Skip the whole resource when every alert is disabled: prometheus-operator
        rejects a rule group without rules. Extend the `or` when adding alerts. */}}
-{{- if or $alerts.bucketsWipeOnDelete.enabled $alerts.bucketFailed.enabled $alerts.bucketStuckProvisioning.enabled $alerts.bucketStuckDeleting.enabled $alerts.cloneFailed.enabled $alerts.skeletonMode.enabled $alerts.wipeRequestedButGateDisabled.enabled $alerts.reconcileErrors.enabled $alerts.bucketProviderDegraded.enabled }}
+{{- if or $alerts.bucketsWipeOnDelete.enabled $alerts.bucketFailed.enabled $alerts.bucketStuckProvisioning.enabled $alerts.bucketStuckDeleting.enabled $alerts.cloneFailed.enabled $alerts.skeletonMode.enabled $alerts.wipeRequestedButGateDisabled.enabled $alerts.reconcileErrors.enabled $alerts.bucketProviderDegraded.enabled $alerts.usageMeasurementFailing.enabled $alerts.usageMeasurementTruncated.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -131,6 +131,34 @@ spec:
               drop to Failed. Inspect status.degradedSince and the
               ProviderReachable condition, and check whether the StackIT API is
               reachable from the operator.
+        {{- end }}
+        {{- if $alerts.usageMeasurementFailing.enabled }}
+        - alert: StackitS3UsageMeasurementFailing
+          expr: sum(increase(stackit_s3_provisioner_usage_measurement_failures_total[30m])) > 3
+          labels:
+            severity: warning
+          annotations:
+            summary: Bucket size measurements keep failing
+            description: >-
+              {{ `{{ $value | humanize }}` }} bucket size measurements failed within
+              30 minutes. A failed measurement leaves the previous size and cost
+              estimate in place and deliberately does NOT affect a Bucket's Ready
+              condition, so the values on the CRs are silently going stale. Check
+              status.usage.message on the affected Buckets and the operator logs.
+        {{- end }}
+        {{- if $alerts.usageMeasurementTruncated.enabled }}
+        - alert: StackitS3UsageMeasurementTruncated
+          expr: max(stackit_s3_provisioner_bucket_usage_truncated) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Bucket size measurement hit the object cap
+            description: >-
+              At least one Bucket's size measurement stopped at the operator's
+              object cap (bucketUsage.maxObjects), so its reported size and its
+              monthly cost estimate are LOWER BOUNDS, not the real values. Raise
+              the cap deliberately — the listing pass gets proportionally longer.
         {{- end }}
         {{- if $alerts.reconcileErrors.enabled }}
         - alert: StackitS3ReconcileErrors

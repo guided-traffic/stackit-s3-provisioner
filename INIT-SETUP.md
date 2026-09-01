@@ -376,6 +376,20 @@ in den frisch provisionierten Bucket. Kern-Entscheidungen:
   zurück auf die CR (Cross-Namespace-OwnerRef nicht erlaubt).
 - **RBAC neu:** `batch/jobs` CRUD + `pods` get/list/watch (Pod-IP für rc-Polling).
 
+**Live verifiziert (2026-09-01, `make e2e-stackit`, `TestCloudClone`):** Kopie eines echten
+Buckets mit dem echten rclone-Image (`rclone/rclone:1.75.0`) in Kind. Quelle war ein zweites
+Bucket-CR, dessen Workload-Secret unveraendert als `cloneFrom.secretRef` taugt (die Default-Keys
+passen) — der Workload-Key darf sein eigenes Bucket listen und lesen (`s3:ListBucket`,
+`s3:GetObject` in `workloadAllowedActions`), was die Quell-Messung und den Copy traegt.
+Bestaetigt: `totalBytes` = die geseedete Groesse, drei Objekte inkl. verschachtelter Praefixe
+byte-identisch angekommen, `CloneCompleted=True`, und die **Hold-Invariante** — das
+Workload-Secret des Ziels taucht nie auf, solange die Clone-Phase nicht `Completed` ist (der
+Operator persistiert den Terminalzustand vor dem Secret-Write, der Test prueft das bei jedem
+Poll). `completedAt` bleibt ueber nachfolgende Reconciles stabil, der Clone laeuft also
+wirklich nur einmal. Das rclone-Image wird vom Make-Target aus dem gerenderten Chart gelesen
+(`--clone-image=`) und in den Kind-Node vorgeladen — kein dritter Versions-Pin neben
+`DefaultCloneImage` und `clone.image`, und kein Registry-Pull mitten im Test.
+
 ### 8.2 Transiente Provider-Fehler — implementiert (2026-08-25)
 
 Anlass: Incident mgmt-p 2026-08-25. Zwei Ereignisse, dieselbe Verstaerkerkette
@@ -500,6 +514,76 @@ provider-kontrolliert und offen — sie kann nie fertig sein, und jeder nicht
 gelistete Fehler faellt auf den falschen Default. Die hier gepflegte Liste
 definitiver Faelle ist geschlossen und gehoert uns.
 
+### 8.3 Bucket-Groesse + Kostenschaetzung (`spec.usage`) — implementiert (2026-09-01)
+
+Anforderung: aktuelle Bucket-Groesse an der CR sichtbar (Lens), konfigurierbares
+Intervall, clusterweiter Default via Helm (default aus), pro CR ueberschreib- und
+abschaltbar, Ermittlung darf den Operator nicht blockieren; zusaetzlich eine
+Kostenschaetzung pro Monat aus einem konfigurierbaren GB/h-Preis.
+
+**Verifizierte Preis-/Abrechnungslage** (recherchiert 2026-09-01):
+
+| Frage | Befund | Quelle |
+| ----- | ------ | ------ |
+| Abrechnungsmetrik | "je angefangener Stunde je angefangenem Gigabyte" — sonst nichts | Leistungsschein STACKIT Object Storage v1.2, gueltig ab 2026-03-26, Abschnitt "Servicepläne - Metriken" |
+| Preis Premium-EU01 | **0.00003697772 EUR** per GB/hour (Monatsspalte 0.03 EUR) | STACKIT price list v1.0.43 (08/04/2026), Zeile "Object Storage Premium-EU01" |
+| Preis Premium-EU02 | 0.00003883000 EUR per GB/hour | dieselbe Preisliste |
+| Preis Archiving-EU01 | 0.00003697772 EUR per GB/hour (identisch zum Standard-Tier) | dieselbe Preisliste |
+| Request-/Operations-Kosten | **keine** — die Preisliste enthaelt null Treffer fuer request/operation/traffic/egress ueber alle 31 Seiten | dieselbe Preisliste |
+| Monats-Projektion | 720 Stunden ("a hypothetical subscription period of 720 hours (30-day month)") | Fussnote jeder Preislisten-Seite |
+
+**Konsequenz fuer das Feature:** Die Groessenermittlung kostet **kein Geld**, aber
+**Zeit**. Es gibt keinen Usage-Endpoint in der Control Plane (geprueft gegen
+`objectstorage` SDK v1.9.1: nur Bucket/CredentialsGroup/AccessKey/Service/
+Retention/ComplianceLock), die Groesse ist also nur ueber ein vollstaendiges
+Listing zu bekommen — ~1 Request je 1000 Keys. Die Guards sind entsprechend auf
+Zeit ausgelegt, nicht auf Geld: `minInterval` (Default 60m) und `maxObjects`
+(Default 2 Mio, danach `truncated` = untere Schranke).
+
+**Design:**
+
+- **Eigener Controller** (`BucketUsageReconciler`, eigene Workqueue,
+  `MaxConcurrentReconciles` = `bucketUsage.concurrency`). Ein Listing ueber einen
+  grossen Bucket dauert so lange wie der Bucket gross ist; im Provisioning-Pass
+  wuerde das eine unbegrenzte, rein informative Operation vor Credential- und
+  Policy-Management haengen.
+- **Status-Trennung:** der Mess-Controller schreibt **nur** `status.usage`, und
+  zwar per Merge-Patch — er kann die Felder des Provisioning-Reconcilers nicht
+  ueberschreiben. Die Gegenrichtung deckt Optimistic Concurrency ab: der
+  Provisioning-Pfad schreibt Status per `Update` mit ResourceVersion, eine
+  dazwischen gelandete Messung laesst dieses Update also konfliktieren und neu
+  laufen statt still verloren zu gehen.
+- **Zeitplan aus dem Status, nicht aus einem Prozess-Timer:** faellig ist eine
+  Messung wenn `status.usage.lastMeasurementTime + interval` erreicht ist, der
+  naechste Lauf kommt per `RequeueAfter`. Ueberlebt Operator-Neustarts; der
+  Bucket-Watch ist generation/annotation-gefiltert, sonst wuerde der eigene
+  Status-Write die naechste Messung sofort ausloesen (Hot-Loop).
+- **Admin-Key liest, legt nichts an:** der Mess-Pfad liest das Admin-Secret und
+  bootstrappt es nie — eine Messung darf keine Cloud-Credentials als Seiteneffekt
+  erzeugen. Fehlt es, wird kurz requeued.
+- **Messfehler beruehren `Ready` nicht** und geben keinen Reconcile-Error zurueck
+  (`StackitS3ReconcileErrors` filtert ohnehin auf `controller="bucket"`). Sie
+  landen in `status.usage.message`, einem Warning-Event und
+  `stackit_s3_provisioner_usage_measurement_failures_total`. Der vorherige Wert
+  bleibt stehen — eine veraltete Groesse ist nuetzlicher als keine.
+- **Versionen optional** (`includeVersions`): das Versions-Listing liefert
+  aktuelle Versionen, alte Versionen und Delete-Marker in einem Pass; ohne diese
+  Option unterschaetzt die Messung einen versionierten Bucket gegenueber der
+  Rechnung. Unvollstaendige Multipart-Uploads werden **nicht** gezaehlt (bewusst
+  offen gelassen — sie belegen Speicher, brauchen aber ein drittes Listing).
+- **Kostenformel:** `ceil(billableBytes / 1e9)` angefangene GB × Preis × 720 h,
+  auf ganze Cent gerundet. Die Cent-Zahl ist der kanonische Wert
+  (`estimatedMonthlyCostCents`), der Anzeigestring ist ihre Darstellung.
+
+**Live verifiziert (2026-09-01, `make e2e-stackit`, Projekt `ebc9d379…`, eu01):**
+
+| Befund | Ergebnis |
+| ------ | -------- |
+| Messung mit dem Admin-Key gegen StorageGRID | funktioniert; leerer Bucket in 64 ms gemessen |
+| 5 MiB / 1 Objekt geschrieben, danach neu gemessen | `bytes=5242880`, `objects=1`, `0.03 EUR` (1 angefangenes GB) — Formel und Preis stimmen gegen die echte Listung |
+| `includeVersions: true` auf einem **nicht-versionierten** Bucket | StorageGRID beantwortet das Versions-Listing; das lebende Objekt kommt mit `IsLatest=true` und landet korrekt in den Current-Zaehlern, `versionBytes`/`versionObjects` bleiben 0. Der Pfad laeuft also nicht ins Leere und zaehlt nichts doppelt. |
+| `spec.usage.enabled: false` nachtraeglich | `status.usage` verschwindet vollstaendig |
+
 ## 9. Machbarkeits-Smoke-Test — VERIFIZIERT (2026-06-30)
 
 Minimaler Go-Code gegen die **echte** StackIT-API, mit beiden Service-Account-Keys
@@ -581,5 +665,6 @@ Wichtige technische Bestätigungen / Fallstricke (`objectstorage` v1.9.0, `minio
 - [Service Accounts](https://docs.stackit.cloud/platform/access-and-identity/service-accounts/) · [Auth Flows (Key-Flow)](https://docs.stackit.cloud/platform/access-and-identity/service-accounts/authentication-flows/)
 - [Go SDK objectstorage](https://pkg.go.dev/github.com/stackitcloud/stackit-sdk-go/services/objectstorage) · [Terraform Provider](https://github.com/stackitcloud/terraform-provider-stackit)
 - [NetApp StorageGRID — Bucket/Group Access Policies](https://docs.netapp.com/us-en/storagegrid/s3/bucket-and-group-access-policies.html) (Backend, Policy-Auswertung & Lockout)
+- [STACKIT Preisliste (PDF)](https://stackit.com/en/asset/download/37788/file/STACKIT_price_list.pdf) · [Leistungsschein Object Storage (PDF)](https://stackit.com/de/asset/download/34186/file/Leistungsschein_STACKIT_Object_Storage.pdf) · [Object-Storage-Produktseite mit Preisen](https://stackit.com/en/products/storage/stackit-object-storage) (Preis- und Abrechnungsbasis fuer §8.3)
 </content>
 </invoke>

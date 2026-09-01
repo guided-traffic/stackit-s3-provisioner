@@ -184,6 +184,14 @@ kind-delete: ## Delete the Kind test cluster.
 SA_KEY ?= account-1.json
 E2E_BUCKET_PREFIX ?= s3e2e
 
+# The rclone image the clone tests need inside the Kind node. It is READ OUT of
+# the rendered chart rather than pinned here a third time: the tag already lives
+# in the chart values (Renovate-managed) and in DefaultCloneImage, and a stale
+# copy in the Makefile would preload an image the operator never asks for. The
+# image is preloaded so the clone Job never waits on a registry pull mid-test.
+E2E_CLONE_IMAGE = $(shell helm template e2e $(HELM_CHART_DIR) --values test/e2e/helm-values-stackit.yaml \
+	| grep -m1 -- '--clone-image=' | sed 's/.*--clone-image=//')
+
 .PHONY: e2e-stackit
 e2e-stackit: kind-create ## Run E2E against the REAL StackIT API (creates and deletes real buckets/keys; needs $(SA_KEY)).
 	@test -f $(SA_KEY) || { echo "ERROR: $(SA_KEY) not found — the cloud E2E run needs a StackIT service-account key"; exit 1; }
@@ -191,6 +199,9 @@ e2e-stackit: kind-create ## Run E2E against the REAL StackIT API (creates and de
 	docker build -f Containerfile -t $(E2E_IMG) .
 	@echo "Loading E2E image into Kind cluster..."
 	kind load docker-image $(E2E_IMG) --name $(KIND_CLUSTER)
+	@echo "Preloading clone image $(E2E_CLONE_IMAGE) into Kind cluster..."
+	docker pull $(E2E_CLONE_IMAGE)
+	kind load docker-image $(E2E_CLONE_IMAGE) --name $(KIND_CLUSTER)
 	@echo "Creating service-account key Secret..."
 	kubectl create namespace stackit-s3-provisioner-system --dry-run=client -o yaml | kubectl apply -f -
 	kubectl create secret generic stackit-sa-key \

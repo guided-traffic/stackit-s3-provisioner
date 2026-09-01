@@ -177,6 +177,87 @@ clone:
   networkPolicy:
     enabled: true
 
+# bucketUsage controls the periodic bucket-size measurement and the monthly cost
+# estimate derived from it. The measured size, the object count and the estimate
+# are written to each Bucket's status (status.usage) and shown as CR columns, so
+# they are visible in kubectl and Lens; every value is also exported as a metric
+# for alerting.
+#
+# WHAT IT COSTS. STACKIT bills Object Storage per started gigabyte per started
+# hour and its price list has NO request, operation or traffic component, so
+# measuring costs no money (verified against the STACKIT price list v1.0.43 and
+# the Object Storage Leistungsschein v1.2, see INIT-SETUP.md 8.3). It costs TIME:
+# the control-plane API exposes no usage endpoint, so the only way to obtain a
+# size is to list the bucket — roughly one request per 1000 object keys. A bucket
+# with 2 million objects is about 2000 requests per pass, every pass. That is why
+# minInterval and maxObjects exist; lower the interval only after looking at
+# status.usage.measurementDuration on a real bucket.
+bucketUsage:
+  # enabled is the HARD gate. false means the operator measures nothing at all,
+  # whatever any Bucket asks for (a Bucket that asked explicitly gets a warning
+  # event and a note in status). Flip it to stop all measurement traffic at once
+  # without touching a single CR.
+  enabled: true
+  # defaultEnabled applies to every Bucket that does not set spec.usage.enabled
+  # itself. This is the cluster-wide policy and it is OFF, so measurement is
+  # something a workload opts into; a Bucket can override it in either direction
+  # while `enabled` above is true.
+  defaultEnabled: false
+  # interval is how often a Bucket that does not request its own interval is
+  # measured. Must be a Go duration string WITH A UNIT (e.g. "1h", "6h"); a bare
+  # number like 60 is rejected and crash-loops the operator at startup.
+  interval: "60m"
+  # minInterval is the floor for spec.usage.interval: a Bucket asking to be
+  # measured more often is clamped up to this and told so in status and via a
+  # warning event. It is the guard against a single CR generating continuous
+  # listing traffic for the whole project.
+  minInterval: "60m"
+  # maxObjects caps how many listing entries ONE measurement consumes. Beyond it
+  # the pass stops and reports a LOWER BOUND: status.usage.truncated becomes
+  # true, and the size and cost columns are prefixed with ">=". This bounds the
+  # time a single pass can take on a bucket with very many objects.
+  #
+  # WARNING: a bucket that regularly exceeds this cap never reports a true size,
+  # and its cost estimate is therefore too low. Watch the warning event
+  # UsageMeasurementTruncated and raise the cap deliberately — the pass gets
+  # proportionally longer, not more expensive.
+  # Set to 0 to remove the cap entirely (unbounded listing).
+  maxObjects: 2000000
+  # includeVersions counts non-current object versions and delete markers by
+  # default. They occupy billed storage but do not appear in a plain object
+  # listing, so on a VERSIONED bucket the default (false) understates both the
+  # size and the cost. Enabling it makes the measurement match the invoice at the
+  # price of listing every version instead of every current object. Individual
+  # Buckets can override this with spec.usage.includeVersions.
+  includeVersions: false
+  # concurrency is how many buckets are measured in parallel. Measurement runs in
+  # its own controller with its own work queue, so a slow measurement never
+  # delays provisioning — this value only bounds how much listing traffic the
+  # operator produces at once.
+  concurrency: 2
+  # pricing turns a measured size into the monthly cost estimate shown on the CR
+  # (status.usage.estimatedMonthlyCost, column "Cost/Month") and exported as
+  # stackit_s3_provisioner_bucket_estimated_monthly_cost.
+  pricing:
+    # perGBHour is the price of ONE GIGABYTE for ONE HOUR in whole currency
+    # units, QUOTED AS A STRING so YAML does not turn it into an exponent.
+    #
+    # The default is the STACKIT list price for Object Storage Premium-EU01 from
+    # the public price list (version 1.0.43, 08/04/2026), net, excluding taxes.
+    # EU02 (Austria) was 0.00003883000 in the same list. These are LIST prices:
+    # if you have a contract, put YOUR price here — nothing verifies this number.
+    # Set to "" or "0" to switch the estimate off entirely.
+    perGBHour: "0.00003697772"
+    # currency labels the estimate on the CR and as a metric label. Display only:
+    # no conversion of any kind happens, so changing it does not change a number.
+    currency: "EUR"
+    # NOTE on how the estimate is computed, because it is an ESTIMATE and not an
+    # invoice: the measured size is rounded UP to a whole decimal gigabyte (the
+    # billing metric is per STARTED gigabyte), priced for 720 hours (the 30-day
+    # month STACKIT's own price list projects with) and rounded to whole cents.
+    # It prices the size measured at ONE moment as if it were held all month, and
+    # it covers storage only.
+
 # monitoring integrates the operator with a prometheus-operator stack. Both
 # resources below use prometheus-operator CRDs (monitoring.coreos.com/v1) —
 # enable them only on clusters where those CRDs exist, or the install fails.
@@ -241,6 +322,17 @@ monitoring:
       # alert the hold is invisible until the grace elapses and the Bucket drops
       # to Failed. Fires well inside a 30m grace so the hold is never silent.
       bucketProviderDegraded:
+        enabled: true
+      # usageMeasurementFailing fires (warning) when bucket size measurements
+      # keep failing. Measurement failures deliberately do NOT mark a Bucket
+      # unhealthy — the bucket itself is fine, only its size is unknown — so
+      # without this alert a permanently stale size and cost estimate is silent.
+      usageMeasurementFailing:
+        enabled: true
+      # usageMeasurementTruncated fires (warning) while a Bucket keeps hitting
+      # bucketUsage.maxObjects. Its reported size and cost are then lower bounds,
+      # which is exactly the state in which a size-based alert under-reports.
+      usageMeasurementTruncated:
         enabled: true
 
 # stackit configures the operator's binding to a StackIT project.

@@ -58,6 +58,21 @@ func requireCloud(t *testing.T) {
 	}
 }
 
+// usageSpec is the optional spec.usage block of a Bucket CR.
+type usageSpec struct {
+	enabled         bool
+	includeVersions bool
+	interval        string
+}
+
+// cloneSpec is the optional spec.cloneFrom block of a Bucket CR.
+type cloneSpec struct {
+	endpoint   string
+	bucket     string
+	region     string
+	secretName string
+}
+
 // bucketSpec is the minimum a Bucket CR needs plus the optional bits these tests
 // exercise.
 type bucketSpec struct {
@@ -65,6 +80,8 @@ type bucketSpec struct {
 	name         string
 	grantRead    []string
 	wipeOnDelete bool
+	usage        *usageSpec
+	cloneFrom    *cloneSpec
 }
 
 func (b bucketSpec) object() *unstructured.Unstructured {
@@ -81,6 +98,27 @@ func (b bucketSpec) object() *unstructured.Unstructured {
 	}
 	if b.wipeOnDelete {
 		spec["wipeOnDelete"] = true
+	}
+	if u := b.usage; u != nil {
+		usage := map[string]any{"enabled": u.enabled}
+		if u.includeVersions {
+			usage["includeVersions"] = true
+		}
+		if u.interval != "" {
+			usage["interval"] = u.interval
+		}
+		spec["usage"] = usage
+	}
+	if c := b.cloneFrom; c != nil {
+		clone := map[string]any{
+			"endpoint":  c.endpoint,
+			"bucket":    c.bucket,
+			"secretRef": map[string]any{"name": c.secretName},
+		}
+		if c.region != "" {
+			clone["region"] = c.region
+		}
+		spec["cloneFrom"] = clone
 	}
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "stackit-bucket.gtrfc.com/v1",
@@ -266,15 +304,28 @@ func s3List(ctx context.Context, mc *minio.Client, bucket string) error {
 	return nil
 }
 
+// definitiveError marks a failure eventually must not keep retrying.
+type definitiveError struct{ err error }
+
+func (d definitiveError) Error() string { return d.err.Error() }
+
+// giveUp wraps an error as definitive: waiting longer cannot turn it into a
+// success, so eventually returns it immediately instead of burning the timeout.
+func giveUp(err error) error { return definitiveError{err} }
+
 // eventually retries fn until it returns nil or the timeout elapses. Bucket
 // policies take effect asynchronously, so every assertion about access has to
 // tolerate a short lag in BOTH directions (granted -> visible, revoked -> gone).
+// An error wrapped with giveUp aborts the retry loop at once.
 func eventually(timeout time.Duration, fn func() error) error {
 	deadline := time.Now().Add(timeout)
 	var last error
 	for {
 		if last = fn(); last == nil {
 			return nil
+		}
+		if d, ok := last.(definitiveError); ok {
+			return d.err
 		}
 		if time.Now().After(deadline) {
 			return last
@@ -463,4 +514,386 @@ func TestCloudReadGrantLifecycle(t *testing.T) {
 		return nil
 	}), "status.grantedReadTo must stop advertising the revoked grant")
 	t.Log("OK: grant revoked")
+}
+
+// --- bucket size measurement (spec.usage) ---------------------------------
+
+// usageTimeout bounds waiting for a measurement. The operator measures a Bucket
+// as soon as it becomes Ready and then every bucketUsage.interval, which the e2e
+// values shorten to seconds; the slack is for the listing round-trip and the
+// status write.
+const usageTimeout = 3 * time.Minute
+
+// usageStatus is the status.usage block, read through the dynamic client.
+type usageStatus struct {
+	bytes         int64
+	objects       int64
+	versionBytes  int64
+	versionObject int64
+	billableBytes int64
+	humanReadable string
+	cost          string
+	costCents     int64
+	currency      string
+	duration      string
+	measuredAt    string
+	truncated     bool
+	message       string
+}
+
+// readUsage reads status.usage off a Bucket CR. found is false while the Bucket
+// carries no measurement at all.
+func readUsage(t *testing.T, ctx context.Context, dyn dynamic.Interface, ns, name string) (usageStatus, bool) {
+	t.Helper()
+	got, err := dyn.Resource(bucketGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	require.NoError(t, err)
+	raw, found, _ := unstructured.NestedMap(got.Object, "status", "usage")
+	if !found {
+		return usageStatus{}, false
+	}
+	num := func(k string) int64 {
+		v, ok, _ := unstructured.NestedInt64(raw, k)
+		if !ok {
+			return 0
+		}
+		return v
+	}
+	str := func(k string) string {
+		v, _, _ := unstructured.NestedString(raw, k)
+		return v
+	}
+	b, _, _ := unstructured.NestedBool(raw, "truncated")
+	return usageStatus{
+		bytes:         num("bytes"),
+		objects:       num("objects"),
+		versionBytes:  num("versionBytes"),
+		versionObject: num("versionObjects"),
+		billableBytes: num("billableBytes"),
+		humanReadable: str("humanReadable"),
+		cost:          str("estimatedMonthlyCost"),
+		costCents:     num("estimatedMonthlyCostCents"),
+		currency:      str("currency"),
+		duration:      str("measurementDuration"),
+		measuredAt:    str("lastMeasurementTime"),
+		truncated:     b,
+		message:       str("message"),
+	}, true
+}
+
+// waitUsage blocks until a measurement satisfies want, and reports the last seen
+// value on timeout so a failure says what the operator actually measured.
+func waitUsage(t *testing.T, ctx context.Context, dyn dynamic.Interface, ns, name string,
+	what string, want func(usageStatus) bool,
+) usageStatus {
+	t.Helper()
+	var last usageStatus
+	var seen bool
+	err := eventually(usageTimeout, func() error {
+		u, ok := readUsage(t, ctx, dyn, ns, name)
+		last, seen = u, ok
+		if !ok {
+			return fmt.Errorf("no status.usage yet")
+		}
+		if !want(u) {
+			return fmt.Errorf("measurement does not match yet: %+v", u)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Bucket %s/%s: %s: %v (last seen: %+v, present=%t)", ns, name, what, err, last, seen)
+	}
+	return last
+}
+
+// TestCloudBucketUsage measures a real bucket end to end: the operator lists it
+// with the admin credentials, writes the size to status.usage and prices it.
+//
+// This is the part the offline suite cannot reach — it runs against an in-memory
+// fake of the S3 listing. Here the listing is StorageGRID's.
+func TestCloudBucketUsage(t *testing.T) {
+	requireCloud(t)
+	kube, dyn := clients(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cloudTimeout)
+	defer cancel()
+
+	ensureNamespace(t, ctx, kube, nsAlpha)
+	// The e2e values keep bucketUsage.defaultEnabled off, so measuring this
+	// Bucket at all proves the per-CR opt-in path.
+	createBucket(t, ctx, dyn, bucketSpec{
+		namespace: nsAlpha, name: "sized", wipeOnDelete: true,
+		usage: &usageSpec{enabled: true},
+	})
+	waitReady(t, ctx, dyn, nsAlpha, "sized")
+
+	// An empty bucket must still produce a measurement — "0 bytes" and "never
+	// measured" have to stay distinguishable.
+	empty := waitUsage(t, ctx, dyn, nsAlpha, "sized", "first measurement of the empty bucket",
+		func(u usageStatus) bool { return u.measuredAt != "" })
+	assert.Zero(t, empty.bytes, "a fresh bucket holds no bytes")
+	assert.Zero(t, empty.objects, "a fresh bucket holds no objects")
+	assert.False(t, empty.truncated, "a tiny bucket must not hit the object cap")
+	assert.NotEmpty(t, empty.duration, "measurementDuration is the honest price of the interval")
+	t.Logf("OK: empty bucket measured in %s", empty.duration)
+
+	// Write a known amount through the workload credentials, exactly as a
+	// consuming workload would.
+	mc, bucket := s3For(t, ctx, kube, nsAlpha, "sized-s3")
+	const payloadSize = 5 * 1024 * 1024 // 5 MiB
+	payload := bytes.Repeat([]byte("x"), payloadSize)
+	require.NoError(t, eventually(policyTimeout, func() error {
+		return s3Put(ctx, mc, bucket, "blob.bin", payload)
+	}), "workload credentials should be able to write")
+
+	grown := waitUsage(t, ctx, dyn, nsAlpha, "sized", "re-measurement after the bucket grew",
+		func(u usageStatus) bool { return u.objects == 1 })
+	assert.Equal(t, int64(payloadSize), grown.bytes, "measured size must match what was written")
+	assert.Equal(t, int64(payloadSize), grown.billableBytes,
+		"without version counting the billable size is the current-object size")
+	assert.Zero(t, grown.versionBytes, "versions are not counted unless asked for")
+	assert.Equal(t, "5.0 MiB", grown.humanReadable)
+	assert.False(t, grown.truncated)
+
+	// 5 MiB is one STARTED gigabyte: 1 * 0.00003697772 * 720 h = 0.0266 EUR -> 3 cents.
+	assert.Equal(t, int64(3), grown.costCents, "cost is rounded to whole cents")
+	assert.Equal(t, "0.03 EUR", grown.cost)
+	assert.Equal(t, "EUR", grown.currency)
+	assert.Empty(t, grown.message, "a clean measurement carries no message")
+	t.Logf("OK: %d bytes / %d objects measured, estimated %s per month", grown.bytes, grown.objects, grown.cost)
+
+	// Switching measurement off must remove the values: nothing refreshes them
+	// any more, so leaving them on display would assert a currency they lost.
+	patch := []byte(`[{"op":"replace","path":"/spec/usage/enabled","value":false}]`)
+	_, err := dyn.Resource(bucketGVR).Namespace(nsAlpha).Patch(
+		ctx, "sized", types.JSONPatchType, patch, metav1.PatchOptions{})
+	require.NoError(t, err, "disable measurement on the CR")
+
+	require.NoError(t, eventually(usageTimeout, func() error {
+		if _, ok := readUsage(t, ctx, dyn, nsAlpha, "sized"); ok {
+			return fmt.Errorf("status.usage still present")
+		}
+		return nil
+	}), "disabling measurement must clear the stale size and cost")
+	t.Log("OK: measurement disabled and status.usage cleared")
+}
+
+// TestCloudBucketUsageWithVersions exercises the version-counting listing
+// against the real backend.
+//
+// It is here rather than only offline because the interesting question is a
+// live one: STACKIT buckets are not versioned by default, and this asks
+// StorageGRID for a VERSION listing of a bucket that has no versioning. The
+// offline fake answers that happily by construction; the real backend is the
+// only place where "does this path work at all" can be settled.
+func TestCloudBucketUsageWithVersions(t *testing.T) {
+	requireCloud(t)
+	kube, dyn := clients(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cloudTimeout)
+	defer cancel()
+
+	ensureNamespace(t, ctx, kube, nsAlpha)
+	createBucket(t, ctx, dyn, bucketSpec{
+		namespace: nsAlpha, name: "versioned", wipeOnDelete: true,
+		usage: &usageSpec{enabled: true, includeVersions: true},
+	})
+	waitReady(t, ctx, dyn, nsAlpha, "versioned")
+
+	mc, bucket := s3For(t, ctx, kube, nsAlpha, "versioned-s3")
+	const payloadSize = 1024
+	payload := bytes.Repeat([]byte("v"), payloadSize)
+	require.NoError(t, eventually(policyTimeout, func() error {
+		return s3Put(ctx, mc, bucket, "versioned.bin", payload)
+	}))
+
+	u := waitUsage(t, ctx, dyn, nsAlpha, "versioned", "measurement with version counting",
+		func(u usageStatus) bool { return u.objects == 1 })
+	assert.Equal(t, int64(payloadSize), u.bytes,
+		"the version listing must classify the live object as current, not as a version")
+	assert.Zero(t, u.versionBytes, "an unversioned bucket has no non-current versions")
+	assert.Zero(t, u.versionObject, "an unversioned bucket has no delete markers either")
+	assert.Equal(t, int64(payloadSize), u.billableBytes)
+	assert.Empty(t, u.message, "the version listing must not report a failure")
+	t.Log("OK: version-counting measurement works against a non-versioned bucket")
+}
+
+// --- bucket clone (spec.cloneFrom) ----------------------------------------
+
+// cloneTimeout bounds a clone: the Job has to be scheduled, rclone has to start
+// and copy, and the operator polls the Job every 15s. The rclone image is
+// preloaded into the Kind node by the make target, so no registry pull is on
+// this path.
+const cloneTimeout = 6 * time.Minute
+
+// cloneStatus is the status.clone block, read through the dynamic client.
+type cloneStatus struct {
+	phase       string
+	totalBytes  int64
+	bytesCopied int64
+	progress    string
+	message     string
+	completedAt string
+}
+
+func readClone(t *testing.T, ctx context.Context, dyn dynamic.Interface, ns, name string) (cloneStatus, bool) {
+	t.Helper()
+	got, err := dyn.Resource(bucketGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	require.NoError(t, err)
+	raw, found, _ := unstructured.NestedMap(got.Object, "status", "clone")
+	if !found {
+		return cloneStatus{}, false
+	}
+	str := func(k string) string {
+		v, _, _ := unstructured.NestedString(raw, k)
+		return v
+	}
+	num := func(k string) int64 {
+		v, ok, _ := unstructured.NestedInt64(raw, k)
+		if !ok {
+			return 0
+		}
+		return v
+	}
+	return cloneStatus{
+		phase:       str("phase"),
+		totalBytes:  num("totalBytes"),
+		bytesCopied: num("bytesCopied"),
+		progress:    str("progress"),
+		message:     str("message"),
+		completedAt: str("completedAt"),
+	}, true
+}
+
+// secretExists reports whether the workload credentials Secret is present.
+func secretExists(t *testing.T, ctx context.Context, kube kubernetes.Interface, ns, name string) bool {
+	t.Helper()
+	_, err := kube.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return true
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Logf("get Secret %s/%s: %v", ns, name, err)
+	}
+	return false
+}
+
+// conditionStatus returns a condition's status ("" when absent).
+func conditionStatus(u *unstructured.Unstructured, condType string) string {
+	conds, found, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	if !found {
+		return ""
+	}
+	for _, c := range conds {
+		cond, ok := c.(map[string]any)
+		if !ok || cond["type"] != condType {
+			continue
+		}
+		s, _ := cond["status"].(string)
+		return s
+	}
+	return ""
+}
+
+// TestCloudClone copies a real bucket into a freshly provisioned one with the
+// real rclone image, which the offline suite cannot do — there the Job lifecycle
+// is simulated and rclone never runs.
+//
+// The source is another Bucket CR: its workload Secret already carries exactly
+// the keys spec.cloneFrom.secretRef expects, so this also proves the documented
+// "a Secret written by this operator works as a clone source" claim.
+func TestCloudClone(t *testing.T) {
+	requireCloud(t)
+	kube, dyn := clients(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cloneTimeout)
+	defer cancel()
+
+	ensureNamespace(t, ctx, kube, nsAlpha)
+
+	// --- source bucket with content ---
+	createBucket(t, ctx, dyn, bucketSpec{namespace: nsAlpha, name: "clonesrc", wipeOnDelete: true})
+	waitReady(t, ctx, dyn, nsAlpha, "clonesrc")
+
+	srcMC, srcBucket := s3For(t, ctx, kube, nsAlpha, "clonesrc-s3")
+	objects := map[string][]byte{
+		"top.txt":           []byte("top level object"),
+		"nested/deep/a.bin": bytes.Repeat([]byte("a"), 4096),
+		"nested/deep/b.bin": bytes.Repeat([]byte("b"), 8192),
+	}
+	var srcBytes int64
+	for key, data := range objects {
+		require.NoError(t, eventually(policyTimeout, func() error {
+			return s3Put(ctx, srcMC, srcBucket, key, data)
+		}), "seed source object %s", key)
+		srcBytes += int64(len(data))
+	}
+	t.Logf("source bucket %s seeded with %d objects / %d bytes", srcBucket, len(objects), srcBytes)
+
+	srcSecret, err := kube.CoreV1().Secrets(nsAlpha).Get(ctx, "clonesrc-s3", metav1.GetOptions{})
+	require.NoError(t, err)
+	srcEndpoint := string(srcSecret.Data["S3_ENDPOINT"])
+	require.NotEmpty(t, srcEndpoint)
+
+	// --- destination bucket that clones it ---
+	createBucket(t, ctx, dyn, bucketSpec{
+		namespace: nsAlpha, name: "clonedst", wipeOnDelete: true,
+		cloneFrom: &cloneSpec{
+			endpoint:   srcEndpoint,
+			bucket:     srcBucket,
+			region:     string(srcSecret.Data["S3_REGION"]),
+			secretName: "clonesrc-s3",
+		},
+	})
+
+	// Wait for the copy, and check the hold invariant on every poll:
+	// holdSecretUntilCloned defaults to true, and the operator persists the
+	// terminal clone state BEFORE it writes the workload Secret. Observing a
+	// Secret while the clone is not Completed would mean a workload could start
+	// against a half-copied bucket.
+	var last cloneStatus
+	require.NoError(t, eventually(cloneTimeout, func() error {
+		c, ok := readClone(t, ctx, dyn, nsAlpha, "clonedst")
+		last = c
+		if secretExists(t, ctx, kube, nsAlpha, "clonedst-s3") && c.phase != "Completed" {
+			return giveUp(fmt.Errorf(
+				"HOLD BROKEN: workload Secret exists while clone phase is %q", c.phase))
+		}
+		if !ok {
+			return fmt.Errorf("no status.clone yet")
+		}
+		if c.phase == "Failed" {
+			return giveUp(fmt.Errorf("clone failed: %s", c.message))
+		}
+		if c.phase != "Completed" {
+			return fmt.Errorf("clone phase %q (%s)", c.phase, c.progress)
+		}
+		return nil
+	}), "clone should complete")
+
+	assert.Equal(t, srcBytes, last.totalBytes,
+		"totalBytes is measured on the source before copying and must match what was seeded")
+	assert.Equal(t, srcBytes, last.bytesCopied)
+	assert.NotEmpty(t, last.completedAt)
+	t.Logf("OK: clone completed, %d bytes (%s)", last.totalBytes, last.progress)
+
+	cr := waitReady(t, ctx, dyn, nsAlpha, "clonedst")
+	assert.Equal(t, "True", conditionStatus(cr, "CloneCompleted"),
+		"a finished clone must report the CloneCompleted condition")
+
+	// --- the data actually arrived, byte for byte ---
+	dstMC, dstBucket := s3For(t, ctx, kube, nsAlpha, "clonedst-s3")
+	for key, want := range objects {
+		got, err := s3Get(ctx, dstMC, dstBucket, key)
+		require.NoError(t, err, "copied object %s should be readable in the destination", key)
+		assert.Equal(t, want, got, "object %s must be copied byte for byte", key)
+	}
+	t.Logf("OK: all %d objects present in %s with identical content", len(objects), dstBucket)
+
+	// --- the clone is one-shot ---
+	// Completed is terminal: nothing re-runs the copy, so the completion stamp
+	// must not move even after further reconciles (the drift resync is 1m here).
+	time.Sleep(75 * time.Second)
+	after, ok := readClone(t, ctx, dyn, nsAlpha, "clonedst")
+	require.True(t, ok)
+	assert.Equal(t, "Completed", after.phase)
+	assert.Equal(t, last.completedAt, after.completedAt,
+		"a completed clone must never run again")
+	t.Log("OK: clone is one-shot across subsequent reconciles")
 }
