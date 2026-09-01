@@ -30,15 +30,18 @@ api/v1/bucket_types.go                    CRD `Bucket` (stackit-bucket.gtrfc.com
 cmd/main.go                              controller-runtime Manager (stackit.Client + Admin-Secret-Name/-Namespace)
 internal/controller/bucket_controller.go Reconciler (VOLL: §8-Provisioning + Admin-Bootstrap + Finalizer-Teardown)
 internal/controller/clone.go             Bucket-Clone (spec.cloneFrom): rclone-Job, Staging-Secret, rc-Progress-Polling
+internal/controller/bucket_usage_controller.go Groessen-Messung (spec.usage): eigener Controller, Merge-Patch auf status.usage
+internal/controller/usage_config.go      Mess-Policy (Gate/Default/Intervall-Floor/Cap) + Kostenformel (720h, angefangene GB)
 internal/controller/reconciler_grants_test.go Offline-Tests Read-Grants (spec.grantReadAccess) + Watch-Mapping
 internal/controller/reconciler_degraded_test.go Offline-Tests Sticky-Ready (Halten, Grace-Ablauf, Auth-Ausnahme, Teardown)
+internal/controller/reconciler_usage_test.go   Offline-Tests Groessen-Messung (Gate, Clamp, Cap, Versionen, Fehlerpfad)
 internal/controller/reconciler_*_test.go Offline-Reconciler-Tests (fake k8s-Client + stackitfake, inkl. Fehlerpfade)
 internal/stackitfake/                    In-Memory-Fake der StackIT-API (Control-Plane REST + S3-XML) für Offline-Tests
 config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
 deploy/helm/stackit-s3-provisioner/      Helm-Chart (CRD via `make sync-helm-crd` synchronisiert)
 test/integration/                        //go:build integration — envtest gegen echten API-Server
 test/e2e/e2e_test.go                     //go:build e2e — Kind-Smoke Skeleton-Mode (Operator healthy + CR reconciled)
-test/e2e/cloud_test.go                   //go:build e2e — Kind gegen ECHTE API (E2E_STACKIT=1): Provisioning + Read-Grants
+test/e2e/cloud_test.go                   //go:build e2e — Kind gegen ECHTE API (E2E_STACKIT=1): Provisioning, Read-Grants, Groessen-Messung, Clone (echtes rclone)
 hack/e2ecleanup/                         Sweep fuer Cloud-Reste eines abgebrochenen e2e-Laufs (inkl. verwaister Admin-Key)
 Makefile / Containerfile / renovate.json CI-Gerüst (an Valkey-Operator orientiert)
 .github/workflows/                       release.yml (Test+Release), build.yml (Docker+Helm), renovate.yml
@@ -210,6 +213,21 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   ueber Rotations-Annotation ohne Generations-Bump erreichbar); Teardown;
   `ObservedGeneration != Generation`; nie-Ready. Fehler wird weiterhin zurueckgegeben, also feuert
   `StackitS3ReconcileErrors` unveraendert; zusaetzlich `StackitS3BucketProviderDegraded`.
+- **Bucket-Groesse + Kosten (`spec.usage`, INIT-SETUP.md §8.3):** eigener
+  `BucketUsageReconciler` (eigene Workqueue, `bucketUsage.concurrency`), misst per
+  vollstaendigem S3-Listing mit dem Admin-Key und schreibt **nur** `status.usage`
+  per Merge-Patch. Faelligkeit kommt aus `status.usage.lastMeasurementTime`
+  (ueberlebt Restarts), naechster Lauf per `RequeueAfter` + deterministischem
+  Skew; Watch ist generation/annotation-gefiltert (sonst Hot-Loop durch eigene
+  Status-Writes). Zwei Helm-Schalter: `bucketUsage.enabled` = harter Gate,
+  `bucketUsage.defaultEnabled` = Default fuer CRs ohne eigene Angabe (aus).
+  Guards sind **Zeit**-Guards, nicht Geld: Messen kostet bei StackIT nichts
+  (Abrechnung nur per angefangenem GB/h, keine Request-Position — verifiziert
+  gegen Preisliste v1.0.43 + Leistungsschein v1.2), aber ~1 Request je 1000 Keys.
+  Daher `minInterval` (60m, CR-Wunsch wird hochgeklemmt) und `maxObjects` (2 Mio,
+  danach `truncated` → alle Werte sind untere Schranken, `>=`-Praefix).
+  Kosten = `ceil(bytes/1e9)` × `pricing.perGBHour` × 720h, auf Cent gerundet.
+  **Messfehler beruehren `Ready` nie** und geben keinen Reconcile-Error zurueck.
 - **Guards (produktionssicher):** CR darf `secretRef` **nicht** aufs Admin-Secret zeigen (sonst
   Pollution + Admin-Lockout beim Delete); `spec.region` muss = Operator-Region sein (Single-Region v1).
   Beides → `Ready=Failed` ohne Requeue-Hammer.
@@ -252,8 +270,18 @@ Read-Grants; Layer-2-Policy-Enforcement mit 3 Statements direkt gegen StorageGRI
 **Erledigt (2026-08-25):** Transiente Provider-Fehler (INIT-SETUP.md §8.2) — EnsureService eskaliert
 keinen fehlgeschlagenen Read mehr zu einem Write + prozessweiter Cache, Retry-RoundTripper fuer GET/HEAD
 unter der SDK-Auth, Sticky-`Ready` mit begrenztem Grace. Ticket `local_s3-provisioner-transient-errors.md`.
-**Offen:** (1) Clone-Feature mit echtem rclone-Image im e2e (offline nur Fake-Job-Lifecycle);
-(2) die beiden präexistenten Sicherheits-Befunde oben; (3) Q2 (Minimal-Rolle), Q4 (Bucket-Namensraum).
+**Erledigt (2026-09-01):** Bucket-Groesse + Monatskosten-Schaetzung an der CR (`spec.usage`,
+INIT-SETUP.md §8.3) — eigener Mess-Controller, Helm-Gate + Cluster-Default, Intervall-Floor,
+Objekt-Cap, alle Werte als Metriken, zwei neue Alerts.
+**Erledigt (2026-09-01):** e2e gegen die echte API nachgezogen (`make e2e-stackit`, neue SA-Keys,
+kompletter Lauf gruen in 658s, Sweep danach leer): `TestCloudBucketUsage` (Messung + Kosten +
+Clear beim Abschalten), `TestCloudBucketUsageWithVersions` (Versions-Listing auf einem
+nicht-versionierten Bucket — live verifiziert, dass StorageGRID das beantwortet und `IsLatest`
+korrekt setzt), `TestCloudClone` (echtes rclone-Image, Quelle ist ein zweites Bucket-CR:
+Hold-Invariante, byte-genauer Inhalt, Clone-once). rclone-Image wird im Make-Target aus dem
+gerenderten Chart gelesen und in Kind vorgeladen (kein dritter Pin, kein Registry-Pull im Test).
+**Offen:** (1) die beiden präexistenten Sicherheits-Befunde oben; (2) Q2 (Minimal-Rolle),
+Q4 (Bucket-Namensraum).
 RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) — bereits von den cluster-weiten
 Secret-RBAC-Markern abgedeckt.
 </content>

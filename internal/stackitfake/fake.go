@@ -32,6 +32,11 @@ type Object struct {
 	Key          string
 	VersionID    string
 	DeleteMarker bool
+	// IsLatest marks the current version of a key. Only the version listing
+	// exposes it; the plain object listing returns exactly these entries.
+	IsLatest bool
+	// Size is the object's size in bytes, so size measurement can be tested.
+	Size int64
 }
 
 // accessKey is one S3 credential in a credentials group.
@@ -209,15 +214,29 @@ func (s *Server) SeedBucket(name string, tags map[string]string) {
 	s.buckets[name] = b
 }
 
-// SeedObject stores an object version in a bucket (bucket must exist).
+// SeedObject stores an object version in a bucket (bucket must exist). It is the
+// convenience form: the entry is the current version of its key and one byte
+// large. Use SeedObjectVersion to model sizes and non-current versions.
 func (s *Server) SeedObject(bucketName, key, versionID string, deleteMarker bool) {
+	s.SeedObjectVersion(bucketName, key, versionID, deleteMarker, !deleteMarker, 1)
+}
+
+// SeedObjectVersion stores an object version with full control over whether it
+// is the current version and how large it is (bucket must exist).
+func (s *Server) SeedObjectVersion(bucketName, key, versionID string, deleteMarker, isLatest bool, size int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b := s.buckets[bucketName]
 	if b == nil {
 		panic(fmt.Sprintf("stackitfake: SeedObject on unknown bucket %q", bucketName))
 	}
-	b.Objects = append(b.Objects, Object{Key: key, VersionID: versionID, DeleteMarker: deleteMarker})
+	b.Objects = append(b.Objects, Object{
+		Key:          key,
+		VersionID:    versionID,
+		DeleteMarker: deleteMarker,
+		IsLatest:     isLatest,
+		Size:         size,
+	})
 }
 
 // BucketNames returns the names of all existing buckets, sorted.
@@ -768,13 +787,16 @@ func (s *Server) handleListVersions(w http.ResponseWriter, r *http.Request, b *b
 	var sb strings.Builder
 	fmt.Fprintf(&sb, `<ListVersionsResult><Name>%s</Name><IsTruncated>false</IsTruncated>`, b.Name)
 	for _, o := range b.Objects {
-		tag := "Version"
 		if o.DeleteMarker {
-			tag = "DeleteMarker"
+			// A delete marker has no size element in the real listing.
+			fmt.Fprintf(&sb,
+				`<DeleteMarker><Key>%s</Key><VersionId>%s</VersionId><IsLatest>%t</IsLatest><LastModified>%s</LastModified></DeleteMarker>`,
+				o.Key, o.VersionID, o.IsLatest, s3FixedTime)
+			continue
 		}
 		fmt.Fprintf(&sb,
-			`<%[1]s><Key>%[2]s</Key><VersionId>%[3]s</VersionId><IsLatest>false</IsLatest><LastModified>%[4]s</LastModified><ETag>"0"</ETag><Size>1</Size></%[1]s>`,
-			tag, o.Key, o.VersionID, s3FixedTime)
+			`<Version><Key>%s</Key><VersionId>%s</VersionId><IsLatest>%t</IsLatest><LastModified>%s</LastModified><ETag>"0"</ETag><Size>%d</Size></Version>`,
+			o.Key, o.VersionID, o.IsLatest, s3FixedTime, o.Size)
 	}
 	sb.WriteString(`</ListVersionsResult>`)
 	writeXML(w, sb.String())
@@ -799,13 +821,14 @@ func (s *Server) handleListObjectsV2(w http.ResponseWriter, r *http.Request, b *
 	fmt.Fprintf(&sb, `<ListBucketResult><Name>%s</Name><IsTruncated>false</IsTruncated>`, b.Name)
 	count := 0
 	for _, o := range b.Objects {
-		if o.DeleteMarker || count == maxKeys {
+		// The plain listing returns current objects only, mirroring S3.
+		if o.DeleteMarker || !o.IsLatest || count == maxKeys {
 			continue
 		}
 		count++
 		fmt.Fprintf(&sb,
-			`<Contents><Key>%s</Key><LastModified>%s</LastModified><ETag>"0"</ETag><Size>1</Size></Contents>`,
-			o.Key, s3FixedTime)
+			`<Contents><Key>%s</Key><LastModified>%s</LastModified><ETag>"0"</ETag><Size>%d</Size></Contents>`,
+			o.Key, s3FixedTime, o.Size)
 	}
 	sb.WriteString(`</ListBucketResult>`)
 	writeXML(w, sb.String())

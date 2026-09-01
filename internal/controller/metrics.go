@@ -35,6 +35,10 @@ var clonePhases = []s3v1.ClonePhase{
 	s3v1.ClonePhaseFailed,
 }
 
+// bucketLabels identifies a per-Bucket series. Shared by every per-Bucket
+// descriptor so the label set cannot drift apart between them.
+var bucketLabels = []string{"namespace", "name"}
+
 var (
 	bucketsDesc = prometheus.NewDesc(
 		"stackit_s3_provisioner_buckets",
@@ -54,7 +58,7 @@ var (
 	bucketDegradedSinceDesc = prometheus.NewDesc(
 		"stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds",
 		"Unix time at which this Bucket started degrading; absent for Buckets that are not degraded.",
-		[]string{"namespace", "name"}, nil,
+		bucketLabels, nil,
 	)
 	bucketsWipeOnDeleteDesc = prometheus.NewDesc(
 		"stackit_s3_provisioner_buckets_wipe_on_delete",
@@ -74,8 +78,84 @@ var (
 	lastRotationDesc = prometheus.NewDesc(
 		"stackit_s3_provisioner_credentials_last_rotation_timestamp_seconds",
 		"Unix time of the Bucket's last credentials rotation; absent for Buckets that were never rotated.",
-		[]string{"namespace", "name"}, nil,
+		bucketLabels, nil,
 	)
+
+	// Bucket size and cost. Every one of these is absent for a Bucket that has
+	// not been measured, so an alert on a size threshold never fires on a
+	// missing measurement, and `absent()` distinguishes the two cases.
+	bucketSizeDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_size_bytes",
+		"Size in bytes of the Bucket's current objects at the last measurement.",
+		bucketLabels, nil,
+	)
+	bucketObjectsDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_objects",
+		"Number of current objects in the Bucket at the last measurement.",
+		bucketLabels, nil,
+	)
+	bucketVersionSizeDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_version_size_bytes",
+		"Size in bytes of the Bucket's non-current object versions at the last measurement; 0 unless version counting is enabled.",
+		bucketLabels, nil,
+	)
+	bucketVersionObjectsDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_version_objects",
+		"Number of non-current object versions and delete markers at the last measurement; 0 unless version counting is enabled.",
+		bucketLabels, nil,
+	)
+	bucketBillableSizeDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_billable_size_bytes",
+		"Size in bytes the cost estimate is computed from (current objects plus counted versions).",
+		bucketLabels, nil,
+	)
+	bucketCostDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_estimated_monthly_cost",
+		"Estimated monthly storage cost of the Bucket at the operator's configured price, in whole currency units; absent when no price is configured.",
+		append(append([]string{}, bucketLabels...), "currency"), nil,
+	)
+	bucketUsageMeasuredDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_usage_last_measurement_timestamp_seconds",
+		"Unix time of the Bucket's last successful size measurement; absent for Buckets that were never measured.",
+		bucketLabels, nil,
+	)
+	bucketUsageTruncatedDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_usage_truncated",
+		"1 when the Bucket's last measurement stopped at the operator's object cap, so its size and cost are lower bounds.",
+		bucketLabels, nil,
+	)
+	bucketsUsageEnabledDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_buckets_usage_measured",
+		"Number of Bucket resources that carry a size measurement.",
+		nil, nil,
+	)
+	usageGateDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_usage_measurement_gate_enabled",
+		"1 when the operator-wide bucket size measurement gate is on.",
+		nil, nil,
+	)
+)
+
+// Process-level measurement metrics. Unlike the gauges above these cannot be
+// derived from the Bucket cache: a failed measurement leaves no trace on the CR
+// beyond a message, and the duration of a pass is gone once it finished.
+var (
+	// usageMeasurementFailures counts measurements that could not complete.
+	// Measurement failures deliberately do NOT return a reconcile error (they
+	// must not be confused with provisioning failures), so this counter is the
+	// only place they are aggregated.
+	usageMeasurementFailures = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "stackit_s3_provisioner_usage_measurement_failures_total",
+		Help: "Total number of bucket size measurements that failed.",
+	})
+	// usageMeasurementDuration records how long a listing pass took. It is the
+	// honest price of the configured interval: the number to look at before
+	// lowering it, and the one that shows a bucket outgrowing its cap.
+	usageMeasurementDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "stackit_s3_provisioner_usage_measurement_duration_seconds",
+		Help:    "Duration of a successful bucket size measurement (one full listing pass).",
+		Buckets: []float64{0.1, 0.5, 1, 5, 15, 60, 300, 900, 1800},
+	})
 )
 
 // bucketMetricsCollector computes Bucket gauges from the manager's cache on
@@ -86,17 +166,21 @@ type bucketMetricsCollector struct {
 	skeletonMode bool
 	// wipeGateEnabled mirrors the --enable-wipe-on-delete feature gate.
 	wipeGateEnabled bool
+	// usageGateEnabled mirrors the operator-wide bucket size measurement gate.
+	usageGateEnabled bool
 }
 
 // RegisterBucketMetrics registers the Bucket collector with the
 // controller-runtime metrics registry served on the metrics endpoint. Call it
 // once per process.
-func RegisterBucketMetrics(reader client.Reader, skeletonMode, wipeGateEnabled bool) {
+func RegisterBucketMetrics(reader client.Reader, skeletonMode, wipeGateEnabled, usageGateEnabled bool) {
 	ctrlmetrics.Registry.MustRegister(&bucketMetricsCollector{
-		reader:          reader,
-		skeletonMode:    skeletonMode,
-		wipeGateEnabled: wipeGateEnabled,
+		reader:           reader,
+		skeletonMode:     skeletonMode,
+		wipeGateEnabled:  wipeGateEnabled,
+		usageGateEnabled: usageGateEnabled,
 	})
+	ctrlmetrics.Registry.MustRegister(usageMeasurementFailures, usageMeasurementDuration)
 }
 
 func (c *bucketMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -108,11 +192,22 @@ func (c *bucketMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- skeletonModeDesc
 	ch <- wipeGateDesc
 	ch <- lastRotationDesc
+	ch <- bucketSizeDesc
+	ch <- bucketObjectsDesc
+	ch <- bucketVersionSizeDesc
+	ch <- bucketVersionObjectsDesc
+	ch <- bucketBillableSizeDesc
+	ch <- bucketCostDesc
+	ch <- bucketUsageMeasuredDesc
+	ch <- bucketUsageTruncatedDesc
+	ch <- bucketsUsageEnabledDesc
+	ch <- usageGateDesc
 }
 
 func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(skeletonModeDesc, prometheus.GaugeValue, boolGauge(c.skeletonMode))
 	ch <- prometheus.MustNewConstMetric(wipeGateDesc, prometheus.GaugeValue, boolGauge(c.wipeGateEnabled))
+	ch <- prometheus.MustNewConstMetric(usageGateDesc, prometheus.GaugeValue, boolGauge(c.usageGateEnabled))
 
 	// The cached client blocks until the informer cache syncs; bound the wait
 	// so a scrape during startup cannot hang the metrics handler.
@@ -130,6 +225,7 @@ func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	byClonePhase := map[s3v1.ClonePhase]int{}
 	wipeOnDelete := 0
 	degraded := 0
+	measured := 0
 	for i := range buckets.Items {
 		b := &buckets.Items[i]
 		phase := b.Status.Phase
@@ -162,6 +258,10 @@ func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(lastRotationDesc, prometheus.GaugeValue,
 				float64(t.Unix()), b.Namespace, b.Name)
 		}
+		if u := b.Status.Usage; u != nil && u.LastMeasurementTime != nil {
+			measured++
+			collectUsage(ch, b.Namespace, b.Name, u)
+		}
 	}
 
 	for _, phase := range bucketPhases {
@@ -174,6 +274,29 @@ func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(bucketsWipeOnDeleteDesc, prometheus.GaugeValue, float64(wipeOnDelete))
 	ch <- prometheus.MustNewConstMetric(bucketsDegradedDesc, prometheus.GaugeValue, float64(degraded))
+	ch <- prometheus.MustNewConstMetric(bucketsUsageEnabledDesc, prometheus.GaugeValue, float64(measured))
+}
+
+// collectUsage emits one Bucket's measured size and cost. It is only called for
+// a Bucket that actually carries a measurement, so every series below means "was
+// measured at least once" rather than "is zero bytes".
+func collectUsage(ch chan<- prometheus.Metric, namespace, name string, u *s3v1.UsageStatus) {
+	gauge := func(desc *prometheus.Desc, v float64) {
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, namespace, name)
+	}
+	gauge(bucketSizeDesc, float64(u.Bytes))
+	gauge(bucketObjectsDesc, float64(u.Objects))
+	gauge(bucketVersionSizeDesc, float64(u.VersionBytes))
+	gauge(bucketVersionObjectsDesc, float64(u.VersionObjects))
+	gauge(bucketBillableSizeDesc, float64(u.BillableBytes))
+	gauge(bucketUsageMeasuredDesc, float64(u.LastMeasurementTime.Unix()))
+	gauge(bucketUsageTruncatedDesc, boolGauge(u.Truncated))
+	if u.Currency != "" {
+		// The estimate is rounded to whole cents, so cents are the canonical
+		// value and this converts back to currency units for the metric.
+		ch <- prometheus.MustNewConstMetric(bucketCostDesc, prometheus.GaugeValue,
+			float64(u.EstimatedMonthlyCostCents)/100, namespace, name, u.Currency)
+	}
 }
 
 func boolGauge(b bool) float64 {

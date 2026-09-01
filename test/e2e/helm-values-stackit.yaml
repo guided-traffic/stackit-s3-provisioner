@@ -48,6 +48,28 @@ ownership:
 wipeOnDelete:
   enabled: true
 
+# Bucket size measurement. The gate is on and the cluster-wide default is OFF, so
+# TestCloudBucketUsage proves the per-CR opt-in path rather than a blanket policy.
+#
+# The intervals are seconds instead of the shipped 60m for one reason: the test
+# has to observe a SECOND measurement after it grows the bucket, and waiting an
+# hour for it is not a test. The floor is lowered along with the interval,
+# otherwise it would clamp the CRs back up. Do not copy these numbers into a real
+# deployment — each measurement is a full listing pass of the bucket.
+bucketUsage:
+  enabled: true
+  defaultEnabled: false
+  interval: "30s"
+  minInterval: "30s"
+  maxObjects: 2000000
+  includeVersions: false
+  concurrency: 2
+  pricing:
+    # The real STACKIT list price for Object Storage Premium-EU01, so the cost the
+    # test asserts is the cost a real deployment would compute.
+    perGBHour: "0.00003697772"
+    currency: "EUR"
+
 stackit:
   region: eu01
   serviceAccountKey:

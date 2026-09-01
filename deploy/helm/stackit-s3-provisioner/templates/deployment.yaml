@@ -65,6 +65,15 @@ spec:
             - --drift-resync-interval={{ .Values.driftResyncInterval }}
             - --provider-degraded-grace={{ .Values.providerDegradedGrace }}
             - --clone-image={{ .Values.clone.image.repository }}:{{ .Values.clone.image.tag }}
+            - --bucket-usage-enabled={{ .Values.bucketUsage.enabled }}
+            - --bucket-usage-default-enabled={{ .Values.bucketUsage.defaultEnabled }}
+            - --bucket-usage-interval={{ .Values.bucketUsage.interval }}
+            - --bucket-usage-min-interval={{ .Values.bucketUsage.minInterval }}
+            - --bucket-usage-max-objects={{ .Values.bucketUsage.maxObjects | int64 }}
+            - --bucket-usage-include-versions={{ .Values.bucketUsage.includeVersions }}
+            - --bucket-usage-concurrency={{ .Values.bucketUsage.concurrency }}
+            - --bucket-usage-price-per-gb-hour={{ .Values.bucketUsage.pricing.perGBHour }}
+            - --bucket-usage-currency={{ .Values.bucketUsage.pricing.currency }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

@@ -41,6 +41,14 @@ spec:
       jsonPath: .spec.region
       name: Region
       type: string
+    - description: Measured bucket size at the last measurement
+      jsonPath: .status.usage.humanReadable
+      name: Size
+      type: string
+    - description: Estimated monthly storage cost at the operator's configured price
+      jsonPath: .status.usage.estimatedMonthlyCost
+      name: Cost/Month
+      type: string
     - description: Since when reconciles keep failing while Ready is held
       jsonPath: .status.degradedSince
       name: Degraded
@@ -61,6 +69,16 @@ spec:
       name: Secret
       priority: 1
       type: string
+    - description: Number of current objects at the last measurement
+      jsonPath: .status.usage.objects
+      name: Objects
+      priority: 1
+      type: integer
+    - description: When the bucket size was last measured
+      jsonPath: .status.usage.lastMeasurementTime
+      name: Measured
+      priority: 1
+      type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -302,6 +320,41 @@ spec:
                 required:
                 - name
                 type: object
+              usage:
+                description: |-
+                  Usage configures the periodic bucket-size measurement and the monthly cost
+                  estimate derived from it. Omitting the block follows the operator-wide
+                  policy (Helm bucketUsage.*); see UsageSpec for the individual overrides.
+                properties:
+                  enabled:
+                    description: |-
+                      Enabled turns the size measurement on or off for this Bucket, overriding
+                      the operator-wide default (Helm bucketUsage.defaultEnabled). Leaving it
+                      unset inherits that default, so a cluster-wide policy change reaches this
+                      Bucket without editing it.
+
+                      It cannot switch the feature on when the operator-wide gate
+                      (Helm bucketUsage.enabled) is off: that gate is the hard kill switch, and
+                      a Bucket asking for a measurement under it is skipped with a warning event.
+                    type: boolean
+                  includeVersions:
+                    description: |-
+                      IncludeVersions additionally measures non-current object versions and
+                      delete markers, which occupy billed storage but are invisible in a plain
+                      object listing. It makes the measurement match the invoice on a versioned
+                      bucket, at the price of listing every version rather than every current
+                      object. Unset inherits the operator default
+                      (Helm bucketUsage.includeVersions).
+                    type: boolean
+                  interval:
+                    description: |-
+                      Interval overrides how often this bucket is measured. It is a Go duration
+                      string with a unit (e.g. "30m", "6h") and is clamped up to the operator's
+                      floor (Helm bucketUsage.minInterval) — a Bucket cannot ask to be measured
+                      more often than the cluster allows. Empty inherits the operator default.
+                    pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                    type: string
+                type: object
               wipeOnDelete:
                 description: |-
                   WipeOnDelete requests that the operator deletes ALL objects (including
@@ -525,6 +578,94 @@ spec:
                   naming policy). Once set it is authoritative and never recomputed, so a later
                   change to the operator's prefix/namespace policy leaves this bucket untouched.
                 type: string
+              usage:
+                description: |-
+                  Usage is the result of the last bucket-size measurement and the monthly
+                  cost estimate derived from it. It is absent while measurement is disabled
+                  for this Bucket and is removed again when it is switched off, so a stale
+                  size never lingers on the CR.
+                properties:
+                  billableBytes:
+                    description: |-
+                      BillableBytes is Bytes plus VersionBytes: the figure the cost estimate is
+                      computed from. Without version counting it equals Bytes, which UNDERSTATES
+                      a versioned bucket's invoice.
+                    format: int64
+                    type: integer
+                  bytes:
+                    description: Bytes is the total size of the bucket's current objects.
+                    format: int64
+                    type: integer
+                  currency:
+                    description: Currency is the currency of the estimate (Helm bucketUsage.pricing.currency).
+                    type: string
+                  estimatedMonthlyCost:
+                    description: |-
+                      EstimatedMonthlyCost is the ESTIMATED monthly storage cost for this bucket
+                      at the price the operator is configured with (Helm bucketUsage.pricing),
+                      rendered for display (e.g. "1.23 EUR"). Empty when no price is configured.
+
+                      It is an estimate, not an invoice: it prices the measured size as if it
+                      were held for a whole 30-day month, uses the operator's configured list
+                      price rather than the contract actually in force, and excludes taxes and
+                      anything the bucket is not billed for by size.
+                    type: string
+                  estimatedMonthlyCostCents:
+                    description: |-
+                      EstimatedMonthlyCostCents is the same estimate in minor currency units
+                      (cents), which is the canonical value: the estimate is always rounded to
+                      whole cents, and EstimatedMonthlyCost is its rendering.
+                    format: int64
+                    type: integer
+                  humanReadable:
+                    description: |-
+                      HumanReadable renders BillableBytes for display (e.g. "18.0 GiB"). A
+                      measurement that hit the operator's object cap is prefixed with ">=",
+                      because the real bucket is larger than what was counted.
+                    type: string
+                  lastMeasurementTime:
+                    description: LastMeasurementTime is when the values above were
+                      measured.
+                    format: date-time
+                    type: string
+                  measurementDuration:
+                    description: |-
+                      MeasurementDuration is how long the last measurement took (e.g. "4.2s").
+                      A listing pass costs one request per 1000 keys, so this is the honest
+                      price of the configured interval and the number to look at before lowering it.
+                    type: string
+                  message:
+                    description: |-
+                      Message carries a short reason when the last measurement did not succeed,
+                      or a note about the effective configuration (e.g. a clamped interval). A
+                      failed measurement leaves the previous values in place and never affects
+                      the Bucket's Ready condition.
+                    type: string
+                  objects:
+                    description: Objects is the number of current objects.
+                    format: int64
+                    type: integer
+                  truncated:
+                    description: |-
+                      Truncated reports that the measurement stopped at the operator's object cap
+                      (Helm bucketUsage.maxObjects). Every size and cost value is then a LOWER
+                      BOUND, not the bucket's actual size.
+                    type: boolean
+                  versionBytes:
+                    description: |-
+                      VersionBytes is the total size of non-current object versions. It is only
+                      measured when version counting is enabled (spec.usage.includeVersions);
+                      otherwise it stays zero and BillableBytes equals Bytes.
+                    format: int64
+                    type: integer
+                  versionObjects:
+                    description: |-
+                      VersionObjects is the number of non-current object versions and delete
+                      markers. Delete markers carry no bytes but are counted here, because they
+                      are what makes a "deleted" object still occupy a version.
+                    format: int64
+                    type: integer
+                type: object
             type: object
         type: object
         x-kubernetes-validations:

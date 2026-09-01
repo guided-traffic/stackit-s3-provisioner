@@ -106,9 +106,12 @@ The operator reports progress on the `Bucket` status subresource, so `kubectl ge
 bucket` (short name `bkt`) shows the live state:
 
 ```
-NAME        BUCKET      PHASE   READY   STATUS               REGION   AGE
-my-bucket   my-bucket   Ready   True    provisioned          eu01     2m
+NAME        BUCKET      PHASE   READY   STATUS               REGION   SIZE       COST/MONTH   AGE
+my-bucket   my-bucket   Ready   True    provisioned          eu01     18.0 GiB   0.53 EUR     2m
 ```
+
+`SIZE` and `COST/MONTH` stay empty unless
+[size measurement](#bucket-size-and-monthly-cost) is switched on for the Bucket.
 
 - **`status.phase`** — `Pending` → `Provisioning` → `Ready`, or `Failed` /
   `Deleting`.
@@ -131,7 +134,8 @@ my-bucket   my-bucket   Ready   True    provisioned          eu01     2m
   [Sharing a bucket read-only](#sharing-a-bucket-read-only)), `clone` (see
   [Cloning an existing bucket](#cloning-an-existing-bucket)),
   `lastRotationTrigger` / `lastRotationTime` (see
-  [Credentials rotation](#credentials-rotation)).
+  [Credentials rotation](#credentials-rotation)), `usage` (see
+  [Bucket size and monthly cost](#bucket-size-and-monthly-cost)).
 
 Each `Bucket` is stamped with S3 ownership tags (`managed-by` + `owner=<ns>/<name>`)
 so the operator adopts only buckets it owns and refuses to clobber a pre-existing
@@ -402,6 +406,125 @@ Rules worth knowing:
 Leaving `grantReadAccess` unset keeps the previous behavior exactly — the
 bucket policy is then identical to that of a bucket that never used the feature.
 
+## Bucket size and monthly cost
+
+The operator can measure each bucket's size at a configurable interval and write
+it — plus an estimated monthly storage cost — onto the `Bucket` CR, so both show
+up as columns in `kubectl get bkt` and in Lens:
+
+```
+NAME        BUCKET      PHASE   READY   STATUS        REGION   SIZE       COST/MONTH   AGE
+my-bucket   my-bucket   Ready   True    provisioned   eu01     18.0 GiB   0.53 EUR     2d
+```
+
+**Measurement never blocks provisioning.** It runs in its own controller with its
+own work queue and concurrency limit, so a slow measurement delays at most other
+measurements. A failed measurement keeps the previous values, does **not** touch
+the `Ready` condition and does **not** count as a reconcile error.
+
+### What it costs
+
+STACKIT bills Object Storage **per started gigabyte per started hour** and its
+price list contains **no** request, operation or traffic position, so measuring
+costs no money (verified against the STACKIT price list v1.0.43 and the Object
+Storage Leistungsschein v1.2, see [`INIT-SETUP.md` §8.3](INIT-SETUP.md)).
+
+It costs **time**: the control-plane API exposes no usage endpoint, so the only
+way to obtain a size is to list the bucket — roughly one request per 1000 object
+keys. A bucket with 2 million objects is ~2000 requests per pass, every pass.
+Two operator-wide guards bound that, and `status.usage.measurementDuration`
+tells you what a pass actually costs on your data before you lower the interval.
+
+### Operator-wide configuration
+
+```yaml
+# values.yaml
+bucketUsage:
+  enabled: true            # default; HARD gate — false disables measurement everywhere
+  defaultEnabled: false    # default; applies to Buckets that do not decide themselves
+  interval: "60m"          # default; for Buckets that do not request their own
+  minInterval: "60m"       # default; floor — a Bucket asking for less is clamped up
+  maxObjects: 2000000      # default; abort cap, reports a LOWER BOUND beyond it
+  includeVersions: false   # default; count non-current versions and delete markers
+  concurrency: 2           # default; buckets measured in parallel
+  pricing:
+    perGBHour: "0.00003697772"   # default: STACKIT list price Object Storage Premium-EU01
+    currency: "EUR"              # default; display label only, no conversion
+```
+
+Two switches, not one:
+
+- **`enabled`** is the kill switch. With `false` nothing is measured, whatever a
+  Bucket asks for; a Bucket that asked explicitly gets the warning event
+  `UsageMeasurementDisabled` and a note in `status.usage.message`.
+- **`defaultEnabled`** is the cluster-wide policy for Buckets that do not set
+  `spec.usage.enabled`. It ships **off**, so measurement is opt-in.
+
+⚠️ **`minInterval` and `maxObjects` are cost-of-time guards, and both bite.** A
+Bucket asking for a shorter interval is clamped up (warning event
+`UsageIntervalClamped`); a bucket with more objects than `maxObjects` is measured
+only partially and every value it reports — size *and* cost — becomes a lower
+bound, marked with a `>=` prefix and the warning event
+`UsageMeasurementTruncated`. Raise the cap deliberately: the pass gets
+proportionally longer, not more expensive.
+
+⚠️ **`pricing.perGBHour` is a LIST price, not your contract.** The default is the
+public STACKIT list price for Object Storage Premium-EU01 (price list v1.0.43,
+08/04/2026, net, excluding taxes; EU02 was `0.00003883000`). Nothing verifies it.
+Put your own price there, or set it to `""` to switch the estimate off entirely.
+Quote the value as a **string** so YAML does not turn it into an exponent.
+
+### Per-Bucket overrides
+
+Every field is optional; an omitted field follows the operator-wide default, so a
+cluster-wide policy change reaches the Bucket without editing it.
+
+```yaml
+spec:
+  bucketName: my-bucket
+  usage:
+    enabled: true          # override defaultEnabled in either direction
+    interval: "6h"         # Go duration WITH a unit; clamped up to minInterval
+    includeVersions: true  # count non-current versions and delete markers too
+```
+
+- `enabled: false` switches measurement off for this Bucket **and clears
+  `status.usage`**, so a size and a cost nobody refreshes any more are not left
+  on display.
+- `interval` must be a Go duration with a unit (`"30m"`, `"6h"`). A bare number
+  is rejected by the CRD at admission time.
+- `includeVersions` matters on a **versioned** bucket: non-current versions and
+  delete markers occupy billed storage but never appear in a plain object
+  listing, so the default understates both size and cost there.
+
+### Status fields
+
+```yaml
+status:
+  usage:
+    bytes: 19327352832              # current objects
+    objects: 4213
+    versionBytes: 0                 # non-current versions (only with includeVersions)
+    versionObjects: 0
+    billableBytes: 19327352832      # bytes + versionBytes — what the cost is based on
+    humanReadable: 18.0 GiB         # ">= 18.0 GiB" when the measurement was capped
+    estimatedMonthlyCost: 0.53 EUR  # ">= ..." when the measurement was capped
+    estimatedMonthlyCostCents: 53   # canonical value; the estimate is cent-rounded
+    currency: EUR
+    lastMeasurementTime: "2026-09-01T10:15:00Z"
+    measurementDuration: 4.213s     # the honest price of the configured interval
+    truncated: false                # true = every value above is a lower bound
+    message: ""                     # why no fresh measurement, or a config note
+```
+
+How the estimate is computed, because it is an **estimate and not an invoice**:
+`billableBytes` is rounded **up** to a whole decimal gigabyte (the billing metric
+is per *started* gigabyte), priced for **720 hours** (the 30-day month STACKIT's
+own price list projects with) and rounded to whole cents. It prices the size
+measured at *one* moment as if it were held all month, uses the price the
+operator is configured with rather than your contract, covers storage only, and
+excludes taxes.
+
 ## Deletion behavior
 
 Deleting a `Bucket` CR tears down the access key, credentials group, bucket and
@@ -442,9 +565,23 @@ the standard controller-runtime and Go collectors plus its own metrics:
 | `stackit_s3_provisioner_skeleton_mode` | gauge | `1` while the operator runs without a StackIT service-account key (provisions nothing) |
 | `stackit_s3_provisioner_wipe_on_delete_gate_enabled` | gauge | `1` while the operator-wide `--enable-wipe-on-delete` feature gate is on |
 | `stackit_s3_provisioner_credentials_last_rotation_timestamp_seconds{namespace,name}` | gauge | Unix time of the Bucket's last [credentials rotation](#credentials-rotation); absent for never-rotated Buckets |
+| `stackit_s3_provisioner_bucket_size_bytes{namespace,name}` | gauge | Size of the Bucket's current objects at the last [measurement](#bucket-size-and-monthly-cost); **absent** for never-measured Buckets, so `absent()` distinguishes "not measured" from "empty" |
+| `stackit_s3_provisioner_bucket_objects{namespace,name}` | gauge | Number of current objects at the last measurement |
+| `stackit_s3_provisioner_bucket_version_size_bytes{namespace,name}` | gauge | Size of non-current object versions; `0` unless `includeVersions` is on |
+| `stackit_s3_provisioner_bucket_version_objects{namespace,name}` | gauge | Number of non-current versions and delete markers; `0` unless `includeVersions` is on |
+| `stackit_s3_provisioner_bucket_billable_size_bytes{namespace,name}` | gauge | The size the cost estimate is computed from (current objects + counted versions) |
+| `stackit_s3_provisioner_bucket_estimated_monthly_cost{namespace,name,currency}` | gauge | Estimated monthly storage cost in whole currency units; absent when no price is configured |
+| `stackit_s3_provisioner_bucket_usage_last_measurement_timestamp_seconds{namespace,name}` | gauge | Unix time of the last successful measurement — `time() - <series>` is the age of the reported size |
+| `stackit_s3_provisioner_bucket_usage_truncated{namespace,name}` | gauge | `1` while the Bucket's last measurement hit `maxObjects`, i.e. its size and cost are lower bounds |
+| `stackit_s3_provisioner_buckets_usage_measured` | gauge | Number of `Bucket` resources carrying a size measurement |
+| `stackit_s3_provisioner_usage_measurement_gate_enabled` | gauge | `1` while the operator-wide `bucketUsage.enabled` gate is on |
+| `stackit_s3_provisioner_usage_measurement_failures_total` | counter | Measurements that failed. Measurement failures deliberately do not surface as reconcile errors, so this is the only place they aggregate. |
+| `stackit_s3_provisioner_usage_measurement_duration_seconds` | histogram | Duration of a successful measurement (one full listing pass) — the number to check before lowering the interval |
 
 All gauges are computed live from the cluster state on every scrape, so they
-never drift. For clusters running the
+never drift. The two `usage_measurement_*` process metrics are the exception:
+a failed measurement leaves no trace on the CR beyond a message, and the duration
+of a pass is gone once it finished, so both are tracked in the process. For clusters running the
 [prometheus-operator](https://github.com/prometheus-operator/prometheus-operator)
 stack (e.g. kube-prometheus-stack), the chart can ship the scrape config and
 alerting rules — both **disabled by default** because they require the
@@ -472,6 +609,8 @@ monitoring:
       wipeRequestedButGateDisabled: { enabled: true }
       reconcileErrors:              { enabled: true }
       bucketProviderDegraded:       { enabled: true }
+      usageMeasurementFailing:      { enabled: true }
+      usageMeasurementTruncated:    { enabled: true }
 ```
 
 Some kube-prometheus-stack installs only discover `ServiceMonitor`/
@@ -491,6 +630,8 @@ Shipped alerts — every toggle lives under `monitoring.prometheusRule.alerts.<n
 | `StackitS3WipeRequestedButGateDisabled` | `wipeRequestedButGateDisabled` | `warning` | Buckets request `spec.wipeOnDelete` while the operator-wide gate (`wipeOnDelete.enabled`) is off — deletion would silently degrade to the empty-only guard |
 | `StackitS3ReconcileErrors` | `reconcileErrors` | `warning` | more than 3 reconcile errors within 15m (controller-runtime's built-in `controller_runtime_reconcile_errors_total`) |
 | `StackitS3BucketProviderDegraded` | `bucketProviderDegraded` | `warning` | a Bucket's `Ready` state has been [held through provider failures](#ready-during-provider-outages) for 10m. These Buckets still report `Ready=True` to health checks, so this alert is the only signal until the grace elapses. |
+| `StackitS3UsageMeasurementFailing` | `usageMeasurementFailing` | `warning` | more than 3 [size measurements](#bucket-size-and-monthly-cost) failed within 30m. A failed measurement keeps the previous values and never marks a Bucket unhealthy, so without this alert the sizes and costs on the CRs go stale silently. |
+| `StackitS3UsageMeasurementTruncated` | `usageMeasurementTruncated` | `warning` | a Bucket keeps hitting `bucketUsage.maxObjects` for 30m: its reported size and cost are lower bounds, which is exactly the state in which a size-based alert under-reports |
 
 ## Install (FluxCD)
 
@@ -616,7 +757,15 @@ make test-integration-coverage # envtest integration tests
 make lint gosec vuln cyclo     # linters and security scans
 make generate-all              # regenerate CRD + DeepCopy and sync the Helm chart
 make e2e-local                 # spin up Kind, install via Helm, run e2e smoke tests
+make e2e-stackit               # same, but with a REAL StackIT key: creates and deletes real
+                               # buckets, credentials groups, access keys and clone Jobs
+make e2e-stackit-sweep-dry     # report cloud leftovers from an aborted e2e run
 ```
+
+`make e2e-stackit` needs a service-account key (`SA_KEY`, default `account-1.json`) and
+provisions against the real API — including a bucket clone with the real rclone image and
+periodic size measurement. It tears every Bucket down through the finalizer, then sweeps
+the project for leftovers; `make e2e-stackit-sweep` is the manual backstop after a crash.
 
 Run `make generate-all` after any change to `api/v1/` types and commit the result —
 CI fails the release if the checked-in CRD/DeepCopy/Helm chart drift from the types.
