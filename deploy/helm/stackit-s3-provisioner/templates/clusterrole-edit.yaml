@@ -1,0 +1,29 @@
+{{- if .Values.bucketRoles.create }}
+# User-facing write access to Bucket CRs. An aggregation fragment for the
+# built-in edit and admin ClusterRoles, and deliberately nothing more: it has
+# no read verbs (edit already contains view, which contains -view) and is not
+# meant for direct binding. A Bucket uses Secrets of its namespace on behalf
+# of whoever created it (spec.cloneFrom.secretRef, spec.secretRef adoption),
+# so Bucket write must only ever be held together with Secret access — which
+# edit and admin guarantee (ADR 0001). No write on buckets/status: status is
+# the operator's.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "stackit-s3-provisioner.fullname" . }}-edit
+  labels:
+    {{- include "stackit-s3-provisioner.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups:
+      - stackit-bucket.gtrfc.com
+    resources:
+      - buckets
+    verbs:
+      - create
+      - delete
+      - deletecollection
+      - patch
+      - update
+{{- end }}

@@ -227,6 +227,9 @@ jobs:
         with:
           version: 'v4.2.4'
 
+      - name: Render-check Helm chart
+        run: make test-helm-render
+
       - name: Debug cluster state
         run: |
           echo "=== Cluster info ==="

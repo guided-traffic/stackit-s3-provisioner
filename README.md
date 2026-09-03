@@ -773,6 +773,61 @@ helm install stackit-s3-provisioner stackit-s3-provisioner/stackit-s3-provisione
 Without `stackit.serviceAccountKey.secretName` the operator runs in **skeleton
 mode**: it reconciles `Bucket` resources but does not touch the cloud.
 
+## User-facing RBAC
+
+`Bucket` is a custom resource, so the built-in `view` / `edit` / `admin`
+ClusterRoles do not cover it on their own. The chart ships two aggregated
+ClusterRoles that close that gap (`bucketRoles.create`, default `true`):
+
+| ClusterRole | Aggregated into | Grants |
+| --- | --- | --- |
+| `<release>-view` | `view`, `edit`, `admin` | `get`, `list`, `watch` on `buckets`; `get` on `buckets/status` |
+| `<release>-edit` | `edit`, `admin` | `create`, `delete`, `deletecollection`, `patch`, `update` on `buckets` |
+
+```yaml
+# values.yaml
+bucketRoles:
+  create: true   # default; false = manage user RBAC out-of-band
+```
+
+The operator's own ClusterRole is unaffected by this block. Aggregation is
+asynchronous: the controller-manager merges the rules into the built-in roles
+a moment after the install.
+
+**Read** exposes ids, URLs, sizes, clone progress and conditions.
+`status.accessKeyID` is the key id only; the secret half is written to the
+credentials Secret and nowhere else.
+
+**Write** hands out, all of it inside the Bucket's namespace
+([ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md),
+[ADR 0002](docs/adr/0002-a-credentials-group-is-attributed-through-its-bucket.md)):
+
+- creating a Bucket provisions a real StackIT bucket, a credentials group and
+  an access key in the operator's project, and writes the credentials Secret;
+- an existing Secret under `spec.secretRef.name` that has no controller owner
+  is adopted, its colliding keys overwritten, and it is deleted with the CR;
+- `spec.cloneFrom.secretRef` makes the operator use any Secret in the
+  namespace that holds S3 credentials as the source of a full copy;
+- `patch` reaches the [rotation annotation](#credentials-rotation): the live
+  key dies immediately;
+- `spec.grantReadAccess` shares the bucket read-only with sibling Buckets;
+- `spec.wipeOnDelete` plus delete wipes the bucket when the operator runs with
+  `wipeOnDelete.enabled`.
+
+That is the same class of power `edit` already holds over PVCs and Secrets.
+
+**`<release>-edit` is an aggregation fragment, not a role for direct
+binding.** It has no read verbs on purpose. A Bucket uses Secrets of its
+namespace on behalf of whoever created it (the two Secret items above), and the
+operator cannot check the creator's rights — the CR carries no requester
+identity. A subject holding Bucket write **without** Secret read in the same
+namespace could therefore copy any bucket whose credentials sit in a Secret
+there, or overwrite unowned Secrets, through a Bucket. The built-in `edit` and
+`admin` always hand out Secret access together with workload access, which is
+why the chart aggregates `-edit` into exactly those and offers no switch to
+render it standalone. Do not bind it directly to a subject that lacks Secret
+read/write in that namespace.
+
 ## Bucket naming
 
 By default the physical StackIT bucket name equals `spec.bucketName`. The operator

@@ -74,6 +74,8 @@ deploy/helm/stackit-s3-provisioner/      Helm-Chart (CRD via `make sync-helm-crd
 test/integration/                        //go:build integration — envtest gegen echten API-Server
 test/e2e/e2e_test.go                     //go:build e2e — Kind-Smoke Skeleton-Mode (Operator healthy + CR reconciled)
 test/e2e/cloud_test.go                   //go:build e2e — Kind gegen ECHTE API (E2E_STACKIT=1): Provisioning, Read-Grants, Groessen-Messung, Clone (echtes rclone)
+test/e2e/rbac_test.go                    //go:build e2e — Aggregation der User-Rollen in built-in view/edit (SubjectAccessReview)
+test/helm/render_test.go                 //go:build helm — `helm template`-Assertions auf -view/-edit/Operator-ClusterRole (make test-helm-render)
 hack/e2ecleanup/                         Sweep fuer Cloud-Reste eines abgebrochenen e2e-Laufs (inkl. verwaister Admin-Key)
 Makefile / Containerfile / renovate.json CI-Gerüst (an Valkey-Operator orientiert)
 .github/workflows/                       release.yml (Test+Release), build.yml (Docker+Helm), renovate.yml
@@ -97,6 +99,7 @@ make generate-all               # CRD + DeepCopy regenerieren, Helm-Chart-CRD sy
 make lint gosec vuln cyclo      # Linter + Security-Scans (wie CI)
 make test-unit-coverage         # Unit (offline), make test-integration-coverage = envtest
 make e2e-local                  # Kind hochziehen, via Helm installieren, e2e-Smoke (Skeleton, kein Cloud-Call)
+make test-helm-render           # helm template + Assertions auf die User-ClusterRoles (braucht helm)
 make e2e-stackit                # Kind + ECHTER SA-Key: legt reale Buckets/Groups/Keys an, raeumt garantiert ab
 make e2e-stackit-sweep-dry      # zeigt Cloud-Reste eines abgebrochenen Laufs (nur Report)
 make e2e-stackit-sweep          # loescht diese Reste inkl. verwaister operator-admin-Group
@@ -360,8 +363,12 @@ gerenderten Chart gelesen und in Kind vorgeladen (kein dritter Pin, kein Registr
 Credentials-Group ueber das Bucket-Tag `credentials-group-id`, Migration aus der Policy, ohne
 Umbenennung/Key-Wechsel; offline + gegen die echte API verifiziert
 (`go test -tags integration ./internal/controller/ -run IntegrationGroupAttribution -v`).
-**Offen:** Q2 (Minimal-Rolle), Q4 (Bucket-Namensraum); RBAC-Ticket `local_aggregation.md`
-(Flip-Trigger fuer `aggregateEdit` ist erfuellt).
+**Erledigt (2026-09-03):** User-facing RBAC (`local_aggregation.md`): Chart liefert `<release>-view`/`-edit`
+als Aggregations-Fragmente fuer built-in `view`/`edit`/`admin` (`bucketRoles.create`), bewusst OHNE
+Standalone-`-edit` (Confused Deputy ueber `cloneFrom.secretRef` + Secret-Adoption; ADR 0001 Amendment).
+Render-Check `make test-helm-render` (`test/helm/`), e2e `TestBucketRBACAggregation` (SubjectAccessReview,
+gepollt, Deny erst nach Allow).
+**Offen:** Q2 (Minimal-Rolle), Q4 (Bucket-Namensraum).
 RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) — bereits von den cluster-weiten
 Secret-RBAC-Markern abgedeckt.
 </content>

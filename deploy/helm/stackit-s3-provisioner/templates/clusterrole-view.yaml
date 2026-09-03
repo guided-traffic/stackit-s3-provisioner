@@ -1,0 +1,30 @@
+{{- if .Values.bucketRoles.create }}
+# User-facing read access to Bucket CRs. An aggregation fragment: the labels
+# make the built-in view, edit and admin ClusterRoles pick these rules up, so
+# a subject holding any of them in a namespace can read the Buckets there.
+# Read exposes ids, URLs, sizes and conditions — never credential material.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "stackit-s3-provisioner.fullname" . }}-view
+  labels:
+    {{- include "stackit-s3-provisioner.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups:
+      - stackit-bucket.gtrfc.com
+    resources:
+      - buckets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - stackit-bucket.gtrfc.com
+    resources:
+      - buckets/status
+    verbs:
+      - get
+{{- end }}
