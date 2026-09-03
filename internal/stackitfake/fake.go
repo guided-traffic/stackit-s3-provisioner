@@ -79,6 +79,7 @@ type Server struct {
 	failNext       map[string]int
 	failNextRaw    map[string]rawFailure
 	calls          map[string]int
+	omitNext       map[string]bool // group ids left out of the next ListGroups answer
 }
 
 // rawFailure is an injected response that bypasses the JSON error envelope, so
@@ -101,6 +102,7 @@ func New(projectID, region string) *Server {
 		failNext:       map[string]int{},
 		failNextRaw:    map[string]rawFailure{},
 		calls:          map[string]int{},
+		omitNext:       map[string]bool{},
 	}
 	s.CP = httptest.NewServer(http.HandlerFunc(s.controlPlane))
 	s.S3 = httptest.NewServer(http.HandlerFunc(s.dataPlane))
@@ -310,6 +312,66 @@ func (s *Server) KeyCount(displayName string) int {
 		}
 	}
 	return -1
+}
+
+// KeyCountByID returns the number of access keys in the group with the given
+// id (-1 when no such group exists). Unlike KeyCount it is unambiguous when
+// several groups share a display name.
+func (s *Server) KeyCountByID(id string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if g := s.groups[id]; g != nil {
+		return len(g.Keys)
+	}
+	return -1
+}
+
+// GroupIDs returns the ids of all credentials groups, sorted.
+func (s *Server) GroupIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.groups))
+	for id := range s.groups {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// SetTags replaces a bucket's tag set directly (bypassing the API), e.g. to
+// model a bucket provisioned before a tag existed. The bucket must exist.
+func (s *Server) SetTags(name string, tags map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.buckets[name]
+	if b == nil {
+		panic(fmt.Sprintf("stackitfake: SetTags on unknown bucket %q", name))
+	}
+	b.Tags = map[string]string{}
+	for k, v := range tags {
+		b.Tags[k] = v
+	}
+}
+
+// SetPolicy replaces a bucket's policy directly (bypassing the API); "" removes
+// it. The bucket must exist.
+func (s *Server) SetPolicy(name, policy string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.buckets[name]
+	if b == nil {
+		panic(fmt.Sprintf("stackitfake: SetPolicy on unknown bucket %q", name))
+	}
+	b.Policy = policy
+}
+
+// OmitFromNextListing leaves the group with the given id out of the next
+// ListGroups answer, modelling a project listing that lags behind a create
+// while the group's own endpoints already answer. One listing only.
+func (s *Server) OmitFromNextListing(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.omitNext[id] = true
 }
 
 // nextID returns a fresh sequence-numbered id. Caller must hold mu.
@@ -560,8 +622,12 @@ func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	ids := make([]string, 0, len(s.groups))
 	for id := range s.groups {
+		if s.omitNext[id] {
+			continue
+		}
 		ids = append(ids, id)
 	}
+	s.omitNext = map[string]bool{}
 	sort.Strings(ids)
 	list := make([]any, 0, len(ids))
 	for _, id := range ids {

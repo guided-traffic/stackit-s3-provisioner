@@ -473,3 +473,45 @@ func TestSanitizeReaderURNs_TrimmedComparison(t *testing.T) {
 		})
 	}
 }
+
+// TestWorkloadPrincipalFromPolicy pins the migration path of ADR 0002: the
+// workload principal is read back from the policy the operator itself wrote,
+// in the exact form BuildIsolationPolicy emits and in the normalized forms a
+// storage backend may hand back, and never from anything else.
+func TestWorkloadPrincipalFromPolicy(t *testing.T) {
+	const (
+		admin    = "urn:sgws:identity::123:group/admin"
+		workload = "urn:sgws:identity::123:group/workload"
+		reader   = "urn:sgws:identity::123:group/reader"
+	)
+
+	cases := []struct {
+		name   string
+		policy string
+		want   string
+		ok     bool
+	}{
+		{"two statements as written", BuildIsolationPolicy("b", admin, workload, nil), workload, true},
+		{"three statements as written", BuildIsolationPolicy("b", admin, workload, []string{reader}), workload, true},
+		{"principal as one-element list",
+			`{"Statement":[{"Sid":"workload-objects-only","Principal":{"AWS":["` + workload + `"]}}]}`, workload, true},
+		{"principal as bare string",
+			`{"Statement":[{"Sid":"workload-objects-only","Principal":"` + workload + `"}]}`, workload, true},
+		{"principal padded", `{"Statement":[{"Sid":"workload-objects-only","Principal":{"AWS":" ` + workload + ` "}}]}`, workload, true},
+		{"empty document", "", "", false},
+		{"not json", "{", "", false},
+		{"no workload statement", `{"Statement":[{"Sid":"deny-all-except-admin-and-workload","NotPrincipal":{"AWS":["` + admin + `"]}}]}`, "", false},
+		{"several principals", `{"Statement":[{"Sid":"workload-objects-only","Principal":{"AWS":["` + workload + `","` + reader + `"]}}]}`, "", false},
+		{"empty principal", `{"Statement":[{"Sid":"workload-objects-only","Principal":{"AWS":""}}]}`, "", false},
+		{"non-string principal", `{"Statement":[{"Sid":"workload-objects-only","Principal":{"AWS":[1]}}]}`, "", false},
+		{"foreign document", `{"Statement":[{"Sid":"something-else","Principal":{"AWS":"` + workload + `"}}]}`, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := WorkloadPrincipalFromPolicy(tc.policy)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("WorkloadPrincipalFromPolicy = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}

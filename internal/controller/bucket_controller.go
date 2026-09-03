@@ -73,9 +73,10 @@ type adminCreds struct {
 // One Bucket CR maps to a StackIT bucket, a dedicated credentials group, an
 // access key, an isolation policy (INIT-SETUP.md §4.1) and a workload
 // credentials Secret. The reconciler is idempotent and self-healing: cloud
-// resources are looked up by deterministic name (so a crash never leaks a
-// duplicate), the workload Secret is the source of truth for the live
-// credential, and the bucket policy is re-applied on drift.
+// resources are found again by the bucket's own tags (ownership and, per
+// ADR 0002, the credentials group it attributes), so a crash never leaks a
+// duplicate and a name is never trusted; the workload Secret is the source of
+// truth for the live credential, and the bucket policy is re-applied on drift.
 type BucketReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
@@ -353,7 +354,8 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("enable object storage: %w", err))
 	}
 
-	if err := r.ensureBucket(ctx, b, name, admin); err != nil {
+	freshBucket, err := r.ensureBucket(ctx, b, name, admin)
+	if err != nil {
 		return r.failEnsureBucket(ctx, b, err)
 	}
 
@@ -362,7 +364,7 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("bucket connection info: %w", err))
 	}
 
-	creds, done, res, err := r.provisionCredentialsAndClone(ctx, b, name, admin, host, bucketURL)
+	creds, done, res, err := r.provisionCredentialsAndClone(ctx, b, name, admin, host, bucketURL, freshBucket)
 	if !done {
 		return res, err
 	}
@@ -451,7 +453,7 @@ type workloadCreds struct {
 // against a partially copied bucket; holdSecretUntilCloned=false publishes it
 // up front. Ready always waits for the clone either way.
 func (r *BucketReconciler) provisionCredentialsAndClone(
-	ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds, host, bucketURL string,
+	ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds, host, bucketURL string, freshBucket bool,
 ) (workloadCreds, bool, ctrl.Result, error) {
 	var creds workloadCreds
 	failed := func(err error) (workloadCreds, bool, ctrl.Result, error) {
@@ -459,11 +461,15 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 		return creds, false, res, rerr
 	}
 
-	var err error
-	creds.gid, creds.urn, err = r.Stackit.EnsureCredentialsGroup(ctx, workloadGroupName(b))
+	groups, err := r.listGroups(ctx)
+	if err != nil {
+		return failed(fmt.Errorf("list credentials groups: %w", err))
+	}
+	group, err := r.resolveWorkloadGroup(ctx, b, name, admin, groups, true, freshBucket)
 	if err != nil {
 		return failed(fmt.Errorf("ensure credentials group: %w", err))
 	}
+	creds.gid, creds.urn = group.id, group.urn
 	// Publish the group identity as soon as it exists rather than only on the
 	// terminal status write. It is the signal grantors watch for
 	// (granteeCredentialsPredicate), and a Bucket that is itself still cloning
@@ -476,7 +482,7 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 	// is part of the very first policy the bucket ever gets. Unresolvable
 	// entries are skipped (not fatal): a data bucket must not lose its own
 	// Ready state because a consumer bucket is missing or not provisioned yet.
-	readerURNs, grantedTo, err := r.resolveReadGrants(ctx, b)
+	readerURNs, grantedTo, err := r.resolveReadGrants(ctx, b, admin, groups)
 	if err != nil {
 		return failed(fmt.Errorf("resolve read grants: %w", err))
 	}
@@ -557,35 +563,38 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 //   - An untagged pre-existing bucket is claimed only when empty (a crash between
 //     create and tag-write leaves exactly this state); a non-empty untagged bucket
 //     is treated as foreign and refused.
-func (r *BucketReconciler) ensureBucket(ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds) error {
+//
+// It reports whether the bucket was created in this call: such a bucket cannot
+// have a credentials group yet, which resolveWorkloadGroup needs to know.
+func (r *BucketReconciler) ensureBucket(ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds) (created bool, err error) {
 	ok, err := r.Stackit.HasBucket(ctx, r.Stackit.ProjectID(), name)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if ok {
-		return r.adoptOrCollide(ctx, b, name, admin)
+		return false, r.adoptOrCollide(ctx, b, name, admin)
 	}
 	if err := r.Stackit.CreateBucket(ctx, name); err != nil {
 		// Tolerate a create race (bucket appeared between the check and the create):
 		// fall through to the ownership check rather than blindly stamping our tags.
 		if stackit.StatusCode(err) != 409 {
-			return err
+			return false, err
 		}
 		if err := r.Stackit.WaitBucketVisible(ctx, name, bucketVisibleTimeout); err != nil {
-			return err
+			return false, err
 		}
-		return r.adoptOrCollide(ctx, b, name, admin)
+		return false, r.adoptOrCollide(ctx, b, name, admin)
 	}
 	if err := r.Stackit.WaitBucketVisible(ctx, name, bucketVisibleTimeout); err != nil {
-		return err
+		return false, err
 	}
 	// Freshly created by us: stamp ownership so later reconciles (and other
 	// operators/fleets) recognize it.
 	s3admin, err := r.newS3Admin(ctx, name, admin)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return s3admin.SetBucketTags(ctx, name, r.ownershipTags(b))
+	return true, s3admin.SetBucketTags(ctx, name, r.ownershipTags(b))
 }
 
 // failEnsureBucket maps an ensureBucket error onto the right terminal state: an
@@ -686,6 +695,270 @@ func (r *BucketReconciler) ownershipTags(b *s3v1.Bucket) map[string]string {
 func (r *BucketReconciler) isOwnedByUs(tagSet map[string]string, b *s3v1.Bucket) bool {
 	return tagSet[tagOwnershipManagedBy] == r.ownershipName() &&
 		tagSet[tagOwnershipOwner] == ownerTagValue(b)
+}
+
+// tagCredentialsGroupID is the bucket tag that binds a bucket to its workload
+// credentials group (ADR 0002). A credentials group carries no owner field of
+// its own, so the attribution lives on the bucket, next to the ownership tags
+// that already prove which Bucket CR the bucket belongs to, and is written
+// with the admin key only. The group's display name (workloadGroupName) is
+// not an identity: it is truncated, hashed with a 32-bit function and not
+// unique in the project, so it is never used to find a group.
+const tagCredentialsGroupID = "credentials-group-id"
+
+// tagCredentialsGroupURN carries the group's URN next to its id, so a tagged
+// bucket resolves its policy principal without the project listing — which
+// may lag behind a create — and a teardown needs no listing at all.
+const tagCredentialsGroupURN = "credentials-group-urn"
+
+// Event reasons of the credentials-group attribution (ADR 0002).
+const (
+	// reasonGroupAttributed: a bucket provisioned before the tag existed had
+	// its group recovered from its own isolation policy and the tag written.
+	reasonGroupAttributed = "CredentialsGroupAttributed"
+	// reasonGroupNotAttributable: teardown found no group it can prove belongs
+	// to the bucket, so none was deleted.
+	reasonGroupNotAttributable = "CredentialsGroupNotAttributable"
+)
+
+// errGroupNotAttributable reports that neither the bucket tag nor the bucket
+// policy names a credentials group that exists.
+var errGroupNotAttributable = errors.New("no credentials group is attributed to the bucket")
+
+// errBucketNotOwned reports that the bucket's ownership tags do not name the
+// Bucket CR on whose behalf a credentials group was requested.
+var errBucketNotOwned = errors.New("bucket is not owned by this Bucket")
+
+// errAttributionLagging reports that the provider has not yet shown a
+// credentials group the operator knows to exist: a listing without a group the
+// keys endpoint answers for, or a bucket without the tags that were written to
+// it. The reconcile is retried; nothing is created meanwhile.
+var errAttributionLagging = errors.New("credentials group attribution not yet visible")
+
+// workloadGroupRef identifies a workload credentials group.
+type workloadGroupRef struct {
+	id  string
+	urn string
+}
+
+// groupIndex is one control-plane listing of the project's credentials groups,
+// indexed by id and URN so a reconcile resolves any number of groups with a
+// single list call.
+type groupIndex struct {
+	byID  map[string]stackit.CredentialsGroupInfo
+	byURN map[string]stackit.CredentialsGroupInfo
+}
+
+// listGroups lists the project's credentials groups once and indexes them.
+func (r *BucketReconciler) listGroups(ctx context.Context) (*groupIndex, error) {
+	groups, err := r.Stackit.ListCredentialsGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	idx := &groupIndex{
+		byID:  make(map[string]stackit.CredentialsGroupInfo, len(groups)),
+		byURN: make(map[string]stackit.CredentialsGroupInfo, len(groups)),
+	}
+	for _, g := range groups {
+		idx.byID[g.ID] = g
+		idx.byURN[g.URN] = g
+	}
+	return idx, nil
+}
+
+// resolveWorkloadGroup returns the workload credentials group attributed to the
+// bucket named name, which must be the physical bucket of b (ADR 0002).
+//
+// Attribution is read from the cloud side only, in this order:
+//
+//  1. the bucket tags tagCredentialsGroupID / tagCredentialsGroupURN, when the
+//     group they name still exists — probed by id through the keys endpoint,
+//     which answers for a group the moment it is created, whereas the project
+//     listing may lag behind a create (groupFromTags);
+//  2. the workload principal of the bucket's own isolation policy — the record
+//     the operator wrote before the tags existed — in which case the tags are
+//     written now (migration, reported as reasonGroupAttributed;
+//     groupFromPolicy);
+//  3. with create set, a fresh group, whose id and URN are written to the tags
+//     before any key is minted (createWorkloadGroup).
+//
+// Nothing a namespace user controls takes part: not the Bucket spec, not its
+// annotations, not the Secret and not the status. The bucket must carry the
+// ownership tags of b (isOwnedByUs); otherwise errBucketNotOwned is returned
+// and no tag is written, so a foreign bucket sharing the name can neither lend
+// its group nor receive a tag. Without create, an unattributable bucket yields
+// errGroupNotAttributable.
+//
+// Step 3 is guarded against the provider's eventual consistency (ADR 0002 D8,
+// guardGroupCreate): when the Bucket's status records a group id and that group
+// still exists, a bucket showing no attribution is a stale read — a tag set or
+// policy not yet visible right after it was written — not a bucket without a
+// group; creating then would orphan a keyed group and rotate the workload. So
+// unless the bucket was created in this very pass (freshBucket: it cannot have
+// a group yet), the reconcile is retried with errAttributionLagging. The
+// recorded id is only used to decide whether to wait; it never names the group
+// the bucket is bound to.
+//
+// The group's display name is never consulted.
+func (r *BucketReconciler) resolveWorkloadGroup(
+	ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds, groups *groupIndex, create, freshBucket bool,
+) (workloadGroupRef, error) {
+	s3admin, err := r.newS3Admin(ctx, name, admin)
+	if err != nil {
+		return workloadGroupRef{}, err
+	}
+	tags, err := s3admin.BucketTags(ctx, name)
+	if err != nil {
+		return workloadGroupRef{}, err
+	}
+	if !r.isOwnedByUs(tags, b) {
+		return workloadGroupRef{}, fmt.Errorf("%w: bucket %q carries managed-by=%q owner=%q",
+			errBucketNotOwned, name, tags[tagOwnershipManagedBy], tags[tagOwnershipOwner])
+	}
+	// stamp records the group on the bucket, preserving every other tag.
+	stamp := func(ref workloadGroupRef) error {
+		tags[tagCredentialsGroupID] = ref.id
+		tags[tagCredentialsGroupURN] = ref.urn
+		if err := s3admin.SetBucketTags(ctx, name, tags); err != nil {
+			return fmt.Errorf("record credentials group %s on bucket %q: %w", ref.id, name, err)
+		}
+		return nil
+	}
+
+	if ref, found, err := r.groupFromTags(ctx, name, tags, groups, stamp); err != nil || found {
+		return ref, err
+	}
+	if ref, found, err := r.groupFromPolicy(ctx, s3admin, b, name, groups, stamp); err != nil || found {
+		return ref, err
+	}
+	if !create {
+		return workloadGroupRef{}, fmt.Errorf("%w: bucket %q", errGroupNotAttributable, name)
+	}
+	if err := r.guardGroupCreate(ctx, b, name, freshBucket); err != nil {
+		return workloadGroupRef{}, err
+	}
+	return r.createWorkloadGroup(ctx, b, stamp)
+}
+
+// groupFromTags resolves the group the bucket's tags name. The group's
+// existence is probed by id; its URN comes from the URN tag, or — for a bucket
+// tagged before that tag existed — from the listing, and is then recorded so
+// the next pass needs no listing. A tag naming a vanished group reads as no
+// tag. A group that exists but is neither URN-tagged nor listed yet is
+// errAttributionLagging.
+func (r *BucketReconciler) groupFromTags(
+	ctx context.Context, name string, tags map[string]string, groups *groupIndex, stamp func(workloadGroupRef) error,
+) (workloadGroupRef, bool, error) {
+	id := tags[tagCredentialsGroupID]
+	if id == "" {
+		return workloadGroupRef{}, false, nil
+	}
+	exists, err := r.groupExists(ctx, id)
+	if err != nil {
+		return workloadGroupRef{}, false, err
+	}
+	if !exists {
+		// Deleted out of band. The policy cannot name a different live group
+		// of ours, so this ends in a fresh group and the tags are overwritten.
+		log.FromContext(ctx).Info("credentials group named by bucket tag no longer exists", "bucket", name, "group", id)
+		return workloadGroupRef{}, false, nil
+	}
+	if urn := tags[tagCredentialsGroupURN]; urn != "" {
+		return workloadGroupRef{id: id, urn: urn}, true, nil
+	}
+	g, ok := groups.byID[id]
+	if !ok {
+		return workloadGroupRef{}, false, fmt.Errorf("%w: group %s exists but is not listed yet", errAttributionLagging, id)
+	}
+	ref := workloadGroupRef{id: g.ID, urn: g.URN}
+	if err := stamp(ref); err != nil {
+		return workloadGroupRef{}, false, err
+	}
+	return ref, true, nil
+}
+
+// groupFromPolicy resolves the group named by the workload principal of the
+// bucket's own isolation policy — the operator's record for buckets provisioned
+// before the tags existed — and writes the tags (migration). A failure to read
+// the policy is an error, not "no policy": treating it as absent would create a
+// second group for a bucket that has one and rotate its workload.
+func (r *BucketReconciler) groupFromPolicy(
+	ctx context.Context, s3admin *stackit.S3Admin, b *s3v1.Bucket, name string, groups *groupIndex, stamp func(workloadGroupRef) error,
+) (workloadGroupRef, bool, error) {
+	policy, err := s3admin.GetBucketPolicy(ctx, name)
+	if err != nil {
+		return workloadGroupRef{}, false, fmt.Errorf("read isolation policy of bucket %q: %w", name, err)
+	}
+	urn, ok := stackit.WorkloadPrincipalFromPolicy(policy)
+	if !ok {
+		return workloadGroupRef{}, false, nil
+	}
+	g, ok := groups.byURN[urn]
+	if !ok {
+		return workloadGroupRef{}, false, nil
+	}
+	ref := workloadGroupRef{id: g.ID, urn: g.URN}
+	if err := stamp(ref); err != nil {
+		return workloadGroupRef{}, false, err
+	}
+	log.FromContext(ctx).Info("credentials group attributed via isolation policy; bucket tags written", "bucket", name, "group", g.ID)
+	r.event(b, corev1.EventTypeNormal, reasonGroupAttributed,
+		fmt.Sprintf("credentials group %s attributed to bucket %q via its isolation policy and recorded in the bucket tags", g.ID, name))
+	return ref, true, nil
+}
+
+// guardGroupCreate is ADR 0002 D8: a bucket that shows no attribution while the
+// group recorded in the Bucket's status still exists is being read stale, so
+// creating is refused with errAttributionLagging. A bucket created in this pass
+// cannot have a group and skips the guard.
+func (r *BucketReconciler) guardGroupCreate(ctx context.Context, b *s3v1.Bucket, name string, freshBucket bool) error {
+	rec := b.Status.CredentialsGroupID
+	if rec == "" || freshBucket {
+		return nil
+	}
+	exists, err := r.groupExists(ctx, rec)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf(
+			"%w: status records group %s, which still exists, but bucket %q shows no attribution; not creating a second group",
+			errAttributionLagging, rec, name)
+	}
+	return nil
+}
+
+// createWorkloadGroup creates a fresh group and records it on the bucket. When
+// the tag write fails the group is deleted again: without the tags it is
+// unreachable for every later pass, and a retry must not leave a growing trail
+// of empty groups. A crash between the two calls still leaves one behind; it
+// holds no key and is visible by its display name.
+func (r *BucketReconciler) createWorkloadGroup(ctx context.Context, b *s3v1.Bucket, stamp func(workloadGroupRef) error) (workloadGroupRef, error) {
+	id, urn, err := r.Stackit.CreateCredentialsGroup(ctx, workloadGroupName(b))
+	if err != nil {
+		return workloadGroupRef{}, err
+	}
+	ref := workloadGroupRef{id: id, urn: urn}
+	if err := stamp(ref); err != nil {
+		if delErr := r.Stackit.DeleteCredentialsGroup(ctx, id); delErr != nil {
+			log.FromContext(ctx).Error(delErr, "failed to roll back untagged credentials group", "group", id)
+		}
+		return workloadGroupRef{}, err
+	}
+	return ref, nil
+}
+
+// groupExists probes a credentials group by id through its keys endpoint, the
+// one call that answers for a group the moment it is created. Only a 404 reads
+// as "gone"; every other failure is returned.
+func (r *BucketReconciler) groupExists(ctx context.Context, id string) (bool, error) {
+	if _, err := r.Stackit.ListAccessKeyIDs(ctx, id); err != nil {
+		if stackit.StatusCode(err) == 404 {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // ownershipCollisionError signals that a bucket with the target name already
@@ -809,67 +1082,37 @@ const reasonReadGrantPending = "ReadGrantPending"
 //   - Naming any other group in the project would hand read access to a
 //     principal outside the namespace.
 //
-// So the URN is never taken from the referenced object. Only the reference's
-// *name* is used, and it is used to derive the group display name the operator
-// itself would have created (workloadGroupName, deterministic over
-// namespace/name), which is then looked up against the control plane. Nothing an
-// unprivileged status writer controls reaches the policy. BuildIsolationPolicy
-// additionally filters the admin and workload URNs as a second line of defense.
+// So the URN is never taken from the referenced object. The reference is
+// resolved with the grantor's own namespace to a Bucket CR, that CR's physical
+// bucket is looked up in the cloud, and the group is the one that bucket
+// attributes (resolveWorkloadGroup, ADR 0002): the bucket must carry the
+// grantee's ownership tags, and the group comes from the bucket tag or from the
+// bucket's own isolation policy. Both are written with the admin key only, so
+// nothing an unprivileged writer controls reaches the policy — not the status,
+// not annotations, not the group's display name, which is not unique in the
+// project. BuildIsolationPolicy additionally filters the admin and workload
+// URNs as a second line of defense.
 //
-// The reference is resolved with the grantor's own namespace, so it can only
-// ever address a Bucket in that namespace — a same-named Bucket elsewhere in the
-// cluster is invisible here.
-//
-// LIMIT, stated precisely because the comment above is easy to over-read: what
-// reaches the policy is the group located by workloadGroupName, which is
-// "s3op-<ns>-<name>" truncated to 23 characters plus an 8-hex FNV-1a-32 suffix.
-// Distinct namespace/name pairs can be made to collide on that name, so the
-// namespace scoping above is a property of the CR lookup, not a cryptographic
-// guarantee about the principal. This is not specific to grants: the same
-// derivation already decides which credentials group a Bucket owns and adopts
-// (EnsureCredentialsGroup is find-or-create by that name). Any namespace allowed
-// to create Bucket CRs is inside the trust boundary.
-//
-// Unresolvable entries (missing Bucket, Bucket under deletion, no group yet) are
-// skipped with a warning event rather than failing the reconcile: the grantor
-// owns the data and must not lose its own provisioning because a consumer is
-// absent. The grantee watch in SetupWithManager re-queues the grantor as soon as
-// the reference materializes, and a deleted grantee drops out of the policy on
-// the next reconcile — that is the revocation path.
-//
-// One control-plane listing serves all entries, so the cost is independent of
-// the number of grants.
-func (r *BucketReconciler) resolveReadGrants(ctx context.Context, b *s3v1.Bucket) (urns, granted []string, err error) {
+// Unresolvable entries (missing Bucket, Bucket under deletion, no bucket or
+// group yet, a bucket that is not the grantee's) are skipped with a warning
+// event rather than failing the reconcile: the grantor owns the data and must
+// not lose its own provisioning because a consumer is absent. The grantee watch
+// in SetupWithManager re-queues the grantor as soon as the reference
+// materializes, and a deleted grantee drops out of the policy on the next
+// reconcile — that is the revocation path.
+func (r *BucketReconciler) resolveReadGrants(
+	ctx context.Context, b *s3v1.Bucket, admin *adminCreds, groups *groupIndex,
+) (urns, granted []string, err error) {
 	if len(b.Spec.GrantReadAccess) == 0 {
 		return nil, nil, nil
 	}
-
-	groups, err := r.Stackit.ListCredentialsGroups(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	// STACKIT does not enforce unique credentials-group display names, and the
-	// name is the only handle the operator has on a grantee's group. Two rules
-	// follow:
-	//
-	//   - First match wins, matching FindCredentialsGroupByName (stackit/client.go).
-	//     A different tie-break here would hand the grant to a group the grantee
-	//     itself does not use, i.e. read access to nobody while the intended
-	//     reader stays denied.
-	//   - A duplicated name is recorded as ambiguous and grants nothing. Guessing
-	//     which of two identically named groups the reference meant is exactly the
-	//     kind of silent, wrong principal a read grant must never produce.
-	urnByName := make(map[string]string, len(groups))
-	ambiguous := make(map[string]bool)
-	for _, g := range groups {
-		if _, dup := urnByName[g.DisplayName]; dup {
-			ambiguous[g.DisplayName] = true
-			continue
-		}
-		urnByName[g.DisplayName] = g.URN
-	}
-
 	logger := log.FromContext(ctx)
+	pending := func(ref, why string) {
+		logger.Info("read grant pending", "grantee", ref, "reason", why)
+		r.event(b, corev1.EventTypeWarning, reasonReadGrantPending,
+			fmt.Sprintf("Bucket %q referenced in spec.grantReadAccess %s; read access not granted", ref, why))
+	}
+
 	for _, ref := range b.Spec.GrantReadAccess {
 		// A Bucket cannot grant to itself; BuildIsolationPolicy would filter the
 		// resulting URN anyway, but skipping here keeps status truthful.
@@ -883,9 +1126,7 @@ func (r *BucketReconciler) resolveReadGrants(ctx context.Context, b *s3v1.Bucket
 		key := types.NamespacedName{Namespace: b.Namespace, Name: ref.Name}
 		if getErr := r.Get(ctx, key, &grantee); getErr != nil {
 			if apierrors.IsNotFound(getErr) {
-				logger.Info("read grant pending: referenced Bucket not found", "grantee", key)
-				r.event(b, corev1.EventTypeWarning, reasonReadGrantPending,
-					fmt.Sprintf("Bucket %q referenced in spec.grantReadAccess does not exist (yet); read access not granted", ref.Name))
+				pending(ref.Name, "does not exist (yet)")
 				continue
 			}
 			return nil, nil, fmt.Errorf("get referenced Bucket %s: %w", key, getErr)
@@ -899,23 +1140,28 @@ func (r *BucketReconciler) resolveReadGrants(ctx context.Context, b *s3v1.Bucket
 			continue
 		}
 
-		groupName := workloadGroupName(&grantee)
-		if ambiguous[groupName] {
-			logger.Info("read grant refused: credentials-group name is ambiguous", "grantee", key, "group", groupName)
-			r.event(b, corev1.EventTypeWarning, reasonReadGrantPending,
-				fmt.Sprintf("Bucket %q referenced in spec.grantReadAccess resolves to credentials-group name %q, "+
-					"which exists more than once in the project; refusing to grant read access to an ambiguous principal",
-					ref.Name, groupName))
+		granteeBucket := grantee.EffectiveBucketName()
+		exists, err := r.Stackit.HasBucket(ctx, r.Stackit.ProjectID(), granteeBucket)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !exists {
+			pending(ref.Name, "has no bucket yet")
 			continue
 		}
-		urn, ok := urnByName[groupName]
-		if !ok {
-			logger.Info("read grant pending: grantee credentials group not provisioned", "grantee", key)
-			r.event(b, corev1.EventTypeWarning, reasonReadGrantPending,
-				fmt.Sprintf("Bucket %q referenced in spec.grantReadAccess has no credentials group yet; read access not granted", ref.Name))
+		group, err := r.resolveWorkloadGroup(ctx, &grantee, granteeBucket, admin, groups, false, false)
+		switch {
+		case err == nil:
+		case errors.Is(err, errGroupNotAttributable):
+			pending(ref.Name, "has no credentials group yet")
 			continue
+		case errors.Is(err, errBucketNotOwned):
+			pending(ref.Name, fmt.Sprintf("names bucket %q, which is not owned by that Bucket", granteeBucket))
+			continue
+		default:
+			return nil, nil, err
 		}
-		urns = append(urns, urn)
+		urns = append(urns, group.urn)
 		granted = append(granted, ref.Name)
 	}
 	return urns, granted, nil
@@ -967,17 +1213,15 @@ func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
 		}
 	}
 
-	groupID, err := r.resolveWorkloadGroupID(ctx, b)
-	if err != nil {
-		return err
-	}
-	if groupID != "" {
-		if err := r.Stackit.DeleteAllAccessKeys(ctx, groupID); err != nil {
+	// The workload group is released only when the bucket itself attributes
+	// it (ADR 0002 D4). Nothing else in the cloud can prove the attribution, so
+	// without the bucket there is nothing the operator may delete.
+	if bucketExists {
+		if err := r.releaseWorkloadGroup(ctx, b, name); err != nil {
 			return err
 		}
-		if err := r.Stackit.DeleteCredentialsGroup(ctx, groupID); err != nil && stackit.StatusCode(err) != 404 {
-			return err
-		}
+	} else {
+		r.reportGroupNotAttributable(ctx, b, name, "bucket does not exist")
 	}
 
 	if bucketExists {
@@ -1127,21 +1371,60 @@ func (r *BucketReconciler) bucketOwnedByUs(ctx context.Context, b *s3v1.Bucket, 
 	return r.isOwnedByUs(tagSet, b), nil
 }
 
-// resolveWorkloadGroupID returns the workload credentials-group id for teardown,
-// preferring the recorded status and falling back to a lookup by deterministic
-// name so a lost status still cleans up. Returns "" when no group exists.
-func (r *BucketReconciler) resolveWorkloadGroupID(ctx context.Context, b *s3v1.Bucket) (string, error) {
-	if b.Status.CredentialsGroupID != "" {
-		return b.Status.CredentialsGroupID, nil
-	}
-	id, _, found, err := r.Stackit.FindCredentialsGroupByName(ctx, workloadGroupName(b))
+// releaseWorkloadGroup deletes the keys and the group that the (existing)
+// bucket attributes to b (ADR 0002 D4). A bucket that attributes no group, or
+// that is not b's at all, releases nothing: a group found by any other means —
+// the recorded status, a display name — might belong to another Bucket, and
+// deleting its keys would be an outage in a foreign namespace.
+func (r *BucketReconciler) releaseWorkloadGroup(ctx context.Context, b *s3v1.Bucket, name string) error {
+	admin, err := r.ensureAdmin(ctx)
 	if err != nil {
-		return "", err
+		return err
 	}
-	if found {
-		return id, nil
+	groups, err := r.listGroups(ctx)
+	if err != nil {
+		return err
 	}
-	return "", nil
+	group, err := r.resolveWorkloadGroup(ctx, b, name, admin, groups, false, false)
+	switch {
+	case err == nil:
+	case errors.Is(err, errGroupNotAttributable), errors.Is(err, errBucketNotOwned):
+		r.reportGroupNotAttributable(ctx, b, name, err.Error())
+		return nil
+	default:
+		return err
+	}
+	if err := r.Stackit.DeleteAllAccessKeys(ctx, group.id); err != nil {
+		return err
+	}
+	if err := r.Stackit.DeleteCredentialsGroup(ctx, group.id); err != nil && stackit.StatusCode(err) != 404 {
+		return err
+	}
+	return nil
+}
+
+// reportGroupNotAttributable logs that teardown leaves the workload group in
+// place, and raises a warning event when the group recorded in the Bucket's
+// status still exists — that is the case an operator may want to clean up by
+// hand, so the recorded id is in the message. A teardown that runs a second
+// pass after the bucket and group are already gone (a conflict on the finalizer
+// removal requeues it) therefore stays silent; the probe cannot answer is
+// reported as if the group existed, the safe direction for a warning.
+func (r *BucketReconciler) reportGroupNotAttributable(ctx context.Context, b *s3v1.Bucket, name, why string) {
+	logger := log.FromContext(ctx)
+	logger.Info("no credentials group attributed to bucket; none deleted", "bucket", name, "reason", why)
+	rec := b.Status.CredentialsGroupID
+	if rec == "" {
+		return
+	}
+	if exists, err := r.groupExists(ctx, rec); err == nil && !exists {
+		return
+	} else if err != nil {
+		logger.V(1).Info("could not probe recorded credentials group", "group", rec, "error", err.Error())
+	}
+	r.event(b, corev1.EventTypeWarning, reasonGroupNotAttributable,
+		fmt.Sprintf("not deleting credentials group %s recorded in status: %s; bucket %q does not attribute it (ADR 0002)",
+			rec, why, name))
 }
 
 // ensureAdmin loads or bootstraps the operator-wide S3 admin credential used to
@@ -1680,14 +1963,16 @@ func (r *BucketReconciler) persistResolvedName(ctx context.Context, b *s3v1.Buck
 // a credentials-group displayName. Exceeding it yields a 422 string_too_long.
 const maxGroupNameLen = 32
 
-// workloadGroupName derives the deterministic display name of a Bucket's
-// dedicated credentials group. The suffix hashes the Bucket's namespace/name
-// identity (not its metadata.uid), so the name is stable across a
-// disaster-recovery restore that re-creates the CR with a fresh UID: the
-// operator then re-uses the surviving cloud group by name instead of creating a
-// duplicate and orphaning the old one (which would keep a live, un-invalidated
-// access key). The suffix also keeps the name unique when the namespace/name
-// portion is truncated to the length budget.
+// workloadGroupName derives the display name of a Bucket's dedicated
+// credentials group: "s3op-<namespace>-<name>" truncated to the API's length
+// budget plus an 8-hex FNV-1a-32 of the namespace/name identity.
+//
+// The name is a label for humans (the STACKIT console, hack/e2ecleanup), not an
+// identity: distinct namespace/name pairs can produce the same name, and the
+// control plane does not enforce unique display names. Which group a Bucket
+// owns is recorded on the bucket itself (tagCredentialsGroupID, ADR 0002) and
+// never looked up by this name. It is kept stable and namespace/name-derived so
+// existing groups keep the names they were created with.
 func workloadGroupName(b *s3v1.Bucket) string {
 	suffix := shortHash(b.Namespace + "/" + b.Name)
 	base := fmt.Sprintf("s3op-%s-%s", b.Namespace, b.Name)

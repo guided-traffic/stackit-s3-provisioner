@@ -39,6 +39,7 @@ A reader must never find the old rule stated as current.
 | ADR | Decision |
 |---|---|
 | [0001](0001-a-bucket-only-affects-its-own-namespace.md) | A Bucket only affects its own namespace |
+| [0002](0002-a-credentials-group-is-attributed-through-its-bucket.md) | A credentials group is attributed through its bucket |
 
 ## Related documents
 

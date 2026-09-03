@@ -8,7 +8,7 @@ pro Cluster, jeweils gebunden an **ein StackIT-Projekt** via Service-Account-Key
 (kubebuilder-Layout, `Bucket`-CRD, controller-runtime Manager, Helm-Chart, GitHub-Pages-Release,
 Renovate, semantic-release — alle Checks grün). **Reconciler produktiv implementiert** (§8-Flow:
 Admin-Bootstrap → Bucket → Credentials-Group → AccessKey+Secret → Deny-Policy; Finalizer-Teardown
-nur wenn Bucket leer). Idempotent via Find-or-Create-by-Name (kein Leak über Crashes), Secret ist
+nur wenn Bucket leer). Idempotent via Bucket-Tags (Ownership + Group-Zuordnung, ADR 0001/0002; kein Leak über Crashes), Secret ist
 Source-of-Truth fürs Live-Credential, Policy self-heilend bei Drift. **Ohne SA-Key = Skeleton-Mode**
 (`Ready=NotImplemented`, kein Cloud-Call — envtest deckt das ab). Detaillierte Findings:
 **`INIT-SETUP.md`** (Quelle der Wahrheit). Go-Modul: `github.com/guided-traffic/stackit-s3-provisioner`.
@@ -65,6 +65,8 @@ internal/controller/reconciler_degraded_test.go Offline-Tests Sticky-Ready (Halt
 internal/controller/reconciler_circuit_test.go Offline-Tests Circuit-Breaker (Trip, Hold ohne Churn, Grace, Recovery, Teardown)
 internal/controller/breaker_test.go      Unit-Tests Breaker (Threshold, Reset, Probe-Backoff, Disabled)
 internal/controller/reconciler_usage_test.go   Offline-Tests Groessen-Messung (Gate, Clamp, Cap, Versionen, Fehlerpfad)
+internal/controller/reconciler_attribution_test.go Offline-Tests Group-Zuordnung (ADR 0002: Kollision, Migration, Restore, Teardown, Grants)
+internal/controller/attribution_integration_test.go //go:build integration — Legacy-Bucket-Migration gegen die ECHTE API (nichts loeschen/neu anlegen)
 internal/controller/reconciler_*_test.go Offline-Reconciler-Tests (fake k8s-Client + stackitfake, inkl. Fehlerpfade)
 internal/stackitfake/                    In-Memory-Fake der StackIT-API (Control-Plane REST + S3-XML) für Offline-Tests
 config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
@@ -125,8 +127,12 @@ Zwei Ebenen:
    + `Deny Principal workload NotAction [object-ops]` (kein Bucket-Management). Reines `Allow` isoliert NICHT.
 4. **Admin-Group immer in `NotPrincipal`** lassen → sonst Lockout (StorageGRID kann Account-Root aussperren).
 5. `secretAccessKey` nur **1× bei Create** verfügbar → sofort sichern.
-6. **Ein `Bucket` wirkt nur auf seinen eigenen Namespace** — Regeln, Konsequenzen und die
-   offene Verletzung stehen in [ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md).
+6. **Ein `Bucket` wirkt nur auf seinen eigenen Namespace** — Regeln und Konsequenzen stehen in
+   [ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md).
+7. **Credentials-Group nie per Anzeigename suchen, adoptieren oder loeschen.** Zuordnung nur ueber
+   die Bucket-Tags `credentials-group-id`/`-urn` bzw. die eigene Policy des Buckets; Existenz per
+   Keys-Endpoint geprueft, nie per Listing; kein Neu-Anlegen, solange die im Status notierte Gruppe
+   noch existiert ([ADR 0002](docs/adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D8).
 
 ## SDK-Fallstricke (verifiziert)
 
@@ -203,8 +209,10 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   `stackit-s3-provisioner-admin`, in `POD_NAMESPACE`). Deren URN steht in **jeder** Bucket-Policy
   (`NotPrincipal`, Lockout-Schutz). Fehlt/unvollständig → Find-or-Create-Group + Keys-clear + neuer Key.
 - **Provisioning (`reconcileNormal`):** `ValidateSecretKeys` → Admin-Secret-Guard → Region-Guard →
-  `ensureAdmin` → `EnsureService` → Bucket (idempotent by name) → `BucketConnInfo` → Workload-Group
-  (Find-or-Create by deterministischem Namen `s3op-<ns>-<name>-<uid8>`) → AccessKey+Secret → Policy.
+  `ensureAdmin` → `EnsureService` → Bucket (idempotent by name, Ownership-Tags) → `BucketConnInfo` →
+  Workload-Group (`resolveWorkloadGroup`, ADR 0002: Bucket-Tag `credentials-group-id` → sonst
+  Migration aus der eigenen Policy → sonst neu + Tag; **nie** per Anzeigename) → Grants → Policy →
+  AccessKey+Secret.
 - **AccessKey/Secret:** Secret ist Source-of-Truth. Hat Secret Creds **und** Group ≥1 Key → skip.
   Sonst: **erst alle Group-Keys löschen, dann neuen Key + Secret schreiben** (leak-frei, da Clear
   vor Create); scheitert Secret-Write → neuen Key sofort löschen (Secret unrecoverable).
@@ -218,11 +226,12 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   Daten-Bucket listet `Bucket`-CRs **seines Namespace**, deren Workload-Group nur-lesend
   darf. Drittes Policy-Statement + Reader in Stmt-1-`NotPrincipal`; ohne Grant Dokument
   byte-identisch zu vorher (kein Rewrite beim Upgrade). Reader-URN kommt **nie** aus
-  `status.credentialsGroupURN` (fälschbar via `buckets/status`), sondern aus
-  `workloadGroupName(grantee)` → Control-Plane-Lookup; `BuildIsolationPolicy` filtert
+  `status.credentialsGroupURN` (fälschbar via `buckets/status`), sondern ueber den
+  Grantee-Bucket: `EffectiveBucketName()` → Ownership-Tags muessen zum Grantee passen →
+  Tag `credentials-group-id` bzw. Policy (ADR 0002); `BuildIsolationPolicy` filtert
   Admin- + Workload-URN zusätzlich raus (Lockout- bzw. Owner-Verengungs-Schutz).
   Unauflösbarer Grant = Skip + Event `ReadGrantPending`, blockiert `Ready` nicht.
-  Mehrdeutiger Group-Displayname (mehrfach im Projekt) = Grant **verweigert**, nicht geraten.
+  Anzeigenamen spielen keine Rolle mehr (Duplikate erlaubt, kein Ambiguitaets-Pfad).
   **Während eines laufenden Clones bleiben Reader aus der Policy** (`holdSecretUntilCloned`
   schützt nur den eigenen Workload; ein Reader hat schon Credentials) — nach Clone-Erfolg
   wird die Policy im selben Pass mit Readern neu geschrieben.
@@ -232,7 +241,9 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   Deletion-Start) weckt Grantoren — sonst Hot-Loop über Status-Writes.
   Status: `status.grantedReadTo`. Self-Grant per Root-CEL abgelehnt (envtest-verifiziert).
 - **Finalizer-Teardown:** Empty-Check **zuerst** (Admin-S3, Data-Loss-Guard) → dann Keys → Group →
-  Bucket → Secret. Shared Admin-Group wird **nie** angefasst. Opt-in-Wipe: `spec.wipeOnDelete`
+  Bucket → Secret. Geloescht wird nur die Group, die der Bucket selbst per Tag/Policy zuordnet
+  (`releaseWorkloadGroup`, ADR 0002 D4); Status-ID ist keine Loeschquelle, nicht zuordenbar =
+  stehen lassen + Event `CredentialsGroupNotAttributable`. Shared Admin-Group wird **nie** angefasst. Opt-in-Wipe: `spec.wipeOnDelete`
   löscht vorher alle Objekte (inkl. Versions/Delete-Markers, `S3Admin.WipeBucket`) — nur wenn
   Feature-Gate an (`--enable-wipe-on-delete` / Helm `wipeOnDelete.enabled`, Default aus) **und**
   Ownership-Tags passen; sonst Degradierung auf Empty-Only + Warning-Event `WipeOnDeleteSkipped`.
@@ -292,16 +303,20 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   terminal), Failed-Job → Delete + Backoff-Retry (rclone resumed). **Bucket-Watch filtert auf
   Generation/Annotation** (sonst Hot-Loop durch Progress-Writes) — Finalizer-Add requeued explizit.
 
-## Sicherheits-Befunde (verifiziert 2026-08-24, PRÄEXISTENT — nicht vom Grant-Feature eingeführt)
+## Sicherheits-Befunde (verifiziert 2026-08-24, PRÄEXISTENT — nicht vom Grant-Feature eingeführt; beide behoben)
 
-1. **`workloadGroupName` kollidiert über Namespaces** (`internal/controller/bucket_controller.go`).
-   `("s3op-"+ns+"-"+name)[:23]` + 8-Hex-FNV-1a-32. Empirisch reproduziert:
+1. **`workloadGroupName` kollidiert über Namespaces** — **BEHOBEN 2026-09-03**
+   ([ADR 0002](docs/adr/0002-a-credentials-group-is-attributed-through-its-bucket.md)).
+   Vorher: `("s3op-"+ns+"-"+name)[:23]` + 8-Hex-FNV-1a-32, empirisch reproduziert
    `("gitlab","gitlab-artifacts")` == `("gitlab-gitlab","artifacts787ngo")` ==
-   `s3op-gitlab-gitlab-arti-70dbcfc2`. `EnsureCredentialsGroup` ist Find-or-Create
-   **ohne** Ownership-Check (der Tag-Guard schützt nur Buckets) → fremdes CR adoptiert
-   die Gruppe, `ensureAccessKeyAndSecret` löscht den Live-Key des Opfers und schreibt
-   einen neuen ins eigene Secret. Fix = längerer/kryptographischer Suffix ⇒ **Migration**
-   (alle bestehenden Gruppen würden umbenannt, alte Gruppen + Keys verwaisen). Offen.
+   `s3op-gitlab-gitlab-arti-70dbcfc2`; `EnsureCredentialsGroup` war Find-or-Create **ohne**
+   Ownership-Check → fremdes CR adoptierte die Gruppe, `ensureAccessKeyAndSecret` löschte den
+   Live-Key des Opfers und schrieb einen neuen ins eigene Secret. Fix: die Group wird ueber den
+   Bucket zugeordnet (Tag `credentials-group-id`, Admin-Key-only, hinter dem Ownership-Check),
+   Bestand wird aus der eigenen Policy migriert (Statement `workload-objects-only`) — keine
+   Umbenennung, kein Key-Wechsel, Name nur noch Anzeigename. Regressionstest
+   `TestGroupAttributionSurvivesNameCollision`; Migration gegen die echte API verifiziert
+   (`TestIntegrationGroupAttributionMigration`, 2026-09-03).
 2. **`spec.secretRef.namespace` ungeprüft** — **BEHOBEN 2026-09-03** ([ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md)):
    Feld aus der CRD entfernt, `SecretNamespace()` gelöscht, Secret liegt strukturell in
    `b.Namespace` (immer mit Controller-OwnerRef), `bucketsForSecret` listet nur noch den
@@ -311,9 +326,8 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
    wird vom API-Server auf den eigenen Namespace gepruned → Operator rotiert den Key in ein
    neues Secret im CR-Namespace, das alte Fremd-Secret verwaist mit totem Key (manuell löschen).
 
-Befund 1 untergräbt weiterhin die Prämisse „Namespace = Trust-Boundary". Doc-Kommentare in
-`bucket_types.go`, `resolveReadGrants`, README und INIT-SETUP §4.1.1 sind entsprechend
-entschärft — sie behaupten keine Garantie mehr, die der Mechanismus nicht hergibt.
+Beide Befunde sind behoben; die Prämisse „Namespace = Trust-Boundary" gilt fuer Buckets und
+Credentials-Groups strukturell (ADR 0001 D2 + ADR 0002), nicht per RBAC-Konfiguration.
 
 ## Nächster Schritt
 
@@ -342,9 +356,12 @@ nicht-versionierten Bucket — live verifiziert, dass StorageGRID das beantworte
 korrekt setzt), `TestCloudClone` (echtes rclone-Image, Quelle ist ein zweites Bucket-CR:
 Hold-Invariante, byte-genauer Inhalt, Clone-once). rclone-Image wird im Make-Target aus dem
 gerenderten Chart gelesen und in Kind vorgeladen (kein dritter Pin, kein Registry-Pull im Test).
-**Offen:** (1) Sicherheits-Befund 1 oben (Group-Namenskollision; Befund 2 behoben 2026-09-03);
-(2) Q2 (Minimal-Rolle),
-Q4 (Bucket-Namensraum).
+**Erledigt (2026-09-03):** Sicherheits-Befund 1 (Group-Namenskollision) via ADR 0002 — Zuordnung der
+Credentials-Group ueber das Bucket-Tag `credentials-group-id`, Migration aus der Policy, ohne
+Umbenennung/Key-Wechsel; offline + gegen die echte API verifiziert
+(`go test -tags integration ./internal/controller/ -run IntegrationGroupAttribution -v`).
+**Offen:** Q2 (Minimal-Rolle), Q4 (Bucket-Namensraum); RBAC-Ticket `local_aggregation.md`
+(Flip-Trigger fuer `aggregateEdit` ist erfuellt).
 RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) — bereits von den cluster-weiten
 Secret-RBAC-Markern abgedeckt.
 </content>

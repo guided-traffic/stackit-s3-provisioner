@@ -533,7 +533,7 @@ func TestTeardown(t *testing.T) {
 		}
 	})
 
-	t.Run("status group id lost: teardown finds group by name", func(t *testing.T) {
+	t.Run("status group id lost: teardown finds group via bucket tag", func(t *testing.T) {
 		e := newTestEnv(t)
 		b := e.provision(t, newBucketCR("team-a", "app-data"))
 		groupName := workloadGroupName(b)
@@ -547,7 +547,7 @@ func TestTeardown(t *testing.T) {
 		}
 		e.reconcileN(t, "team-a", "app-data", 1)
 		if got := e.fake.KeyCount(groupName); got != -1 {
-			t.Errorf("workload group not cleaned up via name fallback (keys %d)", got)
+			t.Errorf("workload group not cleaned up via bucket tag (keys %d)", got)
 		}
 	})
 

@@ -2,13 +2,16 @@
 
 ## Status
 
-Accepted. Date: 2026-09-03.
+Accepted. Date: 2026-09-03. Amended 2026-09-03 by
+[ADR 0002](0002-a-credentials-group-is-attributed-through-its-bucket.md): D2 now holds for
+credentials groups as well, and the conditional consequence on user-facing write RBAC is
+withdrawn.
 
-D1, D3, D4, D5 and D6 hold in the tree at this commit. D4's first consequence — the
-removal of `spec.secretRef.namespace` — shipped in commit `2fdb722`
-(`fix: keep the workload credentials Secret in the Bucket namespace`). **D2 holds for
-buckets and is violated for credentials groups**; the violation is listed under Residual
-risks and is security finding 1 in [CLAUDE.md](../../CLAUDE.md).
+D1 through D6 hold in the tree at this commit. D4's first consequence — the removal of
+`spec.secretRef.namespace` — shipped in commit `2fdb722`
+(`fix: keep the workload credentials Secret in the Bucket namespace`). D2 held for buckets
+only until ADR 0002 attributed credentials groups through the bucket's tags; the former
+violation (security finding 1 in [CLAUDE.md](../../CLAUDE.md)) is kept below, marked closed.
 
 Verified by reading the code and by the offline unit suite plus the envtest suite:
 `TestBucketsForSecret` and `TestIsAdminSecret` pin D1, the `reconciler_grants_test.go`
@@ -58,9 +61,11 @@ Bucket as controller owner, `deleteSecret` removes it there, and the Secret watc
 For the bucket itself this holds: `ensureBucket` stamps ownership tags (`ownershipTags`,
 managed-by plus owner) on a bucket it creates, and a bucket carrying different tags is an
 `ownershipCollisionError` — a definitive failure without requeue. For the credentials
-group it does **not** hold yet: `EnsureCredentialsGroup` is find-or-create by the derived
-display name `workloadGroupName`, with no ownership check, and that name is not
-collision-proof across namespaces. See Residual risks.
+group it holds since ADR 0002: the bucket names its group in the tag `credentials-group-id`
+(`resolveWorkloadGroup`), and a group is never found, adopted or deleted by its display
+name. *Superseded 2026-09-03:* until then `EnsureCredentialsGroup` was find-or-create by the
+derived display name `workloadGroupName`, with no ownership check, and that name is not
+collision-proof across namespaces — see Residual risks.
 
 **D3 — A reference in a Bucket spec resolves in the Bucket's namespace only.**
 `spec.grantReadAccess` names Bucket CRs and `resolveReadGrants` looks them up with
@@ -102,10 +107,13 @@ namespace is a trust boundary for tenants, not for the operator's own credential
   upgrade; afterwards the field can no longer be read.
 * The Secret watch got cheaper: one namespace-scoped list per Secret event instead of a
   cluster-wide one.
-* User-facing write RBAC on `buckets` hands out precisely the power this ADR bounds. While
-  D2 is violated for credentials groups, an `edit` ClusterRole on `buckets` is shipped for
-  explicit per-namespace binding only and is not aggregated into the built-in
-  `edit`/`admin` by default.
+* User-facing write RBAC on `buckets` hands out precisely the power this ADR bounds.
+  *Amended 2026-09-03 (ADR 0002):* the condition that kept an `edit` ClusterRole on
+  `buckets` out of the built-in `edit`/`admin` aggregation — D2 violated for credentials
+  groups — no longer holds. What the role hands out is namespace-scoped (D1–D5); whether to
+  aggregate it is a privilege decision of the RBAC ticket, not a security precondition.
+  *Superseded rule:* while D2 was violated, the role was shipped for explicit per-namespace
+  binding only and not aggregated by default.
 
 ## Alternatives Considered
 
@@ -134,16 +142,17 @@ move every boundary into RBAC on object names.
 
 ## Residual risks
 
-* **D2 is violated for credentials groups (open; security finding 1 in CLAUDE.md).**
+* **D2 was violated for credentials groups (closed 2026-09-03 by ADR 0002; was security
+  finding 1 in CLAUDE.md).** Kept for the record:
   `workloadGroupName` is `s3op-<namespace>-<name>`, truncated, plus an 8-hex FNV-1a-32
   suffix; CLAUDE.md records `("gitlab","gitlab-artifacts")` and
   `("gitlab-gitlab","artifacts787ngo")` deriving the same name (reproduced 2026-08-24). A
   colliding Bucket adopts the victim's group, `ensureAccessKeyAndSecret` deletes the
   victim's live key and mints a new one in that group, and the victim's bucket policy
   trusts that group's URN — a credential takeover of a foreign bucket plus an outage for
-  its workload. The fix is an ownership check on the group and/or a collision-proof name;
-  either means renaming or re-attributing every existing group. Until then, whoever may
-  create Buckets anywhere sits inside the trust boundary of every namespace's bucket.
+  its workload. ADR 0002 closed this by attributing the group through the bucket's tags,
+  with the bucket's own policy as the migration path — no group was renamed and no key
+  rotated.
 * **Not verified:** whether Flux server-side apply rejects or silently prunes a Bucket that
   still sets `spec.secretRef.namespace`; whether any Bucket on the target clusters sets it.
 * Read access is bounded by the same rule from the other side: `get`/`list` on `buckets`
@@ -155,6 +164,7 @@ move every boundary into RBAC on object names.
 * [`api/v1/bucket_types.go`](../../api/v1/bucket_types.go) — `SecretReference` (name only), `LocalBucketReference`, `CloneSourceSecretRef`
 * [`internal/controller/bucket_controller.go`](../../internal/controller/bucket_controller.go) — `upsertSecret`, `deleteSecret`, `bucketsForSecret`, `isAdminSecret`, `specGuardError`, `ensureBucket`, `ownershipTags`, `resolveReadGrants`, `workloadGroupName`
 * [`internal/controller/clone.go`](../../internal/controller/clone.go) — clone Job and staging Secret in the operator namespace
-* [`stackit/client.go`](../../stackit/client.go) — `EnsureCredentialsGroup`, find-or-create by display name
+* [`stackit/client.go`](../../stackit/client.go) — `EnsureCredentialsGroup`, find-or-create by display name (admin group only since ADR 0002)
+* [ADR 0002](0002-a-credentials-group-is-attributed-through-its-bucket.md) — credentials-group attribution, amends D2 and the RBAC consequence
 * [INIT-SETUP.md](../../INIT-SETUP.md) — §0 decision table, §4.1.1 read grants and the group-name collision
 * [CLAUDE.md](../../CLAUDE.md) — security findings 1 (open) and 2 (closed by this ADR)
