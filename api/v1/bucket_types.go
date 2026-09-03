@@ -456,14 +456,16 @@ type CloneStatus struct {
 
 // SecretReference points to the Kubernetes Secret that receives the bucket's S3
 // access key and secret. The secret is created and kept in sync by the operator.
+//
+// The Secret always lives in the Bucket's own namespace; there is deliberately
+// no way to direct it elsewhere. A cross-namespace target would let anyone who
+// may create a Bucket write into, and on deletion remove, a Secret in a
+// namespace they otherwise cannot touch (decided 2026-09-03, INIT-SETUP.md §0).
 type SecretReference struct {
-	// Name of the Secret to write the S3 credentials to.
+	// Name of the Secret to write the S3 credentials to. The Secret is created
+	// in the Bucket's namespace.
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
-
-	// Namespace of the Secret. Defaults to the Bucket's own namespace when empty.
-	// +optional
-	Namespace string `json:"namespace,omitempty"`
 
 	// Keys overrides the data-key names written into the Secret. All fields are
 	// optional and default to env-var-style names (see SecretKeys).
@@ -868,15 +870,6 @@ type BucketList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []Bucket `json:"items"`
-}
-
-// SecretNamespace returns the namespace the credentials Secret should live in,
-// defaulting to the Bucket's own namespace when spec.secretRef.namespace is empty.
-func (b *Bucket) SecretNamespace() string {
-	if b.Spec.SecretRef.Namespace != "" {
-		return b.Spec.SecretRef.Namespace
-	}
-	return b.Namespace
 }
 
 // GetRegion returns the configured region, defaulting to eu01 when unset.

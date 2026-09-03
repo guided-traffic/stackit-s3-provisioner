@@ -97,6 +97,9 @@ Zwei Ebenen:
    + `Deny Principal workload NotAction [object-ops]` (kein Bucket-Management). Reines `Allow` isoliert NICHT.
 4. **Admin-Group immer in `NotPrincipal`** lassen → sonst Lockout (StorageGRID kann Account-Root aussperren).
 5. `secretAccessKey` nur **1× bei Create** verfügbar → sofort sichern.
+6. **Workload-Secret immer im Namespace des Bucket-CR** (ADR 2026-09-03, INIT-SETUP.md §0).
+   `spec.secretRef` hat bewusst kein `namespace`-Feld — ein Cross-Namespace-Ziel wäre ein
+   Secret-Write/Delete-Primitiv für jeden, der Bucket-CRs anlegen darf. Nicht wieder einführen.
 
 ## SDK-Fallstricke (verifiziert)
 
@@ -149,6 +152,9 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   - `Bucket.ValidateSecretKeys()` — Fehler bei Key-Kollision (zwei Felder → selber Key,
     sonst stiller Datenverlust). Reconciler muss das **vor** dem Secret-Write prüfen.
 - Default-Key-Konstanten: `Default*Key` in `api/v1/bucket_types.go`.
+- Secret liegt **immer** im Namespace des Bucket-CR, mit Controller-OwnerRef (GC mit dem CR).
+  `spec.secretRef.namespace` wurde 2026-09-03 entfernt (ADR, INIT-SETUP.md §0) — ein
+  Cross-Namespace-Ziel war ein Secret-Write/Delete-Primitiv (Sicherheits-Befund 2, behoben).
 
 ## Konventionen
 
@@ -269,12 +275,16 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
    die Gruppe, `ensureAccessKeyAndSecret` löscht den Live-Key des Opfers und schreibt
    einen neuen ins eigene Secret. Fix = längerer/kryptographischer Suffix ⇒ **Migration**
    (alle bestehenden Gruppen würden umbenannt, alte Gruppen + Keys verwaisen). Offen.
-2. **`spec.secretRef.namespace` ungeprüft** (`api/v1/bucket_types.go` `SecretNamespace()`).
-   Einziger Guard ist `isAdminSecret` (ein Name+Namespace). `upsertSecret` merged in ein
-   beliebiges Secret jedes Namespace, `deleteSecret` löscht es beim CR-Delete. Wer irgendwo
-   ein Bucket-CR anlegen darf, hat ein Cross-Namespace-Write/Delete-Primitiv. Offen.
+2. **`spec.secretRef.namespace` ungeprüft** — **BEHOBEN 2026-09-03** (ADR, INIT-SETUP.md §0):
+   Feld aus der CRD entfernt, `SecretNamespace()` gelöscht, Secret liegt strukturell in
+   `b.Namespace` (immer mit Controller-OwnerRef), `bucketsForSecret` listet nur noch den
+   Namespace des Secrets. Vorher: `upsertSecret` merged in ein beliebiges Secret jedes
+   Namespace, `deleteSecret` löschte es beim CR-Delete → Cross-Namespace-Write/Delete-Primitiv
+   für jeden, der ein Bucket-CR anlegen darf. Migration: ein Bestands-CR mit gesetztem Feld
+   wird vom API-Server auf den eigenen Namespace gepruned → Operator rotiert den Key in ein
+   neues Secret im CR-Namespace, das alte Fremd-Secret verwaist mit totem Key (manuell löschen).
 
-Beide untergraben die Prämisse „Namespace = Trust-Boundary". Doc-Kommentare in
+Befund 1 untergräbt weiterhin die Prämisse „Namespace = Trust-Boundary". Doc-Kommentare in
 `bucket_types.go`, `resolveReadGrants`, README und INIT-SETUP §4.1.1 sind entsprechend
 entschärft — sie behaupten keine Garantie mehr, die der Mechanismus nicht hergibt.
 
@@ -305,7 +315,8 @@ nicht-versionierten Bucket — live verifiziert, dass StorageGRID das beantworte
 korrekt setzt), `TestCloudClone` (echtes rclone-Image, Quelle ist ein zweites Bucket-CR:
 Hold-Invariante, byte-genauer Inhalt, Clone-once). rclone-Image wird im Make-Target aus dem
 gerenderten Chart gelesen und in Kind vorgeladen (kein dritter Pin, kein Registry-Pull im Test).
-**Offen:** (1) die beiden präexistenten Sicherheits-Befunde oben; (2) Q2 (Minimal-Rolle),
+**Offen:** (1) Sicherheits-Befund 1 oben (Group-Namenskollision; Befund 2 behoben 2026-09-03);
+(2) Q2 (Minimal-Rolle),
 Q4 (Bucket-Namensraum).
 RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) — bereits von den cluster-weiten
 Secret-RBAC-Markern abgedeckt.

@@ -38,8 +38,11 @@ spec:
 ### Credentials Secret
 
 The operator writes the provisioned access key **and** the S3 connection
-parameters a workload needs into the referenced Secret. By default the data keys
-are env-var style, so the Secret can be consumed directly via `envFrom`:
+parameters a workload needs into the referenced Secret. The Secret always lives
+in the Bucket's own namespace and is owned by the Bucket; `spec.secretRef.name`
+only picks its name, there is no way to place it in another namespace. By
+default the data keys are env-var style, so the Secret can be consumed directly
+via `envFrom`:
 
 | Default key             | Value                                              |
 | ----------------------- | -------------------------------------------------- |

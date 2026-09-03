@@ -306,12 +306,10 @@ spec:
                         type: string
                     type: object
                   name:
-                    description: Name of the Secret to write the S3 credentials to.
+                    description: |-
+                      Name of the Secret to write the S3 credentials to. The Secret is created
+                      in the Bucket's namespace.
                     minLength: 1
-                    type: string
-                  namespace:
-                    description: Namespace of the Secret. Defaults to the Bucket's
-                      own namespace when empty.
                     type: string
                 required:
                 - name

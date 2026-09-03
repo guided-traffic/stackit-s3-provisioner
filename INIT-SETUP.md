@@ -11,6 +11,7 @@
 | Region | **`eu01`** (Single-Region, v1). Code dennoch region-parametrisiert. |
 | Lösch-Semantik | **Nur löschen wenn Bucket leer** — sonst Reconcile-Fehler, kein Datenverlust. |
 | Key-Rotation | **v1: Keys ohne Ablauf**, keine Auto-Rotation. Rotation später nachrüstbar. |
+| Secret-Namespace (ADR 2026-09-03) | **Workload-Secret liegt immer im Namespace des Bucket-CR.** `spec.secretRef.namespace` wurde entfernt — es war ungeprüft und damit ein Cross-Namespace-Secret-Write/Delete-Primitiv für jeden, der Bucket-CRs anlegen darf. Das Secret trägt jetzt immer eine Controller-OwnerRef. Bestands-CRs mit gesetztem Feld: der API-Server pruned das Feld, der Operator rotiert den Key in ein neues Secret im CR-Namespace, das alte Fremd-Secret verwaist mit totem Key (manuell löschen). |
 
 ## 1. Ziel
 
@@ -261,6 +262,9 @@ Mit ≥1 Reader kommt ein drittes Statement dazu, und Stmt 1 nimmt die Reader in
    noch zu klären → Q2.
 4. **Default-Credentials-Group hat breiten Zugriff.** Für Layer 2 nie die Default-Group
    an Workloads geben — immer dedizierte Groups + restriktive Policy.
+5. **Workload-Secret nur im Namespace des Bucket-CR** (§0, ADR 2026-09-03). Kein
+   `namespace`-Feld an `secretRef` wieder einführen — es wäre ein Secret-Write/Delete-
+   Primitiv über Namespace-Grenzen für jeden, der Bucket-CRs anlegen darf.
 
 ## 6. Offene Fragen (zu klären, bevor Code beginnt)
 

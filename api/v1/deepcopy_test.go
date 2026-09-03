@@ -20,8 +20,7 @@ func fullBucket() *Bucket {
 			Region:       "eu01",
 			WipeOnDelete: true,
 			SecretRef: SecretReference{
-				Name:      "sec",
-				Namespace: "other",
+				Name: "sec",
 				Keys: SecretKeys{
 					AccessKeyID:     "AK",
 					SecretAccessKey: "SK",
