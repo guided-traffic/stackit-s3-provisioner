@@ -803,6 +803,9 @@ silently truncated.
 
 ## Development
 
+Architecture decisions live in [docs/adr/](docs/adr/README.md); read the relevant ADR
+before changing the behavior it describes.
+
 ```bash
 make help                      # list all targets
 make build                     # build the manager binary

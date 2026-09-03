@@ -460,7 +460,8 @@ type CloneStatus struct {
 // The Secret always lives in the Bucket's own namespace; there is deliberately
 // no way to direct it elsewhere. A cross-namespace target would let anyone who
 // may create a Bucket write into, and on deletion remove, a Secret in a
-// namespace they otherwise cannot touch (decided 2026-09-03, INIT-SETUP.md §0).
+// namespace they otherwise cannot touch (ADR 0001,
+// docs/adr/0001-a-bucket-only-affects-its-own-namespace.md).
 type SecretReference struct {
 	// Name of the Secret to write the S3 credentials to. The Secret is created
 	// in the Bucket's namespace.
