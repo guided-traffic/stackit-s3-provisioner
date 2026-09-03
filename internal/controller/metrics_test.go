@@ -119,6 +119,9 @@ stackit_s3_provisioner_skeleton_mode 1
 # HELP stackit_s3_provisioner_wipe_on_delete_gate_enabled 1 when the operator-wide --enable-wipe-on-delete feature gate is on.
 # TYPE stackit_s3_provisioner_wipe_on_delete_gate_enabled gauge
 stackit_s3_provisioner_wipe_on_delete_gate_enabled 0
+# HELP stackit_s3_provisioner_provider_circuit_open 1 while the fleet-wide provider circuit breaker is open and Bucket reconciles are being held.
+# TYPE stackit_s3_provisioner_provider_circuit_open gauge
+stackit_s3_provisioner_provider_circuit_open 0
 # HELP stackit_s3_provisioner_credentials_last_rotation_timestamp_seconds Unix time of the Bucket's last credentials rotation; absent for Buckets that were never rotated.
 # TYPE stackit_s3_provisioner_credentials_last_rotation_timestamp_seconds gauge
 stackit_s3_provisioner_credentials_last_rotation_timestamp_seconds{name="ready",namespace="ns-a"} 1.7e+09
@@ -162,5 +165,64 @@ stackit_s3_provisioner_bucket_usage_truncated{name="measured",namespace="ns-d"} 
 `
 	if err := testutil.CollectAndCompare(c, strings.NewReader(expected)); err != nil {
 		t.Fatalf("unexpected metrics: %v", err)
+	}
+}
+
+// TestProviderCircuitMetrics pins the two series an alert on a provider outage
+// keys off. The gauge is always present so an expression never races an absent
+// series; the timestamp exists only while the circuit is open, so
+// `time() - <series>` is the age of the outage wherever it exists.
+func TestProviderCircuitMetrics(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := s3v1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	breaker := NewProviderBreaker(1, time.Minute)
+	clk := newFakeClockAt(time.Unix(1700000000, 0))
+	breaker.now = clk.Now
+	c := &bucketMetricsCollector{reader: cl, breaker: breaker}
+
+	closed := `
+# HELP stackit_s3_provisioner_provider_circuit_open 1 while the fleet-wide provider circuit breaker is open and Bucket reconciles are being held.
+# TYPE stackit_s3_provisioner_provider_circuit_open gauge
+stackit_s3_provisioner_provider_circuit_open 0
+`
+	if err := testutil.CollectAndCompare(c, strings.NewReader(closed),
+		"stackit_s3_provisioner_provider_circuit_open",
+		"stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds"); err != nil {
+		t.Fatalf("closed circuit: %v", err)
+	}
+
+	breaker.Failure()
+	open := `
+# HELP stackit_s3_provisioner_provider_circuit_open 1 while the fleet-wide provider circuit breaker is open and Bucket reconciles are being held.
+# TYPE stackit_s3_provisioner_provider_circuit_open gauge
+stackit_s3_provisioner_provider_circuit_open 1
+# HELP stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds Unix time at which the provider circuit breaker last opened; absent while it is closed.
+# TYPE stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds gauge
+stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds 1.7e+09
+`
+	if err := testutil.CollectAndCompare(c, strings.NewReader(open),
+		"stackit_s3_provisioner_provider_circuit_open",
+		"stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds"); err != nil {
+		t.Fatalf("open circuit: %v", err)
+	}
+
+	// A failed probe extends the outage but must not move its start time.
+	clk.Advance(time.Minute)
+	breaker.Failure()
+	if err := testutil.CollectAndCompare(c, strings.NewReader(open),
+		"stackit_s3_provisioner_provider_circuit_open",
+		"stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds"); err != nil {
+		t.Fatalf("after a failed probe: %v", err)
+	}
+
+	breaker.Success()
+	if err := testutil.CollectAndCompare(c, strings.NewReader(closed),
+		"stackit_s3_provisioner_provider_circuit_open",
+		"stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds"); err != nil {
+		t.Fatalf("recovered circuit: %v", err)
 	}
 }

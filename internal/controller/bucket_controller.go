@@ -18,14 +18,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"golang.org/x/time/rate"
 
 	s3v1 "github.com/guided-traffic/stackit-s3-provisioner/api/v1"
 	"github.com/guided-traffic/stackit-s3-provisioner/stackit"
@@ -142,6 +147,12 @@ type BucketReconciler struct {
 	// it a values-only rollback that needs no new image.
 	ProviderDegradedGrace time.Duration
 
+	// Breaker is the fleet-wide provider circuit breaker. While it is open the
+	// reconciler does no provider work at all and requeues on the breaker's own
+	// cooldown, so one outage costs a handful of API calls instead of one per
+	// retry per Bucket. Nil disables it.
+	Breaker *ProviderBreaker
+
 	adminMu sync.Mutex
 	admin   *adminCreds // cached after the first successful bootstrap
 
@@ -164,8 +175,6 @@ type BucketReconciler struct {
 
 // Reconcile drives a Bucket towards its desired state.
 func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
 	var bucket s3v1.Bucket
 	if err := r.Get(ctx, req.NamespacedName, &bucket); err != nil {
 		// Ignore not-found: the object was deleted after the reconcile was queued.
@@ -174,36 +183,7 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// Handle deletion: release StackIT resources, then drop the finalizer.
 	if !bucket.DeletionTimestamp.IsZero() {
-		if !controllerutil.ContainsFinalizer(&bucket, s3v1.BucketFinalizer) {
-			return ctrl.Result{}, nil
-		}
-		if r.Stackit != nil {
-			// Surface that teardown is in progress (visible while a blocked delete —
-			// e.g. a non-empty bucket — keeps the finalizer). Skip re-writing once
-			// already Deleting or once a Failed teardown reason is recorded, so a
-			// blocked delete does not flip-flop Deleting<->Failed and self-trigger
-			// reconciles via the status watch.
-			if bucket.Status.Phase != s3v1.PhaseDeleting && bucket.Status.Phase != s3v1.PhaseFailed {
-				bucket.Status.Phase = s3v1.PhaseDeleting
-				bucket.Status.Message = "releasing StackIT resources"
-				if err := r.Status().Update(ctx, &bucket); err != nil {
-					return ctrl.Result{}, client.IgnoreNotFound(err)
-				}
-			}
-			if err := r.teardown(ctx, &bucket); err != nil {
-				logger.Error(err, "teardown failed; keeping finalizer", "bucket", bucket.EffectiveBucketName())
-				// Keep the finalizer and surface the reason; a non-empty bucket
-				// must not be deleted (data-loss guard, INIT-SETUP.md §0).
-				return r.fail(ctx, &bucket, err)
-			}
-		} else {
-			logger.Info("deleting bucket (skeleton mode: no StackIT teardown)", "bucket", bucket.EffectiveBucketName())
-		}
-		controllerutil.RemoveFinalizer(&bucket, s3v1.BucketFinalizer)
-		if err := r.Update(ctx, &bucket); err != nil {
-			return ctrl.Result{}, client.IgnoreNotFound(err)
-		}
-		return ctrl.Result{}, nil
+		return r.reconcileDelete(ctx, &bucket)
 	}
 
 	// Ensure the finalizer is present before doing any provisioning work, then
@@ -235,7 +215,105 @@ func (r *BucketReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, nil
 	}
 
+	// Fleet-wide provider outage: skip the provider work entirely rather than
+	// re-establishing per Bucket that the provider is still down. See
+	// ProviderBreaker for why this is not a per-error classification.
+	if wait, allowed := r.Breaker.Allow(); !allowed {
+		return r.holdForProvider(ctx, &bucket, wait)
+	}
+
 	return r.reconcileNormal(ctx, &bucket)
+}
+
+// holdForProvider parks a Bucket for the remainder of the breaker's cooldown
+// without touching the provider.
+//
+// It returns no error on purpose. The provider being unreachable is already
+// recorded once, by the failures that opened the breaker; counting it again for
+// every Bucket on every probe interval is what turned a single outage into 242
+// reconcile errors on mgmt-p on 2026-09-02.
+//
+// Status is written only when the record would actually change — the first visit
+// under an open breaker, and the moment the degradation grace runs out. A Bucket
+// already held (or already parked in Failed) is requeued silently, so an outage
+// lasting hours costs no status churn.
+func (r *BucketReconciler) holdForProvider(ctx context.Context, b *s3v1.Bucket, wait time.Duration) (ctrl.Result, error) {
+	if r.providerHoldNeedsWrite(b) {
+		err := fmt.Errorf("%w; next provider probe in %s", errProviderUnavailable, wait.Round(time.Second))
+		if !r.degrade(ctx, b, err) {
+			r.markFailed(ctx, b, err)
+		}
+	}
+	return ctrl.Result{RequeueAfter: wait}, nil
+}
+
+// providerHoldNeedsWrite reports whether holdForProvider would record anything
+// new about b. Everything else is a repeat of a state already on the object.
+func (r *BucketReconciler) providerHoldNeedsWrite(b *s3v1.Bucket) bool {
+	if b.Status.Phase == s3v1.PhaseFailed {
+		// Already parked; the hold has nothing left to add.
+		return false
+	}
+	if b.Status.DegradedSince == nil {
+		// First visit under this outage: record that the hold started.
+		return true
+	}
+	// Held already — the only transition still ahead is the grace running out,
+	// which degrade() turns into a drop to Failed.
+	return r.ProviderDegradedGrace > 0 &&
+		time.Since(b.Status.DegradedSince.Time) >= r.ProviderDegradedGrace
+}
+
+// reconcileDelete releases the StackIT resources behind a Bucket being deleted
+// and then drops the finalizer. Until the teardown has actually completed the
+// finalizer stays, which is what keeps the CR (and with it the record of what
+// has to be cleaned up) alive.
+func (r *BucketReconciler) reconcileDelete(ctx context.Context, b *s3v1.Bucket) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(b, s3v1.BucketFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	if r.Stackit == nil {
+		logger.Info("deleting bucket (skeleton mode: no StackIT teardown)", "bucket", b.EffectiveBucketName())
+		return r.dropFinalizer(ctx, b)
+	}
+
+	// Surface that teardown is in progress (visible while a blocked delete —
+	// e.g. a non-empty bucket — keeps the finalizer). Skip re-writing once
+	// already Deleting or once a Failed teardown reason is recorded, so a
+	// blocked delete does not flip-flop Deleting<->Failed and self-trigger
+	// reconciles via the status watch.
+	if b.Status.Phase != s3v1.PhaseDeleting && b.Status.Phase != s3v1.PhaseFailed {
+		b.Status.Phase = s3v1.PhaseDeleting
+		b.Status.Message = "releasing StackIT resources"
+		if err := r.Status().Update(ctx, b); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+	}
+	// The teardown talks to the provider on every step (empty check, keys,
+	// group, bucket), so it is gated by the breaker like any other provider
+	// work. The finalizer stays, the phase stays Deleting, and the delete
+	// resumes on the next probe.
+	if wait, allowed := r.Breaker.Allow(); !allowed {
+		logger.V(1).Info("provider circuit open; deferring teardown",
+			"bucket", b.EffectiveBucketName(), "retryAfter", wait)
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
+	if err := r.teardown(ctx, b); err != nil {
+		logger.Error(err, "teardown failed; keeping finalizer", "bucket", b.EffectiveBucketName())
+		// Keep the finalizer and surface the reason; a non-empty bucket must not
+		// be deleted (data-loss guard, INIT-SETUP.md §0).
+		return r.fail(ctx, b, err)
+	}
+	r.Breaker.Success()
+	return r.dropFinalizer(ctx, b)
+}
+
+// dropFinalizer releases the CR once its cloud resources are gone.
+func (r *BucketReconciler) dropFinalizer(ctx context.Context, b *s3v1.Bucket) (ctrl.Result, error) {
+	controllerutil.RemoveFinalizer(b, s3v1.BucketFinalizer)
+	return ctrl.Result{}, client.IgnoreNotFound(r.Update(ctx, b))
 }
 
 // reconcileNormal provisions the bucket, credentials and isolation policy. Every
@@ -314,6 +392,9 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	if err := r.Status().Update(ctx, b); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	// The provider answered every call in this pass, so it is reachable: close
+	// the breaker even if earlier Buckets in this sweep failed.
+	r.Breaker.Success()
 	logger.Info("bucket provisioned", "bucket", name, "requested", b.Spec.BucketName, "credentialsGroup", creds.gid)
 	r.event(b, corev1.EventTypeNormal, s3v1.ReasonProvisioned, "bucket and isolated workload credentials provisioned")
 	// Requeue on a timer so drift (notably a policy change from an operator
@@ -1191,6 +1272,17 @@ func (r *BucketReconciler) fail(ctx context.Context, b *s3v1.Bucket, err error) 
 	if !r.degrade(ctx, b, err) {
 		r.markFailed(ctx, b, err)
 	}
+	// Every failure routed here is non-definitive by construction (definitive
+	// faults use failNoRequeue), which is exactly the input the breaker wants.
+	if wait, open := r.Breaker.Failure(); open {
+		// The breaker has taken over the retry schedule. Returning the error
+		// would additionally requeue this Bucket on the workqueue's own backoff
+		// and count the same outage once more; log it here so the reason stays
+		// in the operator log despite the nil return.
+		log.FromContext(ctx).Error(err, "reconcile failed; provider circuit open",
+			"bucket", b.EffectiveBucketName(), "retryAfter", wait)
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
 	return ctrl.Result{}, err
 }
 
@@ -1372,7 +1464,34 @@ func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.bucketsGrantingTo),
 			builder.WithPredicates(granteeCredentialsPredicate),
 		).
+		WithOptions(controller.Options{RateLimiter: bucketRateLimiter()}).
 		Complete(r)
+}
+
+// bucketRateLimiter paces the requeue of failed reconciles.
+//
+// controller-runtime's default starts the per-item backoff at 5ms and adds a
+// fleet-wide allowance of 10 requeues per second. Those numbers are meant for a
+// controller whose reconcile is a few calls against the local API server. This
+// one calls a rate-limited remote API several times per pass, so on a provider
+// outage the default turns every Bucket in the cluster into a retry loop against
+// an endpoint that is already refusing traffic — verified on mgmt-p 2026-09-02,
+// where a provider-side 503 storm became "rate limit on IP level exceeded"
+// eleven minutes later.
+//
+// Starting at a second and capping at a quarter hour keeps a single transient
+// failure cheap (one retry a second later, which is where most of them end)
+// while making a persistent one back off to a rate a remote API does not notice.
+// The fleet-wide allowance is cut to 1/s with a burst of 5 for the same reason.
+//
+// Only error requeues pass through here. Watch events use Add and RequeueAfter
+// uses AddAfter, neither of which is rate limited, so the drift resync and
+// event-driven reconciles keep their timing.
+func bucketRateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
+	return workqueue.NewTypedMaxOfRateLimiter(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, 15*time.Minute),
+		&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(1), 5)},
+	)
 }
 
 // granteeCredentialsPredicate scopes the grantee watch to the events that can

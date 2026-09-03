@@ -134,6 +134,21 @@ var (
 		"1 when the operator-wide bucket size measurement gate is on.",
 		nil, nil,
 	)
+
+	// Provider circuit breaker. These two are the honest replacement for
+	// counting a provider outage once per retry: the operator stops reconciling
+	// while the breaker is open, so the outage shows up as a state with a
+	// duration rather than as a rising error counter.
+	providerCircuitOpenDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_provider_circuit_open",
+		"1 while the fleet-wide provider circuit breaker is open and Bucket reconciles are being held.",
+		nil, nil,
+	)
+	providerCircuitOpenedSinceDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds",
+		"Unix time at which the provider circuit breaker last opened; absent while it is closed.",
+		nil, nil,
+	)
 )
 
 // Process-level measurement metrics. Unlike the gauges above these cannot be
@@ -162,6 +177,8 @@ var (
 // every scrape, so the values self-heal and need no per-reconcile bookkeeping.
 type bucketMetricsCollector struct {
 	reader client.Reader
+	// breaker is the fleet-wide provider circuit breaker; nil when disabled.
+	breaker *ProviderBreaker
 	// skeletonMode is true when the operator has no StackIT client.
 	skeletonMode bool
 	// wipeGateEnabled mirrors the --enable-wipe-on-delete feature gate.
@@ -173,9 +190,10 @@ type bucketMetricsCollector struct {
 // RegisterBucketMetrics registers the Bucket collector with the
 // controller-runtime metrics registry served on the metrics endpoint. Call it
 // once per process.
-func RegisterBucketMetrics(reader client.Reader, skeletonMode, wipeGateEnabled, usageGateEnabled bool) {
+func RegisterBucketMetrics(reader client.Reader, breaker *ProviderBreaker, skeletonMode, wipeGateEnabled, usageGateEnabled bool) {
 	ctrlmetrics.Registry.MustRegister(&bucketMetricsCollector{
 		reader:           reader,
+		breaker:          breaker,
 		skeletonMode:     skeletonMode,
 		wipeGateEnabled:  wipeGateEnabled,
 		usageGateEnabled: usageGateEnabled,
@@ -202,12 +220,23 @@ func (c *bucketMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- bucketUsageTruncatedDesc
 	ch <- bucketsUsageEnabledDesc
 	ch <- usageGateDesc
+	ch <- providerCircuitOpenDesc
+	ch <- providerCircuitOpenedSinceDesc
 }
 
 func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(skeletonModeDesc, prometheus.GaugeValue, boolGauge(c.skeletonMode))
 	ch <- prometheus.MustNewConstMetric(wipeGateDesc, prometheus.GaugeValue, boolGauge(c.wipeGateEnabled))
 	ch <- prometheus.MustNewConstMetric(usageGateDesc, prometheus.GaugeValue, boolGauge(c.usageGateEnabled))
+
+	// Emitted unconditionally (0 while closed) so an alert never races an absent
+	// series; the timestamp is absent while closed so `time() - <series>` is the
+	// age of the outage wherever it exists.
+	openedAt, open := c.breaker.OpenedAt()
+	ch <- prometheus.MustNewConstMetric(providerCircuitOpenDesc, prometheus.GaugeValue, boolGauge(open))
+	if open {
+		ch <- prometheus.MustNewConstMetric(providerCircuitOpenedSinceDesc, prometheus.GaugeValue, float64(openedAt.Unix()))
+	}
 
 	// The cached client blocks until the informer cache syncs; bound the wait
 	// so a scrape during startup cannot hang the metrics handler.

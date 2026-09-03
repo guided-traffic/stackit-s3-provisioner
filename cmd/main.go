@@ -53,6 +53,8 @@ func main() {
 	var cloneImage string
 	var driftResyncInterval time.Duration
 	var providerDegradedGrace time.Duration
+	var providerCircuitThreshold int
+	var providerCircuitMaxCooldown time.Duration
 	var usageEnabled bool
 	var usageDefaultEnabled bool
 	var usageInterval time.Duration
@@ -112,6 +114,24 @@ func main() {
 			"marks every Bucket unhealthy at once. After the grace the Bucket drops to Failed as "+
 			"before. A structured 401/403 from the API is definitive and never held. Set to 0 to "+
 			"disable the hold. Can also be set via PROVIDER_DEGRADED_GRACE.")
+	flag.IntVar(&providerCircuitThreshold, "provider-circuit-threshold",
+		envIntOrDefault("PROVIDER_CIRCUIT_THRESHOLD", controller.DefaultCircuitThreshold),
+		"How many Bucket reconciles must fail back to back, with no successful reconcile "+
+			"in between, before the operator stops calling the StackIT API altogether and "+
+			"holds every Bucket until a probe succeeds. An unbroken run of failures is what "+
+			"distinguishes a provider outage from a single broken Bucket, whose failures are "+
+			"interleaved with successes from the rest of the fleet. Holding costs a handful of "+
+			"API calls per outage instead of one per retry per Bucket, and stops the operator "+
+			"from driving a provider blip into an IP-level rate limit. Set to 0 to disable. "+
+			"Can also be set via PROVIDER_CIRCUIT_THRESHOLD.")
+	flag.DurationVar(&providerCircuitMaxCooldown, "provider-circuit-max-cooldown",
+		envDurationOrDefault("PROVIDER_CIRCUIT_MAX_COOLDOWN", controller.DefaultCircuitMaxCooldown),
+		"Upper bound on the wait between provider probes while the circuit is open, and "+
+			"therefore on how long recovery lags behind the provider coming back. The wait "+
+			"starts at 60s and doubles per failed probe up to this cap; 60s rather than less "+
+			"so that a trip outlives a 30s scrape gap and stays visible to the alerting "+
+			"rules that suppress themselves while the circuit is open. "+
+			"Can also be set via PROVIDER_CIRCUIT_MAX_COOLDOWN.")
 	flag.DurationVar(&driftResyncInterval, "drift-resync-interval",
 		envDurationOrDefault("DRIFT_RESYNC_INTERVAL", 10*time.Minute),
 		"How often a provisioned Bucket is re-reconciled so configuration drift "+
@@ -209,6 +229,8 @@ func main() {
 		"enableWipeOnDelete", enableWipeOnDelete,
 		"driftResyncInterval", driftResyncInterval,
 		"providerDegradedGrace", providerDegradedGrace,
+		"providerCircuitThreshold", providerCircuitThreshold,
+		"providerCircuitMaxCooldown", providerCircuitMaxCooldown,
 		"bucketUsageEnabled", usageEnabled,
 		"bucketUsageDefaultEnabled", usageDefaultEnabled,
 		"bucketUsageInterval", usageInterval,
@@ -270,6 +292,8 @@ func main() {
 		}
 	}
 
+	providerBreaker := controller.NewProviderBreaker(providerCircuitThreshold, providerCircuitMaxCooldown)
+
 	if err = (&controller.BucketReconciler{
 		Client:                mgr.GetClient(),
 		Scheme:                mgr.GetScheme(),
@@ -284,6 +308,7 @@ func main() {
 		CloneJobResources:     cloneResources,
 		DriftResyncInterval:   driftResyncInterval,
 		ProviderDegradedGrace: providerDegradedGrace,
+		Breaker:               providerBreaker,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Bucket")
 		os.Exit(1)
@@ -300,7 +325,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	controller.RegisterBucketMetrics(mgr.GetClient(), stackitClient == nil, enableWipeOnDelete, usageEnabled)
+	controller.RegisterBucketMetrics(mgr.GetClient(), providerBreaker, stackitClient == nil, enableWipeOnDelete, usageEnabled)
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")

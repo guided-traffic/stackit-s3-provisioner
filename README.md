@@ -193,11 +193,10 @@ What is **not** held, and drops `Ready` immediately regardless of the grace:
 | A Bucket whose spec changed (`observedGeneration != generation`) | The user asked for something new and it was not achieved. |
 | A Bucket being deleted | Holding `Ready` would hide a teardown blocked by the non-empty data-loss guard. |
 
-Independently of the hold, the reconcile still returns an error, so the retry
-backoff, the `Warning` events and `controller_runtime_reconcile_errors_total` are
-unchanged — the `StackitS3ReconcileErrors` alert fires immediately as before, and
-`StackitS3BucketProviderDegraded` fires while a hold is in effect (see
-[Monitoring](#monitoring)).
+The `Warning` events and `status.message` are unchanged, so the reason a Bucket
+is held is always visible on the object. What is **not** emitted once per retry
+any more is the reconcile error — see
+[the provider circuit breaker](#provider-circuit-breaker) below.
 
 ```yaml
 # values.yaml
@@ -211,6 +210,56 @@ image.
 > for up to the grace window. That is deliberate — a delayed signal is bounded
 > and recoverable, whereas marking the whole fleet unhealthy on the first blip is
 > neither.
+
+### Provider circuit breaker
+
+A provider outage is a property of the provider, not of any one Bucket. While
+the StackIT API answers `503`, reconciling the seventeenth Bucket cannot succeed
+— and attempting it costs API calls that make the outage worse.
+
+Measured on a production cluster on 2026-09-02: a provider-side `503` storm
+starting at 14:23 drove the operator into
+`429 rate limit on IP level exceeded` by 14:34 and into 51 rate-limited requests
+per minute by 14:42. By the end, most of the load on the failing endpoint was the
+operator retrying. One outage that resolved on its own produced **242 reconcile
+errors** and paged twice for something nobody could act on.
+
+The breaker stops that. After `providerCircuit.threshold` reconciles fail back to
+back, the operator stops calling the provider entirely, holds every Bucket, and
+probes on a doubling cooldown (60s, 2m, 4m … capped at
+`providerCircuit.maxCooldown`) until one succeeds.
+
+```yaml
+# values.yaml
+providerCircuit:
+  threshold: 3      # consecutive failures before the operator stops calling out
+  maxCooldown: "5m" # upper bound on the wait between probes
+```
+
+What distinguishes an outage from one broken Bucket is the **absence of any
+successful reconcile** in between, not a classification of the error. A single
+failing Bucket among healthy ones has its failures interleaved with the successes
+of the rest of the fleet, which resets the run — so it keeps reporting its own
+error and never holds anyone else.
+
+While the circuit is open:
+
+| | |
+| --- | --- |
+| Provider calls | none at all, including teardown (the finalizer stays, the delete resumes on the next probe) |
+| Reconcile result | `RequeueAfter` on the breaker's cooldown, **no error** |
+| `controller_runtime_reconcile_errors_total` | counts the outage (`threshold` errors), not the retries |
+| Bucket status | held per `providerDegradedGrace`; `status.degradedSince` is written once, not per probe |
+| Metrics | `stackit_s3_provisioner_provider_circuit_open`, `..._provider_circuit_opened_timestamp_seconds` |
+| Alerting | `StackitS3ReconcileErrors` excludes windows in which the circuit was open; the outage surfaces via `StackitS3BucketProviderDegraded` once the hold has lasted long enough that the drop to `Failed` is close |
+
+The grace is **not** extended by the breaker: a Bucket held past
+`providerDegradedGrace` still drops to `Failed`. The breaker delays reconciles,
+it does not widen the window in which a Bucket may advertise a state nobody
+verified.
+
+Setting `providerCircuit.threshold: 0` disables the breaker without deploying a
+different image.
 
 ## Cloning an existing bucket
 
@@ -562,6 +611,8 @@ the standard controller-runtime and Go collectors plus its own metrics:
 | `stackit_s3_provisioner_buckets_wipe_on_delete` | gauge | Number of `Bucket` resources with `spec.wipeOnDelete: true` |
 | `stackit_s3_provisioner_buckets_provider_degraded` | gauge | Number of `Bucket` resources whose `Ready` state is being [held through provider failures](#ready-during-provider-outages) |
 | `stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds{namespace,name}` | gauge | Unix time at which this Bucket started degrading; **absent** for Buckets that are not degraded — so `time() - <series>` is the age of the degradation wherever the series exists |
+| `stackit_s3_provisioner_provider_circuit_open` | gauge | `1` while the [provider circuit breaker](#provider-circuit-breaker) is open and the operator is not calling StackIT at all. Always present, so an alert expression never races an absent series. |
+| `stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds` | gauge | Unix time at which the circuit last opened; **absent** while closed — so `time() - <series>` is the age of the outage. It does not move when a probe fails, so it measures the outage rather than the last probe interval. |
 | `stackit_s3_provisioner_skeleton_mode` | gauge | `1` while the operator runs without a StackIT service-account key (provisions nothing) |
 | `stackit_s3_provisioner_wipe_on_delete_gate_enabled` | gauge | `1` while the operator-wide `--enable-wipe-on-delete` feature gate is on |
 | `stackit_s3_provisioner_credentials_last_rotation_timestamp_seconds{namespace,name}` | gauge | Unix time of the Bucket's last [credentials rotation](#credentials-rotation); absent for never-rotated Buckets |
@@ -628,8 +679,8 @@ Shipped alerts — every toggle lives under `monitoring.prometheusRule.alerts.<n
 | `StackitS3SkeletonMode` | `skeletonMode` | `critical` | the operator runs without a service-account key for 15m: probes stay green, nothing is provisioned |
 | `StackitS3BucketsWipeOnDelete` | `bucketsWipeOnDelete` | `warning` | at least one `Bucket` carries `spec.wipeOnDelete: true` for 5m — deleting such a CR irreversibly wipes all objects in its bucket |
 | `StackitS3WipeRequestedButGateDisabled` | `wipeRequestedButGateDisabled` | `warning` | Buckets request `spec.wipeOnDelete` while the operator-wide gate (`wipeOnDelete.enabled`) is off — deletion would silently degrade to the empty-only guard |
-| `StackitS3ReconcileErrors` | `reconcileErrors` | `warning` | more than 3 reconcile errors within 15m (controller-runtime's built-in `controller_runtime_reconcile_errors_total`) |
-| `StackitS3BucketProviderDegraded` | `bucketProviderDegraded` | `warning` | a Bucket's `Ready` state has been [held through provider failures](#ready-during-provider-outages) for 10m. These Buckets still report `Ready=True` to health checks, so this alert is the only signal until the grace elapses. |
+| `StackitS3ReconcileErrors` | `reconcileErrors` | `warning` | more than `threshold` (default `6`) reconcile errors within 15m, sustained for `sustainedFor` (default `15m`), **excluding** windows in which the [provider circuit breaker](#provider-circuit-breaker) was open. A StackIT outage therefore cannot reach this alert; what is left is errors the breaker never recognised — Kubernetes API failures, or single Buckets failing while the fleet reconciles fine. Set `suppressWhileCircuitOpen: false` to alert on provider outages here too. |
+| `StackitS3BucketProviderDegraded` | `bucketProviderDegraded` | `warning` | a Bucket's `Ready` state has been [held through provider failures](#ready-during-provider-outages) for longer than `holdForSeconds` (default `1200` = 20m, i.e. 10m before the default 30m grace runs out). It alerts on the **age** of the hold, not its existence: a provider blip that resolves inside the window is exactly what the hold is for. `holdForSeconds` must stay below `providerDegradedGrace`, or the Bucket drops to `Failed` — and the series disappears — before the alert can fire. |
 | `StackitS3UsageMeasurementFailing` | `usageMeasurementFailing` | `warning` | more than 3 [size measurements](#bucket-size-and-monthly-cost) failed within 30m. A failed measurement keeps the previous values and never marks a Bucket unhealthy, so without this alert the sizes and costs on the CRs go stale silently. |
 | `StackitS3UsageMeasurementTruncated` | `usageMeasurementTruncated` | `warning` | a Bucket keeps hitting `bucketUsage.maxObjects` for 30m: its reported size and cost are lower bounds, which is exactly the state in which a size-based alert under-reports |
 

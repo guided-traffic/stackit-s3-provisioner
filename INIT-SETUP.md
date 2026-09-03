@@ -501,18 +501,122 @@ verzoegertes Signal, begrenzt durch das Grace-Fenster; ein falsch fallengelassen
 **Begrenzung:** `--provider-degraded-grace` (Helm `providerDegradedGrace`,
 Default `30m`, `0` = aus). Nach Ablauf faellt der Bucket wie vorher auf `Failed`.
 Waehrend des Haltens: `status.degradedSince`, Condition `ProviderReachable=False`,
-unveraenderte Warning-Events, und der Reconcile gibt den Fehler weiter zurueck —
-`controller_runtime_reconcile_errors_total` und der bestehende
-`StackitS3ReconcileErrors`-Alarm feuern also sofort wie bisher. Zusaetzlich
-`stackit_s3_provisioner_buckets_provider_degraded` +
-`StackitS3BucketProviderDegraded`, damit das Halten selbst nie stillschweigend
-passiert.
+unveraenderte Warning-Events, `stackit_s3_provisioner_buckets_provider_degraded`
+und `stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds`.
+
+> Nachtrag 2026-09-02: der urspruengliche Satz an dieser Stelle — "der Reconcile
+> gibt den Fehler weiter zurueck, `StackitS3ReconcileErrors` feuert sofort wie
+> bisher" — war als bewusste Nicht-Aenderung gedacht und hat sich als der
+> eigentliche Alarm-Treiber herausgestellt. Siehe §8.4.
 
 **Bewusst NICHT gemacht:** eine Taxonomie transienter Fehlermuster (Stringmatch
 auf `unexpected EOF`, `undefined response type`, 5xx-Listen). Diese Liste ist
 provider-kontrolliert und offen — sie kann nie fertig sein, und jeder nicht
 gelistete Fehler faellt auf den falschen Default. Die hier gepflegte Liste
 definitiver Faelle ist geschlossen und gehoert uns.
+
+### 8.4 Provider-Circuit-Breaker — implementiert (2026-09-02)
+
+**Befund (read-only in Prometheus + Operator-Logs auf mgmt-p, 2026-09-02).**
+§8.2 hat `Ready` stabilisiert, aber nicht die Alarme. Beide Alarme
+(`StackitS3ReconcileErrors`, `StackitS3BucketProviderDegraded`) feuerten weiter
+bei Provider-Ausfaellen, die sich von allein aufloesen.
+
+Fehler-Zeitleiste des letzten Vorfalls (Operator-Log, UTC; 22 Bucket-CRs):
+
+```
+14:23  11x 503   (nginx-HTML-Seite, StackIT-Edge)
+14:29  17x 503
+14:34  19x 503 + 14x 429  <- erste IP-Rate-Limits
+14:40  19x 503 + 21x 429
+14:41  20x 503 + 11x 429
+14:42  20x 503 + 51x 429
+14:43  vorbei, self-healed
+```
+
+429-Body: `{"status":429,"error":"Too Many Requests","message":"rate limit on IP
+level exceeded; please try again later"}`.
+
+**Kausalitaet ist in der Reihenfolge sichtbar:** 503 kommt zuerst (14:23), 429
+erst elf Minuten spaeter (14:34). Der Provider-Edge faellt aus, der Operator
+haemmert anschliessend sein eigenes IP-Rate-Limit voll und verlaengert damit den
+Ausfall, auf den er reagiert. `sum(increase(controller_runtime_reconcile_errors_total{controller="bucket"}[15m]))`
+erreichte **220**; Alarmschwelle war `> 3` mit `for: 0`. Ein Ausfall, 242
+Reconcile-Fehler, zwei Pages, nichts zu tun.
+
+**Zwei Verstaerker, beide im eigenen Code:**
+
+1. **Kein Workqueue-RateLimiter am `bucket`-Controller.** `Complete(r)` ohne
+   `WithOptions` ⇒ controller-runtime-Default: Exponential-Backoff ab **5 ms**,
+   fleetweit 10 qps / Burst 100. Gedacht fuer Controller, deren Reconcile ein
+   paar Calls gegen den lokalen API-Server macht.
+2. **`retryTransport` retryte 429** (fix 200ms/600ms, ohne `Retry-After`), und
+   das pro GET dreifach. Ein Rate-Limit erneut anzufragen ist die eine Antwort,
+   die ihn garantiert vertieft.
+
+Dazu ein Grundrauschen von ~1 Fehler/15m: `read: connection reset by peer` auf
+gepoolten Keep-Alive-Verbindungen (`http.DefaultTransport`, `IdleConnTimeout`
+90s). Trippt die Schwelle nie allein, macht sie aber billig zu ueberschreiten.
+
+**Loesung — vier Schichten:**
+
+| # | Aenderung | Ort |
+| - | --------- | --- |
+| 1 | Workqueue-RateLimiter: exponentiell ab 1s bis 15min, fleetweit 1 qps / Burst 5 | `bucketRateLimiter`, `SetupWithManager` |
+| 2 | 429 nicht mehr retryen; `IdleConnTimeout` 30s (Client schliesst vor dem Edge) | `stackit/retry.go` |
+| 3 | Fleetweiter Circuit-Breaker | `internal/controller/breaker.go` |
+| 4 | Alarme auf Handlungsbedarf statt auf Burst | `prometheusrule.yaml` |
+
+**Der Diskriminator des Breakers ist bewusst keine Fehler-Klassifikation**,
+sondern das **Ausbleiben eines erfolgreichen Reconciles**: ein einzelner kaputter
+Bucket unter gesunden hat seine Fehler mit den Erfolgen der uebrigen Flotte
+verschraenkt, was den Lauf zuruecksetzt; ein fleetweiter Ausfall erzeugt eine
+ununterbrochene Fehlerkette. Das haelt den Breaker aus dem Geschaeft des
+Fehler-Parsens heraus, das der Operator in §8.2 schon abgelehnt hat.
+
+Verhalten bei offenem Circuit:
+
+- **kein** Provider-Call, auch nicht im Teardown (Finalizer bleibt, Delete setzt
+  beim naechsten Probe fort);
+- Reconcile liefert `RequeueAfter` und **keinen** Fehler — der Fehler wird
+  weiterhin geloggt, erzeugt Warning-Events und steht in `status.message`;
+- Probe-Kadenz 60s, verdoppelnd bis `--provider-circuit-max-cooldown` (5m).
+  60s als Basis, weil der offene Zustand *beobachtbar* sein muss: der Chart
+  scrapet alle 30s, und der `StackitS3ReconcileErrors`-Alarm unterdrueckt sich
+  fuer Fenster mit offenem Circuit;
+- `status.degradedSince` wird **einmal** geschrieben, nicht pro Probe;
+- die Grace laeuft weiter — ein zu lange gehaltener Bucket faellt weiterhin auf
+  `Failed`. Der Breaker verzoegert Reconciles, er verbreitert nicht das Fenster,
+  in dem ein Bucket einen unverifizierten Zustand behaupten darf.
+
+`--provider-circuit-threshold=0` (Helm `providerCircuit.threshold`) schaltet ihn
+ab — Values-only-Rollback ohne neues Image.
+
+**Alarme:**
+
+- `StackitS3ReconcileErrors`: `> 6` Fehler/15m, `for: 15m`, **`unless on()`
+  Fenster mit offenem Circuit**. Ein StackIT-Ausfall erreicht diesen Alarm damit
+  gar nicht mehr; uebrig bleiben Fehler, die der Breaker nie als Provider-Ausfall
+  erkannt hat (Kubernetes-API, einzelne Buckets bei gesunder Flotte). Die
+  `unless`-Form ist fail-open: fehlt die Circuit-Metrik (aelterer Operator),
+  entfernt sie nichts und der Alarm verhaelt sich wie vorher.
+- `StackitS3BucketProviderDegraded`: `max(time() - ..._bucket_degraded_since_timestamp_seconds) > 1200`
+  statt `max(..._buckets_provider_degraded) > 0` mit `for: 10m`. Alarmiert also
+  auf das **Alter** des Haltens, nicht auf dessen Existenz. `holdForSeconds` muss
+  unter `providerDegradedGrace` bleiben: nach Ablauf der Grace faellt der Bucket
+  auf `Failed`, die Serie verschwindet (der Collector emittiert sie nur bei
+  `phase == Ready`) und `StackitS3BucketFailed` uebernimmt.
+
+**Neue Metriken:** `stackit_s3_provisioner_provider_circuit_open` (immer
+vorhanden, damit kein Alarm gegen eine fehlende Serie rennt) und
+`..._provider_circuit_opened_timestamp_seconds` (nur bei offenem Circuit; bewegt
+sich beim fehlgeschlagenen Probe **nicht**, misst also den Ausfall statt des
+letzten Probe-Intervalls).
+
+**Bewusst NICHT gemacht:** ein eigener Alarm auf den offenen Circuit. Er wuerde
+zeitgleich mit `StackitS3BucketProviderDegraded` feuern und dieselbe Sache zweimal
+melden. Der Circuit ist Observability (Dashboard, Alarm-Unterdrueckung), das
+Halten ist das, worauf man reagiert.
 
 ### 8.3 Bucket-Groesse + Kostenschaetzung (`spec.usage`) — implementiert (2026-09-01)
 

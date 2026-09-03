@@ -117,20 +117,26 @@ spec:
         {{- end }}
         {{- if $alerts.bucketProviderDegraded.enabled }}
         - alert: StackitS3BucketProviderDegraded
-          expr: max(stackit_s3_provisioner_buckets_provider_degraded) > 0
-          for: 10m
+          expr: >-
+            max(time() - stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds)
+            > {{ $alerts.bucketProviderDegraded.holdForSeconds }}
+          for: 1m
           labels:
             severity: warning
           annotations:
-            summary: Bucket Ready state is being held through provider failures
+            summary: Bucket Ready state has been held through provider failures for too long
             description: >-
-              {{ `{{ $value }}` }} Bucket resource(s) keep failing to reconcile
-              while their Ready condition is deliberately held True
-              (providerDegradedGrace). They still report Ready to health checks,
-              so this alert is the only signal until the grace elapses and they
-              drop to Failed. Inspect status.degradedSince and the
-              ProviderReachable condition, and check whether the StackIT API is
-              reachable from the operator.
+              A Bucket's Ready condition has been held True through failing
+              reconciles for over {{ $alerts.bucketProviderDegraded.holdForSeconds }}s
+              (providerDegradedGrace is {{ $.Values.providerDegradedGrace }}). Short
+              provider outages resolve inside this window and deliberately do NOT
+              alert; reaching it means the drop to Failed is close. Inspect
+              status.degradedSince and the ProviderReachable condition, check
+              stackit_s3_provisioner_provider_circuit_open for whether the operator
+              has stopped calling the provider altogether, and check whether the
+              StackIT API is reachable from the operator. The per-Bucket series
+              stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds names
+              which Buckets are affected.
         {{- end }}
         {{- if $alerts.usageMeasurementFailing.enabled }}
         - alert: StackitS3UsageMeasurementFailing
@@ -162,15 +168,33 @@ spec:
         {{- end }}
         {{- if $alerts.reconcileErrors.enabled }}
         - alert: StackitS3ReconcileErrors
-          expr: sum(increase(controller_runtime_reconcile_errors_total{controller="bucket"}[15m])) > 3
+          expr: >-
+            (
+              sum(increase(controller_runtime_reconcile_errors_total{controller="bucket"}[15m]))
+              > {{ $alerts.reconcileErrors.threshold }}
+            )
+            {{- if $alerts.reconcileErrors.suppressWhileCircuitOpen }}
+            unless on()
+            (max_over_time(stackit_s3_provisioner_provider_circuit_open[15m]) > 0)
+            {{- end }}
+          for: {{ $alerts.reconcileErrors.sustainedFor }}
           labels:
             severity: warning
           annotations:
             summary: Bucket reconciler keeps erroring
             description: >-
               {{ `{{ $value | humanize }}` }} Bucket reconcile errors within 15
-              minutes — transient StackIT API or Kubernetes API failures that
-              have not (yet) parked a Bucket in Failed. Check the operator logs.
+              minutes, sustained for {{ $alerts.reconcileErrors.sustainedFor }}.
+              {{- if $alerts.reconcileErrors.suppressWhileCircuitOpen }}
+              Windows in which the provider circuit breaker was open are excluded,
+              so these are NOT a StackIT outage: the breaker trips after
+              {{ $.Values.providerCircuit.threshold }} consecutive failures and a
+              provider outage is reported by StackitS3BucketProviderDegraded
+              instead. What is left is errors the breaker never recognised —
+              Kubernetes API failures, or single Buckets failing while the rest of
+              the fleet reconciles fine.
+              {{- end }}
+              Check the operator logs and status.message on the affected Buckets.
         {{- end }}
 {{- end }}
 {{- end }}

@@ -14,11 +14,25 @@ const (
 	// one. Total added latency in the worst case stays well under a second, so a
 	// retrying request never outlives a reconcile.
 	retryBackoff = 200 * time.Millisecond
+	// idleConnTimeout is how long a pooled keep-alive connection may sit unused
+	// before this client closes it. It is deliberately far below
+	// http.DefaultTransport's 90s.
+	//
+	// The operator talks to the API in bursts (one per drift resync) and is then
+	// idle for minutes, so every burst after the first reuses a connection the
+	// provider's edge may already have dropped. That surfaces as
+	// "read: connection reset by peer" on a GET, which retryTransport then
+	// re-runs against the next equally stale connection in the pool. Closing
+	// first turns those into a fresh dial instead of an error.
+	//
+	// Not verified: the edge's own idle timeout. 30s is chosen to sit below any
+	// plausible value rather than to match a measured one.
+	idleConnTimeout = 30 * time.Second
 )
 
 // retryTransport retries a control-plane request whose failure carries no
 // information about the request itself: a transport error (connection reset,
-// unexpected EOF, timeout) or a 5xx/429 from the server. It exists because the
+// unexpected EOF, timeout) or a 5xx from the server. It exists because the
 // STACKIT SDK does not retry — config.WithMaxRetries has been a no-op since
 // core v0.26.0 — so a single dropped connection surfaces as a failed reconcile.
 //
@@ -41,14 +55,30 @@ type retryTransport struct {
 	backoff  time.Duration
 }
 
-// newRetryTransport builds the transport on top of http.DefaultTransport, whose
-// connection pooling the SDK relies on. attempts is floored at 1 so a
-// misconfiguration degrades to "no retries" rather than to no request at all.
+// newRetryTransport builds the transport on top of a clone of
+// http.DefaultTransport, keeping the connection pooling the SDK relies on but
+// with a shorter idle timeout (see idleConnTimeout). attempts is floored at 1 so
+// a misconfiguration degrades to "no retries" rather than to no request at all.
 func newRetryTransport(attempts int, backoff time.Duration) *retryTransport {
 	if attempts < 1 {
 		attempts = 1
 	}
-	return &retryTransport{base: http.DefaultTransport, attempts: attempts, backoff: backoff}
+	return &retryTransport{base: newBaseTransport(), attempts: attempts, backoff: backoff}
+}
+
+// newBaseTransport clones http.DefaultTransport and shortens its idle timeout.
+// Cloning rather than mutating the shared default keeps the change local to this
+// client; mutating it would reach every other HTTP user in the process.
+func newBaseTransport() *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Unreachable with the standard library, but a type assertion that can
+		// fail must not panic a running operator.
+		return &http.Transport{IdleConnTimeout: idleConnTimeout}
+	}
+	t := base.Clone()
+	t.IdleConnTimeout = idleConnTimeout
+	return t
 }
 
 // RoundTrip implements http.RoundTripper.
@@ -94,8 +124,18 @@ func retryableRequest(req *http.Request) bool {
 
 // retryableResult reports whether the outcome of an attempt says nothing about
 // the request and is therefore worth repeating: any transport error, or a
-// server-side 5xx / 429. A 4xx other than 429 is the API's answer and repeating
-// it would only produce the same answer.
+// server-side 5xx. Every 4xx is an answer, and repeating it produces the same
+// answer.
+//
+// 429 is deliberately NOT retried, even though it is transient. It is the one
+// status that says "you are sending too much", so repeating the request is the
+// only reply guaranteed to make things worse. Verified on mgmt-p 2026-09-02: a
+// 503 storm from the provider edge at 14:23 turned into
+// "rate limit on IP level exceeded" at 14:34 and escalated to 51 rate-limited
+// requests per minute by 14:42, with this transport multiplying every GET by
+// three throughout. Backing off from a 429 belongs to the workqueue and the
+// provider circuit breaker, which act on the whole fleet rather than on one
+// in-flight request.
 func retryableResult(resp *http.Response, err error) bool {
 	if err != nil {
 		return true
@@ -103,8 +143,7 @@ func retryableResult(resp *http.Response, err error) bool {
 	if resp == nil {
 		return false
 	}
-	return resp.StatusCode >= http.StatusInternalServerError ||
-		resp.StatusCode == http.StatusTooManyRequests
+	return resp.StatusCode >= http.StatusInternalServerError
 }
 
 // retryingHTTPClient builds the http.Client handed to the SDK. It deliberately
