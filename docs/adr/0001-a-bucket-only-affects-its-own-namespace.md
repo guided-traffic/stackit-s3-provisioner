@@ -7,6 +7,10 @@ Accepted. Date: 2026-09-03. Amended 2026-09-03 by
 credentials groups as well, and the conditional consequence on user-facing write RBAC is
 withdrawn.
 
+The user-facing ClusterRoles shipped 2026-09-03 (`feat(helm): ship aggregated user-facing
+ClusterRoles for Bucket`), aggregated into the built-in `view`/`edit`/`admin` only; the RBAC
+consequence below records why `-edit` has no unaggregated form.
+
 D1 through D6 hold in the tree at this commit. D4's first consequence — the removal of
 `spec.secretRef.namespace` — shipped in commit `2fdb722`
 (`fix: keep the workload credentials Secret in the Bucket namespace`). D2 held for buckets
@@ -114,6 +118,19 @@ namespace is a trust boundary for tenants, not for the operator's own credential
   aggregate it is a privilege decision of the RBAC ticket, not a security precondition.
   *Superseded rule:* while D2 was violated, the role was shipped for explicit per-namespace
   binding only and not aggregated by default.
+  *Amended 2026-09-03 (user-facing RBAC shipped):* the chart's `-view` and `-edit` ClusterRoles
+  ([`clusterrole-view.yaml`](../../deploy/helm/stackit-s3-provisioner/templates/clusterrole-view.yaml),
+  [`clusterrole-edit.yaml`](../../deploy/helm/stackit-s3-provisioner/templates/clusterrole-edit.yaml))
+  are aggregation fragments for the built-in `view`/`edit`/`admin`, and there is no switch to
+  render `-edit` unaggregated. A Bucket acts on Secrets of its namespace on behalf of whoever
+  created it — `spec.cloneFrom.secretRef` is read and used as the clone source (D3), an
+  unowned Secret under `spec.secretRef` is adopted and later deleted (D1) — and the operator
+  cannot check the creator's rights (see the SubjectAccessReview alternative below). Bucket
+  write is therefore only ever handed out together with Secret access in that namespace,
+  which is what `edit`/`admin` guarantee and what a standalone `-edit` binding would split.
+  A subject that needs Bucket write without Secret access needs a consent mechanism on the
+  referenced Secret first, as its own ADR. Pinned by `test/helm/render_test.go` (role shape)
+  and `test/e2e/rbac_test.go` (aggregation via SubjectAccessReview).
 
 ## Alternatives Considered
 
@@ -164,6 +181,7 @@ move every boundary into RBAC on object names.
 * [`api/v1/bucket_types.go`](../../api/v1/bucket_types.go) — `SecretReference` (name only), `LocalBucketReference`, `CloneSourceSecretRef`
 * [`internal/controller/bucket_controller.go`](../../internal/controller/bucket_controller.go) — `upsertSecret`, `deleteSecret`, `bucketsForSecret`, `isAdminSecret`, `specGuardError`, `ensureBucket`, `ownershipTags`, `resolveReadGrants`, `workloadGroupName`
 * [`internal/controller/clone.go`](../../internal/controller/clone.go) — clone Job and staging Secret in the operator namespace
+* [`deploy/helm/stackit-s3-provisioner/templates/`](../../deploy/helm/stackit-s3-provisioner/templates/) — `clusterrole-view.yaml`, `clusterrole-edit.yaml`, the user-facing aggregation fragments
 * [`stackit/client.go`](../../stackit/client.go) — `EnsureCredentialsGroup`, find-or-create by display name (admin group only since ADR 0002)
 * [ADR 0002](0002-a-credentials-group-is-attributed-through-its-bucket.md) — credentials-group attribution, amends D2 and the RBAC consequence
 * [INIT-SETUP.md](../../INIT-SETUP.md) — §0 decision table, §4.1.1 read grants and the group-name collision

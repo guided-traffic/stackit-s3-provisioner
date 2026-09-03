@@ -31,6 +31,25 @@ serviceAccount:
   # If not set and create is true, a name is generated using the fullname template.
   name: ""
 
+# bucketRoles ships the user-facing ClusterRoles for Bucket CRs. The operator's
+# own ClusterRole (clusterrole.yaml) is unaffected by this block.
+bucketRoles:
+  # create renders the <release>-view and <release>-edit ClusterRoles. Both are
+  # aggregation fragments: -view is picked up by the built-in view, edit and
+  # admin ClusterRoles, -edit by edit and admin. Read on a Bucket exposes ids,
+  # URLs, sizes and conditions, never credential material. Write on a Bucket is
+  # the same class of power the built-in edit already holds over PVCs and
+  # Secrets in the namespace (ADR 0001, ADR 0002).
+  #
+  # There is no switch to render -edit without aggregation, on purpose: a Bucket
+  # uses Secrets of its namespace on behalf of whoever created it
+  # (spec.cloneFrom.secretRef, spec.secretRef adoption), so Bucket write access
+  # must only ever be held together with Secret access — which is exactly what
+  # edit and admin guarantee. Do not bind -edit directly to a subject that lacks
+  # Secret read/write in that namespace. Set create to false when user RBAC is
+  # managed out-of-band.
+  create: true
+
 podAnnotations: {}
 podLabels: {}
 

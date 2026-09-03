@@ -101,6 +101,11 @@ test-e2e-stackit: ## Run E2E tests incl. the cloud suite against a running Kind 
 	@echo "Running E2E tests (cloud suite enabled)..."
 	E2E_STACKIT=1 $(GOTEST) -v -tags=e2e -count=1 -timeout=40m ./test/e2e/...
 
+.PHONY: test-helm-render
+test-helm-render: ## Render the Helm chart and assert on the user-facing RBAC objects (needs helm on PATH).
+	@echo "Running Helm render tests..."
+	$(GOTEST) -v -tags=helm -count=1 ./test/helm/...
+
 ##@ Security
 
 .PHONY: gosec
@@ -238,6 +243,8 @@ e2e-local: kind-create ## Run full E2E test locally with Kind (skeleton mode, no
 	docker build -f Containerfile -t $(E2E_IMG) .
 	@echo "Loading E2E image into Kind cluster..."
 	kind load docker-image $(E2E_IMG) --name $(KIND_CLUSTER)
+	@echo "Render-checking Helm chart..."
+	$(MAKE) test-helm-render
 	@echo "Installing operator via Helm..."
 	helm install stackit-s3-provisioner $(HELM_CHART_DIR) \
 		--namespace stackit-s3-provisioner-system \
