@@ -415,7 +415,7 @@ func (r *BucketReconciler) specGuardError(b *s3v1.Bucket) error {
 	if r.isAdminSecret(b) {
 		return fmt.Errorf(
 			"secretRef %s/%s targets the operator's admin credentials Secret; refusing to provision",
-			b.SecretNamespace(), b.Spec.SecretRef.Name)
+			b.Namespace, b.Spec.SecretRef.Name)
 	}
 	if b.GetRegion() != r.Stackit.Region() {
 		return fmt.Errorf(
@@ -723,7 +723,7 @@ func (e *ownershipCollisionError) Error() string {
 // point the workload's published credential is known dead, which the degraded
 // hold must not paper over.
 func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1.Bucket, groupID, host, bucketURL string) (string, error) {
-	secretKey := types.NamespacedName{Name: b.Spec.SecretRef.Name, Namespace: b.SecretNamespace()}
+	secretKey := types.NamespacedName{Name: b.Spec.SecretRef.Name, Namespace: b.Namespace}
 
 	var sec corev1.Secret
 	getErr := r.Get(ctx, secretKey, &sec)
@@ -757,7 +757,7 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 		Endpoint:        host,
 		BucketURL:       bucketURL,
 	})
-	if err := r.upsertSecret(ctx, b, secretKey, data); err != nil {
+	if err := r.upsertSecret(ctx, b, secretKey.Name, data); err != nil {
 		// The secret_access_key cannot be recovered, so a key whose Secret write
 		// failed is worthless — delete it to avoid an orphan.
 		if delErr := r.Stackit.DeleteAccessKey(ctx, groupID, ak.KeyID); delErr != nil {
@@ -995,10 +995,12 @@ func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
 	return r.deleteSecret(ctx, b)
 }
 
-// isAdminSecret reports whether a Bucket's resolved credentials Secret is the
-// operator-owned bootstrap admin Secret.
+// isAdminSecret reports whether a Bucket's credentials Secret is the
+// operator-owned bootstrap admin Secret. Credentials Secrets always live in
+// their Bucket's namespace, so only a Bucket in the operator namespace can
+// name it.
 func (r *BucketReconciler) isAdminSecret(b *s3v1.Bucket) bool {
-	return b.Spec.SecretRef.Name == r.AdminSecretName && b.SecretNamespace() == r.AdminSecretNamespace
+	return b.Spec.SecretRef.Name == r.AdminSecretName && b.Namespace == r.AdminSecretNamespace
 }
 
 // prepareBucketForDelete enforces the data-loss guard before teardown removes
@@ -1197,14 +1199,14 @@ func (r *BucketReconciler) ensureAdmin(ctx context.Context) (*adminCreds, error)
 	return ac, nil
 }
 
-// upsertSecret creates or updates the workload credentials Secret, merging the
-// provisioned data keys in without disturbing unrelated entries. A controller
-// owner reference is set only when the Secret shares the Bucket's namespace
-// (cross-namespace owner references are not permitted).
-func (r *BucketReconciler) upsertSecret(ctx context.Context, b *s3v1.Bucket, key types.NamespacedName, data map[string][]byte) error {
+// upsertSecret creates or updates the workload credentials Secret in the
+// Bucket's namespace, merging the provisioned data keys in without disturbing
+// unrelated entries. The Bucket is set as controller owner, so the Secret is
+// garbage-collected together with its Bucket.
+func (r *BucketReconciler) upsertSecret(ctx context.Context, b *s3v1.Bucket, name string, data map[string][]byte) error {
 	sec := &corev1.Secret{}
-	sec.Name = key.Name
-	sec.Namespace = key.Namespace
+	sec.Name = name
+	sec.Namespace = b.Namespace
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sec, func() error {
 		if sec.Labels == nil {
 			sec.Labels = map[string]string{}
@@ -1217,10 +1219,7 @@ func (r *BucketReconciler) upsertSecret(ctx context.Context, b *s3v1.Bucket, key
 		for k, v := range data {
 			sec.Data[k] = v
 		}
-		if key.Namespace == b.Namespace {
-			return controllerutil.SetControllerReference(b, sec, r.Scheme)
-		}
-		return nil
+		return controllerutil.SetControllerReference(b, sec, r.Scheme)
 	})
 	return err
 }
@@ -1253,7 +1252,7 @@ func (r *BucketReconciler) writeAdminSecret(ctx context.Context, key types.Names
 func (r *BucketReconciler) deleteSecret(ctx context.Context, b *s3v1.Bucket) error {
 	sec := &corev1.Secret{}
 	sec.Name = b.Spec.SecretRef.Name
-	sec.Namespace = b.SecretNamespace()
+	sec.Namespace = b.Namespace
 	if err := r.Delete(ctx, sec); err != nil {
 		return client.IgnoreNotFound(err)
 	}
@@ -1419,9 +1418,9 @@ func (r *BucketReconciler) event(b *s3v1.Bucket, eventtype, reason, note string)
 // Besides owning Bucket objects, it watches the workload credentials Secrets it
 // provisions: if such a Secret is deleted or altered out from under the
 // operator, the owning Bucket is re-queued and ensureAccessKeyAndSecret mints a
-// fresh key and re-writes the Secret. The mapping matches on the resolved secret
-// name+namespace, so it covers cross-namespace secretRefs too (where an owner
-// reference cannot exist). The predicate limits the watch to operator-managed
+// fresh key and re-writes the Secret. The mapping matches on the secret name
+// within the Secret's own namespace, because a credentials Secret always lives
+// in its Bucket's namespace. The predicate limits the watch to operator-managed
 // Secrets so unrelated Secret churn does not wake the controller.
 //
 // The Bucket watch itself only fires on generation or annotation changes (plus
@@ -1584,13 +1583,13 @@ func isManagedSecret(obj client.Object) bool {
 	return obj.GetLabels()[managedByLabel] == managedByValue
 }
 
-// bucketsForSecret maps a Secret event to the Bucket(s) whose resolved
-// secretRef targets that Secret, so a deleted or mutated credentials Secret
-// re-triggers reconcile. Matching by name+namespace (rather than owner
-// reference) also covers cross-namespace secretRefs.
+// bucketsForSecret maps a Secret event to the Bucket(s) in the same namespace
+// whose secretRef names that Secret, so a deleted or mutated credentials Secret
+// re-triggers reconcile. Credentials Secrets always live in their Bucket's
+// namespace, so only that namespace is listed.
 func (r *BucketReconciler) bucketsForSecret(ctx context.Context, obj client.Object) []ctrl.Request {
 	var buckets s3v1.BucketList
-	if err := r.List(ctx, &buckets); err != nil {
+	if err := r.List(ctx, &buckets, client.InNamespace(obj.GetNamespace())); err != nil {
 		log.FromContext(ctx).Error(err, "listing buckets for secret-triggered reconcile",
 			"secret", client.ObjectKeyFromObject(obj))
 		return nil
@@ -1598,7 +1597,7 @@ func (r *BucketReconciler) bucketsForSecret(ctx context.Context, obj client.Obje
 	var reqs []ctrl.Request
 	for i := range buckets.Items {
 		b := &buckets.Items[i]
-		if b.Spec.SecretRef.Name == obj.GetName() && b.SecretNamespace() == obj.GetNamespace() {
+		if b.Spec.SecretRef.Name == obj.GetName() {
 			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
 				Namespace: b.Namespace, Name: b.Name,
 			}})

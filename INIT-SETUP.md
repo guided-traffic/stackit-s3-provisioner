@@ -11,6 +11,7 @@
 | Region | **`eu01`** (Single-Region, v1). Code dennoch region-parametrisiert. |
 | Lösch-Semantik | **Nur löschen wenn Bucket leer** — sonst Reconcile-Fehler, kein Datenverlust. |
 | Key-Rotation | **v1: Keys ohne Ablauf**, keine Auto-Rotation. Rotation später nachrüstbar. |
+| Namespace-Wirkungsradius (2026-09-03) | **Eine namespaced Ressource wie `Bucket` wirkt nur auf ihren eigenen Namespace** — Cluster-Objekte nur im eigenen Namespace, Cloud-Objekte eindeutig via `namespace/name` zugeordnet, Referenzen nur im eigenen Namespace, kein Spec-Feld darf das aufweichen. Erste Konsequenz: `spec.secretRef.namespace` entfernt. Regeln, Migration und die offene Verletzung (Group-Namenskollision) in [ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md). Ab hier leben Entscheidungen in `docs/adr/`. |
 
 ## 1. Ziel
 
@@ -261,6 +262,11 @@ Mit ≥1 Reader kommt ein drittes Statement dazu, und Stmt 1 nimmt die Reader in
    noch zu klären → Q2.
 4. **Default-Credentials-Group hat breiten Zugriff.** Für Layer 2 nie die Default-Group
    an Workloads geben — immer dedizierte Groups + restriktive Policy.
+5. **Ein `Bucket` wirkt nur auf seinen eigenen Namespace** ([ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md)). Kein
+   Spec-Feld einführen, das ein Cluster-Objekt in einem fremden Namespace erzeugt, ändert
+   oder löscht oder eine Referenz über Namespace-Grenzen auflöst. Konkret: kein
+   `namespace`-Feld an `secretRef` wieder einführen — es wäre ein Secret-Write/Delete-
+   Primitiv über Namespace-Grenzen für jeden, der Bucket-CRs anlegen darf.
 
 ## 6. Offene Fragen (zu klären, bevor Code beginnt)
 

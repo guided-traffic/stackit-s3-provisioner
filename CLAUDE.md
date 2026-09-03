@@ -13,6 +13,33 @@ Source-of-Truth fürs Live-Credential, Policy self-heilend bei Drift. **Ohne SA-
 (`Ready=NotImplemented`, kein Cloud-Call — envtest deckt das ab). Detaillierte Findings:
 **`INIT-SETUP.md`** (Quelle der Wahrheit). Go-Modul: `github.com/guided-traffic/stackit-s3-provisioner`.
 
+## Architecture Decision Records — das Grundgesetz dieses Repos
+
+[`docs/adr/`](docs/adr/README.md) ist das Grundgesetz, mit dem in diesem Repo gebaut wird. Jede
+dauerhafte Architekturentscheidung steht dort als ADR; Format und Index in
+[`docs/adr/README.md`](docs/adr/README.md). Die ADRs sind bindend, nicht historisch: Code,
+Helm-Chart und Doku sind Ausdruck der ADRs, nicht umgekehrt. CLAUDE.md beschreibt die ADRs
+**nicht einzeln** — was gilt, steht im Index und in den ADRs selbst.
+
+Verfahren fuer jede Arbeit in diesem Repo:
+
+1. **Vor der Umsetzung gegen die ADRs pruefen.** Eine Funktion, ein Fix oder ein Umbau muss mit
+   allen ADRs im Einklang stehen. Steht eine Anforderung im Widerspruch zu einem ADR, wird
+   **nicht implementiert**, sondern der Konflikt benannt (welcher ADR, welche Regel `Dn`, was
+   genau kollidiert) und eine **explizite Freigabe des Nutzers** zum Umschreiben des ADRs
+   eingeholt. Erst mit der Freigabe wird der ADR geaendert — Amendment mit Datum in `Status`,
+   neue Regel in `Decision`, alte Regel markiert statt geloescht — und dann der Code, im selben
+   Change.
+2. **Neue Architekturentscheidungen fuehren zu neuen ADRs, immer mit dem Nutzer abgestimmt.**
+   Eine Entscheidung ist architektonisch, wenn sie kuenftige Aenderungen bindet: Trust-Boundary,
+   Form der API/CRD, Loesch-, Fehler- oder Rotationssemantik, Betriebs- und Privilegienmodell,
+   Migrationspfade. Wer beim Bauen auf so eine Entscheidung stoesst, entscheidet nicht still im
+   Code, sondern stimmt Entscheidung und ADR-Text mit dem Nutzer ab und legt den ADR mit
+   derselben Aenderung an.
+3. **Vor einer Verhaltensaenderung den passenden ADR lesen**; das ist Teil der Aufgabe, nicht
+   optional. Aeltere Entscheidungen (vor 2026-09-03) stehen in `INIT-SETUP.md` §0 und sind nicht
+   als ADR nachgetragen.
+
 ## Repo-Layout
 
 ```
@@ -50,6 +77,7 @@ Makefile / Containerfile / renovate.json CI-Gerüst (an Valkey-Operator orientie
 .github/workflows/                       release.yml (Test+Release), build.yml (Docker+Helm), renovate.yml
 account-1.json / account-2.json          SA-Keys (ECHTE RSA-Private-Keys, .gitignore'd, NIE committen)
 INIT-SETUP.md                            Vollständige Findings, Policy-Templates, offene Fragen
+docs/adr/                                Architecture Decision Records (README.md = Format + Index)
 ```
 
 ## Build & Test
@@ -97,6 +125,8 @@ Zwei Ebenen:
    + `Deny Principal workload NotAction [object-ops]` (kein Bucket-Management). Reines `Allow` isoliert NICHT.
 4. **Admin-Group immer in `NotPrincipal`** lassen → sonst Lockout (StorageGRID kann Account-Root aussperren).
 5. `secretAccessKey` nur **1× bei Create** verfügbar → sofort sichern.
+6. **Ein `Bucket` wirkt nur auf seinen eigenen Namespace** — Regeln, Konsequenzen und die
+   offene Verletzung stehen in [ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md).
 
 ## SDK-Fallstricke (verifiziert)
 
@@ -149,6 +179,9 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   - `Bucket.ValidateSecretKeys()` — Fehler bei Key-Kollision (zwei Felder → selber Key,
     sonst stiller Datenverlust). Reconciler muss das **vor** dem Secret-Write prüfen.
 - Default-Key-Konstanten: `Default*Key` in `api/v1/bucket_types.go`.
+- Secret liegt **immer** im Namespace des Bucket-CR, mit Controller-OwnerRef (GC mit dem CR).
+  `spec.secretRef.namespace` wurde 2026-09-03 entfernt ([ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md) D1/D4) — ein
+  Cross-Namespace-Ziel war ein Secret-Write/Delete-Primitiv (Sicherheits-Befund 2, behoben).
 
 ## Konventionen
 
@@ -269,12 +302,16 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
    die Gruppe, `ensureAccessKeyAndSecret` löscht den Live-Key des Opfers und schreibt
    einen neuen ins eigene Secret. Fix = längerer/kryptographischer Suffix ⇒ **Migration**
    (alle bestehenden Gruppen würden umbenannt, alte Gruppen + Keys verwaisen). Offen.
-2. **`spec.secretRef.namespace` ungeprüft** (`api/v1/bucket_types.go` `SecretNamespace()`).
-   Einziger Guard ist `isAdminSecret` (ein Name+Namespace). `upsertSecret` merged in ein
-   beliebiges Secret jedes Namespace, `deleteSecret` löscht es beim CR-Delete. Wer irgendwo
-   ein Bucket-CR anlegen darf, hat ein Cross-Namespace-Write/Delete-Primitiv. Offen.
+2. **`spec.secretRef.namespace` ungeprüft** — **BEHOBEN 2026-09-03** ([ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md)):
+   Feld aus der CRD entfernt, `SecretNamespace()` gelöscht, Secret liegt strukturell in
+   `b.Namespace` (immer mit Controller-OwnerRef), `bucketsForSecret` listet nur noch den
+   Namespace des Secrets. Vorher: `upsertSecret` merged in ein beliebiges Secret jedes
+   Namespace, `deleteSecret` löschte es beim CR-Delete → Cross-Namespace-Write/Delete-Primitiv
+   für jeden, der ein Bucket-CR anlegen darf. Migration: ein Bestands-CR mit gesetztem Feld
+   wird vom API-Server auf den eigenen Namespace gepruned → Operator rotiert den Key in ein
+   neues Secret im CR-Namespace, das alte Fremd-Secret verwaist mit totem Key (manuell löschen).
 
-Beide untergraben die Prämisse „Namespace = Trust-Boundary". Doc-Kommentare in
+Befund 1 untergräbt weiterhin die Prämisse „Namespace = Trust-Boundary". Doc-Kommentare in
 `bucket_types.go`, `resolveReadGrants`, README und INIT-SETUP §4.1.1 sind entsprechend
 entschärft — sie behaupten keine Garantie mehr, die der Mechanismus nicht hergibt.
 
@@ -305,7 +342,8 @@ nicht-versionierten Bucket — live verifiziert, dass StorageGRID das beantworte
 korrekt setzt), `TestCloudClone` (echtes rclone-Image, Quelle ist ein zweites Bucket-CR:
 Hold-Invariante, byte-genauer Inhalt, Clone-once). rclone-Image wird im Make-Target aus dem
 gerenderten Chart gelesen und in Kind vorgeladen (kein dritter Pin, kein Registry-Pull im Test).
-**Offen:** (1) die beiden präexistenten Sicherheits-Befunde oben; (2) Q2 (Minimal-Rolle),
+**Offen:** (1) Sicherheits-Befund 1 oben (Group-Namenskollision; Befund 2 behoben 2026-09-03);
+(2) Q2 (Minimal-Rolle),
 Q4 (Bucket-Namensraum).
 RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) — bereits von den cluster-weiten
 Secret-RBAC-Markern abgedeckt.

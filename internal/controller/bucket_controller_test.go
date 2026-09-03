@@ -185,17 +185,17 @@ func TestBucketsForSecret(t *testing.T) {
 		t.Fatalf("add scheme: %v", err)
 	}
 
-	// Default: secret lives in the Bucket's own namespace.
+	// The credentials Secret always lives in the Bucket's own namespace.
 	sameNS := newBucket("app", "data", "uid-1")
 	sameNS.Spec.SecretRef = s3v1.SecretReference{Name: "app-creds"}
-	// Cross-namespace secretRef (no owner reference possible).
-	crossNS := newBucket("app", "logs", "uid-2")
-	crossNS.Spec.SecretRef = s3v1.SecretReference{Name: "shared-creds", Namespace: "platform"}
+	// A namesake Secret in another namespace belongs to that namespace's Bucket only.
+	namesake := newBucket("platform", "logs", "uid-2")
+	namesake.Spec.SecretRef = s3v1.SecretReference{Name: "app-creds"}
 	// Unrelated bucket.
 	other := newBucket("app", "misc", "uid-3")
 	other.Spec.SecretRef = s3v1.SecretReference{Name: "misc-creds"}
 
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sameNS, crossNS, other).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sameNS, namesake, other).Build()
 	r := &BucketReconciler{Client: cl}
 	ctx := context.Background()
 
@@ -208,8 +208,8 @@ func TestBucketsForSecret(t *testing.T) {
 		want []types.NamespacedName
 	}{
 		{"same namespace", secret("app", "app-creds"), []types.NamespacedName{{Namespace: "app", Name: "data"}}},
-		{"cross namespace", secret("platform", "shared-creds"), []types.NamespacedName{{Namespace: "app", Name: "logs"}}},
-		{"name matches but namespace differs", secret("app", "shared-creds"), nil},
+		{"namesake in another namespace maps to that namespace's bucket", secret("platform", "app-creds"), []types.NamespacedName{{Namespace: "platform", Name: "logs"}}},
+		{"name matches but namespace differs", secret("platform", "misc-creds"), nil},
 		{"no match", secret("app", "nobody"), nil},
 	}
 	for _, tc := range cases {
@@ -298,30 +298,23 @@ func TestSecretHasCreds_HonorsKeyOverrides(t *testing.T) {
 func TestIsAdminSecret(t *testing.T) {
 	r := &BucketReconciler{AdminSecretName: "stackit-s3-provisioner-admin", AdminSecretNamespace: "operator-ns"}
 
-	// Exact match (same name, resolved namespace) -> admin secret.
+	// Admin name from a Bucket in the operator namespace -> admin secret.
 	hit := newBucket("operator-ns", "b", "uid")
-	hit.Spec.SecretRef = s3v1.SecretReference{Name: "stackit-s3-provisioner-admin", Namespace: "operator-ns"}
+	hit.Spec.SecretRef = s3v1.SecretReference{Name: "stackit-s3-provisioner-admin"}
 	if !r.isAdminSecret(hit) {
-		t.Error("isAdminSecret = false for a CR targeting the admin secret by name+namespace")
-	}
-
-	// SecretRef.Namespace defaults to the Bucket's namespace when empty.
-	implicit := newBucket("operator-ns", "b", "uid")
-	implicit.Spec.SecretRef = s3v1.SecretReference{Name: "stackit-s3-provisioner-admin"}
-	if !r.isAdminSecret(implicit) {
-		t.Error("isAdminSecret = false when SecretRef.Namespace defaults to the operator namespace")
+		t.Error("isAdminSecret = false for a CR in the operator namespace naming the admin secret")
 	}
 
 	// Different name -> not the admin secret.
 	nameMiss := newBucket("operator-ns", "b", "uid")
-	nameMiss.Spec.SecretRef = s3v1.SecretReference{Name: "team-a-creds", Namespace: "operator-ns"}
+	nameMiss.Spec.SecretRef = s3v1.SecretReference{Name: "team-a-creds"}
 	if r.isAdminSecret(nameMiss) {
 		t.Error("isAdminSecret = true for a differently-named secret in the operator namespace")
 	}
 
-	// Same name, different namespace -> not the admin secret.
+	// Same name from another namespace -> the Secret lands there, never on the admin secret.
 	nsMiss := newBucket("team-a", "b", "uid")
-	nsMiss.Spec.SecretRef = s3v1.SecretReference{Name: "stackit-s3-provisioner-admin", Namespace: "team-a"}
+	nsMiss.Spec.SecretRef = s3v1.SecretReference{Name: "stackit-s3-provisioner-admin"}
 	if r.isAdminSecret(nsMiss) {
 		t.Error("isAdminSecret = true for the admin name in a foreign namespace")
 	}

@@ -23,24 +23,6 @@ func newBucket(namespace string, opts ...func(*Bucket)) *Bucket {
 	return b
 }
 
-func TestSecretNamespace(t *testing.T) {
-	tests := []struct {
-		name      string
-		bucketNS  string
-		secretNS  string
-		expectsNS string
-	}{
-		{name: "defaults to bucket namespace", bucketNS: "team-a", secretNS: "", expectsNS: "team-a"},
-		{name: "explicit secret namespace wins", bucketNS: "team-a", secretNS: "team-b", expectsNS: "team-b"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			b := newBucket(tc.bucketNS, func(b *Bucket) { b.Spec.SecretRef.Namespace = tc.secretNS })
-			assert.Equal(t, tc.expectsNS, b.SecretNamespace())
-		})
-	}
-}
-
 func TestGetRegion(t *testing.T) {
 	b := newBucket("default")
 	assert.Equal(t, "eu01", b.GetRegion(), "empty region defaults to eu01")
@@ -66,7 +48,6 @@ func TestBucketDeepCopy(t *testing.T) {
 func TestDeepCopyRoundTrips(t *testing.T) {
 	b := newBucket("team-a", func(b *Bucket) {
 		b.Spec.Region = "eu02"
-		b.Spec.SecretRef.Namespace = "team-b"
 		b.Spec.SecretRef.Keys = SecretKeys{AccessKeyID: "AK", BucketURL: "URL"}
 		b.Status.AccessKeyID = "AKIA"
 		b.Status.Conditions = []metav1.Condition{{Type: ConditionReady, Status: metav1.ConditionTrue}}
