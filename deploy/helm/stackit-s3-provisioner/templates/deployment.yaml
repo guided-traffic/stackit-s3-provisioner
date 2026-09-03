@@ -64,6 +64,8 @@ spec:
             {{- end }}
             - --drift-resync-interval={{ .Values.driftResyncInterval }}
             - --provider-degraded-grace={{ .Values.providerDegradedGrace }}
+            - --provider-circuit-threshold={{ .Values.providerCircuit.threshold }}
+            - --provider-circuit-max-cooldown={{ .Values.providerCircuit.maxCooldown }}
             - --clone-image={{ .Values.clone.image.repository }}:{{ .Values.clone.image.tag }}
             - --bucket-usage-enabled={{ .Values.bucketUsage.enabled }}
             - --bucket-usage-default-enabled={{ .Values.bucketUsage.defaultEnabled }}

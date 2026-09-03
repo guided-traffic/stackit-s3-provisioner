@@ -85,10 +85,16 @@ driftResyncInterval: "10m"
 #
 # The hold is bounded, so a real outage still surfaces — only later. Once the
 # grace elapses the Bucket drops to Failed exactly as before. While it is held,
-# status.degradedSince and the ProviderReachable condition carry the degradation,
-# the Warning events are unchanged, and the operator keeps returning reconcile
-# errors, so controller_runtime_reconcile_errors_total and the
-# StackitS3ReconcileErrors alert below still fire immediately.
+# status.degradedSince and the ProviderReachable condition carry the degradation
+# and the Warning events are unchanged.
+#
+# Reconcile errors are NOT emitted once per retry any more: providerCircuit below
+# takes over the retry schedule during a fleet-wide outage, so
+# controller_runtime_reconcile_errors_total counts the outage rather than the
+# retries. The signal while a hold is in effect is
+# stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds and the
+# StackitS3BucketProviderDegraded alert, which fires once the hold has lasted
+# long enough that the drop to Failed is close.
 #
 # NOT held (these drop Ready immediately, whatever the grace):
 #   - A structured 400/401/403 from the provider. 401/403 is the Object Storage
@@ -105,6 +111,47 @@ driftResyncInterval: "10m"
 # rejected and crash-loops the operator at startup. Set to "0" to disable the
 # hold and restore the previous behavior without deploying a different image.
 providerDegradedGrace: "30m"
+
+# providerCircuit is the fleet-wide breaker over Bucket reconciles.
+#
+# Why this exists: a provider outage is a property of the provider, not of any
+# one Bucket. While the StackIT API answers 503, reconciling the seventeenth
+# Bucket cannot succeed, and attempting it costs API calls that make the outage
+# worse. Measured on mgmt-p on 2026-09-02: a provider-side 503 storm at 14:23
+# drove the operator into "rate limit on IP level exceeded" by 14:34 and into 51
+# rate-limited requests per minute by 14:42 — by the end, most of the load on the
+# failing endpoint was the operator's own retries. One outage that resolved on its
+# own produced 242 reconcile errors and paged twice.
+#
+# With the breaker, that outage costs a handful of API calls: after `threshold`
+# reconciles fail back to back the operator stops calling the provider entirely,
+# holds every Bucket, and probes on a doubling cooldown until one succeeds. The
+# failures are still logged, still raise Warning events and still land in
+# status.message — they just stop being counted once per retry.
+#
+# What distinguishes an outage from one broken Bucket is the ABSENCE of any
+# successful reconcile in between, not a classification of the error. A single
+# failing Bucket among healthy ones has its failures interleaved with the
+# successes of the rest of the fleet, which resets the run, so it keeps reporting
+# its own error and never holds anyone else.
+#
+# Observability while open: stackit_s3_provisioner_provider_circuit_open and
+# stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds.
+providerCircuit:
+  # threshold is how many reconciles must fail back to back before the breaker
+  # opens. Set to 0 to disable the breaker entirely, which restores the previous
+  # behavior without deploying a different image.
+  threshold: 3
+  # maxCooldown caps the wait between provider probes while the circuit is open,
+  # and therefore how long recovery lags behind the provider coming back. The
+  # wait starts at 60s and doubles per failed probe up to this cap.
+  #
+  # 60s rather than less because the open state has to be OBSERVABLE, not just
+  # effective: monitoring.serviceMonitor.interval is 30s, and the
+  # StackitS3ReconcileErrors alert below suppresses itself for windows in which
+  # the circuit was open, so a trip must outlive a scrape gap to be seen.
+  # Go duration string WITH A UNIT.
+  maxCooldown: "5m"
 
 # bucketNaming controls how the operator composes the physical StackIT bucket
 # name from a Bucket CR. The rule is applied when a bucket is first provisioned
@@ -312,17 +359,54 @@ monitoring:
       # would silently degrade to the empty-only guard.
       wipeRequestedButGateDisabled:
         enabled: true
-      # reconcileErrors fires (warning) on more than 3 reconcile errors within
-      # 15m (controller-runtime's built-in error counter).
+      # reconcileErrors fires (warning) on sustained reconcile errors
+      # (controller-runtime's built-in error counter).
+      #
+      # It deliberately no longer fires on a burst. A fleet-wide provider outage
+      # trips providerCircuit after a few failures and then stops producing
+      # errors at all, so what reaches this alert is errors the breaker did not
+      # absorb — a persistent problem rather than a provider blip that resolves
+      # on its own. Before the breaker, one such blip on mgmt-p produced 242
+      # errors and paged twice for something nobody could act on.
       reconcileErrors:
         enabled: true
-      # bucketProviderDegraded fires (warning) while a Bucket's Ready state is
-      # being HELD through repeated non-definitive reconcile failures
-      # (providerDegradedGrace above). Ready still reports True, so without this
-      # alert the hold is invisible until the grace elapses and the Bucket drops
-      # to Failed. Fires well inside a 30m grace so the hold is never silent.
+        # threshold is the error count within a 15m window that counts as a
+        # problem. One tripped circuit costs providerCircuit.threshold errors, so
+        # keep this above that or two unrelated outages in one window will page.
+        threshold: 6
+        # sustainedFor is how long the threshold must be exceeded continuously.
+        # Because the expression is a 15m increase, a burst decays below the
+        # threshold within 15m of stopping and never satisfies this.
+        sustainedFor: "15m"
+        # suppressWhileCircuitOpen drops every 15m window in which the provider
+        # circuit breaker was open at any point, so a StackIT outage cannot reach
+        # this alert at all: it is reported by StackitS3BucketProviderDegraded
+        # once the hold has lasted long enough to matter, which is the point at
+        # which there is something to do. What is left here is errors the breaker
+        # never recognised as a provider outage.
+        #
+        # Fail-open by construction: if the circuit metric is missing (an operator
+        # older than this chart, or providerCircuit.threshold=0 on a version that
+        # does not export it), the `unless` clause removes nothing and the alert
+        # behaves as it did before. A scrape interval coarser than 60s can also
+        # miss a single short trip, with the same fail-open result.
+        suppressWhileCircuitOpen: true
+      # bucketProviderDegraded fires (warning) when a Bucket's Ready state has
+      # been HELD through non-definitive reconcile failures for longer than
+      # holdForSeconds. Ready still reports True, so without this alert the hold
+      # is invisible until the grace elapses and the Bucket drops to Failed.
+      #
+      # It alerts on the AGE of the hold, not on its existence: a provider blip
+      # that resolves inside the window is exactly what the hold is for and is
+      # not worth waking anyone. Reaching the window means the drop to Failed is
+      # close and there is still time to act.
       bucketProviderDegraded:
         enabled: true
+        # holdForSeconds must sit below providerDegradedGrace, or the alert can
+        # never fire: once the grace elapses the Bucket drops to Failed, the
+        # degraded series disappears and StackitS3BucketFailed takes over.
+        # 1200s = 20m, leaving 10m of the default 30m grace to react.
+        holdForSeconds: 1200
       # usageMeasurementFailing fires (warning) when bucket size measurements
       # keep failing. Measurement failures deliberately do NOT mark a Bucket
       # unhealthy — the bucket itself is fine, only its size is unknown — so

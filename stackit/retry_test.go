@@ -42,9 +42,6 @@ func TestRetryTransportRecoversFromBlip(t *testing.T) {
 		{"503 then success", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}, 2},
-		{"429 then success", func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusTooManyRequests)
-		}, 2},
 		{"dropped connection then success", func(w http.ResponseWriter, _ *http.Request) {
 			// Hijack and close without a response: the client sees an
 			// unexpected EOF, the shape reported as "ensure bucket: unexpected EOF".
@@ -109,10 +106,16 @@ func TestRetryTransportGivesUp(t *testing.T) {
 // TestRetryTransportDoesNotRetryDefiniteAnswers pins that the API's own answers
 // are returned untouched. Retrying a 403 would multiply the very error storm
 // this change exists to prevent.
+//
+// 429 is in this list for a different reason than the rest: it is transient, but
+// it is the provider asking for less traffic. Retrying it in-flight is what
+// turned a provider-side 503 storm into a self-inflicted IP rate limit on
+// mgmt-p on 2026-09-02 — see retryableResult.
 func TestRetryTransportDoesNotRetryDefiniteAnswers(t *testing.T) {
 	for _, status := range []int{
 		http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden,
 		http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity,
+		http.StatusTooManyRequests,
 	} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			srv, calls := countingServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
@@ -202,11 +205,20 @@ func TestRetryTransportHonoursContext(t *testing.T) {
 // TestNewRetryTransportDefaults covers the guard rails on construction.
 func TestNewRetryTransportDefaults(t *testing.T) {
 	rt := newRetryTransport(0, time.Second)
-	if rt.base != http.DefaultTransport {
-		t.Error("base must be http.DefaultTransport")
-	}
 	if rt.attempts != 1 {
 		t.Errorf("attempts = %d, want a floor of 1", rt.attempts)
+	}
+	base, ok := rt.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("base = %T, want *http.Transport", rt.base)
+	}
+	// A clone, not the shared default: mutating http.DefaultTransport would
+	// change the idle timeout for every other HTTP user in the process.
+	if base == http.DefaultTransport {
+		t.Error("base must be a clone of http.DefaultTransport, not the shared instance")
+	}
+	if base.IdleConnTimeout != idleConnTimeout {
+		t.Errorf("IdleConnTimeout = %v, want %v", base.IdleConnTimeout, idleConnTimeout)
 	}
 }
 

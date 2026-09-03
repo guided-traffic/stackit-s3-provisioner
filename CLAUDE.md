@@ -29,11 +29,14 @@ stackit/s3_fake_test.go                  Offline-Tests Data-Plane inkl. WipeBuck
 api/v1/bucket_types.go                    CRD `Bucket` (stackit-bucket.gtrfc.com/v1) + Helper, +kubebuilder-Marker
 cmd/main.go                              controller-runtime Manager (stackit.Client + Admin-Secret-Name/-Namespace)
 internal/controller/bucket_controller.go Reconciler (VOLL: §8-Provisioning + Admin-Bootstrap + Finalizer-Teardown)
+internal/controller/breaker.go           Fleetweiter Provider-Circuit-Breaker (§8.4) + Workqueue-RateLimiter-Gegenstueck
 internal/controller/clone.go             Bucket-Clone (spec.cloneFrom): rclone-Job, Staging-Secret, rc-Progress-Polling
 internal/controller/bucket_usage_controller.go Groessen-Messung (spec.usage): eigener Controller, Merge-Patch auf status.usage
 internal/controller/usage_config.go      Mess-Policy (Gate/Default/Intervall-Floor/Cap) + Kostenformel (720h, angefangene GB)
 internal/controller/reconciler_grants_test.go Offline-Tests Read-Grants (spec.grantReadAccess) + Watch-Mapping
 internal/controller/reconciler_degraded_test.go Offline-Tests Sticky-Ready (Halten, Grace-Ablauf, Auth-Ausnahme, Teardown)
+internal/controller/reconciler_circuit_test.go Offline-Tests Circuit-Breaker (Trip, Hold ohne Churn, Grace, Recovery, Teardown)
+internal/controller/breaker_test.go      Unit-Tests Breaker (Threshold, Reset, Probe-Backoff, Disabled)
 internal/controller/reconciler_usage_test.go   Offline-Tests Groessen-Messung (Gate, Clamp, Cap, Versionen, Fehlerpfad)
 internal/controller/reconciler_*_test.go Offline-Reconciler-Tests (fake k8s-Client + stackitfake, inkl. Fehlerpfade)
 internal/stackitfake/                    In-Memory-Fake der StackIT-API (Control-Plane REST + S3-XML) für Offline-Tests
@@ -200,6 +203,20 @@ verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nut
   löscht vorher alle Objekte (inkl. Versions/Delete-Markers, `S3Admin.WipeBucket`) — nur wenn
   Feature-Gate an (`--enable-wipe-on-delete` / Helm `wipeOnDelete.enabled`, Default aus) **und**
   Ownership-Tags passen; sonst Degradierung auf Empty-Only + Warning-Event `WipeOnDeleteSkipped`.
+- **Provider-Circuit-Breaker (§8.4, implementiert 2026-09-02):** ein Provider-Ausfall ist
+  Eigenschaft des Providers, nicht eines Buckets. Nach `--provider-circuit-threshold` (3)
+  Reconciles, die **ohne dazwischenliegenden Erfolg** scheitern, ruft der Operator die API
+  gar nicht mehr, haelt alle Buckets und probet mit verdoppelndem Cooldown (60s → 5m Cap,
+  `--provider-circuit-max-cooldown`). Diskriminator ist bewusst **kein** Fehler-Parsing,
+  sondern das Ausbleiben eines Erfolgs — ein einzelner kaputter Bucket ist mit den Erfolgen
+  der Flotte verschraenkt und haelt niemanden auf. Offen: kein Provider-Call (auch nicht im
+  Teardown, Finalizer bleibt), Reconcile liefert `RequeueAfter` **ohne Fehler** (Log/Event/
+  `status.message` unveraendert), `degradedSince` einmal geschrieben statt pro Probe, Grace
+  laeuft weiter. `threshold: 0` = aus (Values-only-Rollback). Metriken
+  `..._provider_circuit_open` / `..._provider_circuit_opened_timestamp_seconds`.
+  Begleitend: Workqueue-RateLimiter (1s → 15min, fleetweit 1 qps/Burst 5 statt 5ms/10 qps),
+  `retryTransport` retryt **429 nicht mehr** (Rate-Limit erneut anfragen vertieft ihn),
+  `IdleConnTimeout` 30s gegen `connection reset by peer` auf gepoolten Verbindungen.
 - **Transiente Provider-Fehler (§8.2, implementiert 2026-08-25):** `Ready` beschreibt den zuletzt
   **verifizierten** Zustand, nicht das Ergebnis des letzten Verifikationsversuchs. `fail` haelt `Ready`
   eines provisionierten Buckets, `degrade` schreibt stattdessen `status.degradedSince` +
@@ -273,6 +290,14 @@ unter der SDK-Auth, Sticky-`Ready` mit begrenztem Grace. Ticket `local_s3-provis
 **Erledigt (2026-09-01):** Bucket-Groesse + Monatskosten-Schaetzung an der CR (`spec.usage`,
 INIT-SETUP.md §8.3) — eigener Mess-Controller, Helm-Gate + Cluster-Default, Intervall-Floor,
 Objekt-Cap, alle Werte als Metriken, zwei neue Alerts.
+**Erledigt (2026-09-02):** Provider-Circuit-Breaker + Alarm-Retune (INIT-SETUP.md §8.4).
+Befund read-only auf mgmt-p: 503-Storm des StackIT-Edge um 14:23 UTC, ab 14:34 zusaetzlich
+`429 rate limit on IP level exceeded` — der Operator hat sein eigenes IP-Limit vollgehaemmert
+(kein Workqueue-RateLimiter, `retryTransport` retryte 429 dreifach pro GET). 242 Reconcile-Fehler
+fuer **einen** selbstheilenden Ausfall, Alarmschwelle war `>3 / 15m` mit `for: 0`.
+`StackitS3ReconcileErrors` unterdrueckt jetzt Fenster mit offenem Circuit (`unless on()`,
+fail-open bei fehlender Metrik); `StackitS3BucketProviderDegraded` alarmiert auf das **Alter**
+des Haltens (`> holdForSeconds`, Default 1200s < Grace 30m) statt auf dessen Existenz.
 **Erledigt (2026-09-01):** e2e gegen die echte API nachgezogen (`make e2e-stackit`, neue SA-Keys,
 kompletter Lauf gruen in 658s, Sweep danach leer): `TestCloudBucketUsage` (Messung + Kosten +
 Clear beim Abschalten), `TestCloudBucketUsageWithVersions` (Versions-Listing auf einem
