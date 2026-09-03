@@ -388,11 +388,11 @@ func contains(s []string, want string) bool {
 	return false
 }
 
-// TestReadGrantAmbiguousGroupRefused covers the case STACKIT permits but the
-// operator must not guess at: two credentials groups sharing the display name a
-// grantee resolves to. Picking either one hands read access to a principal the
-// referenced Bucket may not hold keys for, so the grant is refused outright.
-func TestReadGrantAmbiguousGroupRefused(t *testing.T) {
+// TestReadGrantUnaffectedByDuplicateDisplayName pins that a grant binds to the
+// group the grantee's bucket attributes, not to a display name: STACKIT does
+// not enforce unique names, and a second group carrying the grantee's name must
+// neither hijack the grant nor block it.
+func TestReadGrantUnaffectedByDuplicateDisplayName(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()
 
@@ -407,38 +407,12 @@ func TestReadGrantAmbiguousGroupRefused(t *testing.T) {
 
 	data := e.provision(t, grantorCR("gitlab", "artifacts", "backups"))
 
-	if _, has := policyPrincipals(t, e.fake.Policy("artifacts"))[sidReaders]; has {
-		t.Error("grant was applied although the grantee's group name is ambiguous")
+	readers := policyPrincipals(t, e.fake.Policy("artifacts"))[sidReaders]
+	if len(readers) != 1 || readers[0] != reader.Status.CredentialsGroupURN {
+		t.Errorf("reader principals = %v, want exactly the grantee's group %s", readers, reader.Status.CredentialsGroupURN)
 	}
-	if len(data.Status.GrantedReadTo) != 0 {
-		t.Errorf("status.grantedReadTo = %v, want empty", data.Status.GrantedReadTo)
-	}
-	if data.Status.Phase != s3v1.PhaseReady {
-		t.Errorf("phase = %q, want Ready: an ambiguous grant must not fail the grantor", data.Status.Phase)
-	}
-	if !e.rec.hasReason(reasonReadGrantPending) {
-		t.Errorf("no %s event emitted; events: %+v", reasonReadGrantPending, e.rec.events)
-	}
-}
-
-// TestReadGrantFirstMatchWins pins the tie-break used when the listing returns a
-// name more than once for reasons other than a true duplicate: it must agree
-// with FindCredentialsGroupByName, which the operator uses everywhere else. A
-// divergent tie-break would bind the grant to a different group than the one the
-// grantee actually holds keys in.
-func TestReadGrantFirstMatchWins(t *testing.T) {
-	e := newTestEnv(t)
-	ctx := context.Background()
-
-	reader := e.provision(t, newBucketCR("gitlab", "backups"))
-	name := workloadGroupName(reader)
-
-	_, firstURN, found, err := e.r.Stackit.FindCredentialsGroupByName(ctx, name)
-	if err != nil || !found {
-		t.Fatalf("find group %q: found=%v err=%v", name, found, err)
-	}
-	if firstURN != reader.Status.CredentialsGroupURN {
-		t.Fatalf("test premise broken: first match %q != grantee group %q", firstURN, reader.Status.CredentialsGroupURN)
+	if len(data.Status.GrantedReadTo) != 1 || data.Status.GrantedReadTo[0] != "backups" {
+		t.Errorf("status.grantedReadTo = %v, want [backups]", data.Status.GrantedReadTo)
 	}
 }
 

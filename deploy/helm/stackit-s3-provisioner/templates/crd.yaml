@@ -216,13 +216,12 @@ spec:
                   cluster resolves to a different credentials group.
 
                   The principal that ends up in the bucket policy is that Bucket's
-                  credentials group, located by the deterministic group name the operator
-                  derives from namespace and CR name. That name — not the namespace itself —
-                  is the boundary the grant ultimately rests on, and it is a truncated
-                  string plus a 32-bit hash, so it is not collision-proof against a chosen
-                  namespace/name pair. Treat a namespace that can create Bucket CRs as
-                  trusted; the same derivation already decides which credentials group a
-                  Bucket owns, independently of this field.
+                  credentials group, resolved through that Bucket's physical bucket: the
+                  bucket must carry the referenced Bucket's ownership tags, and the group is
+                  the one named by the bucket's own credentials-group tag (or, for buckets
+                  provisioned before that tag existed, by its isolation policy). Nothing
+                  writable by a namespace user — status, annotations, Secrets, the group's
+                  display name — takes part in that resolution.
 
                   A referenced Bucket that does not exist yet, or whose credentials group is
                   not provisioned yet, is skipped with a warning event and picked up

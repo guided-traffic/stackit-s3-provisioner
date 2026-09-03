@@ -33,6 +33,16 @@ const (
 	keyAWS          = "AWS"
 )
 
+// Statement ids of the isolation policy. They are part of the document the
+// operator writes and reads back: WorkloadPrincipalFromPolicy locates the
+// workload statement by sidWorkloadObjectsOnly, so the ids are load-bearing,
+// not cosmetic.
+const (
+	sidDenyAllExceptAdminAndWorkload = "deny-all-except-admin-and-workload"
+	sidWorkloadObjectsOnly           = "workload-objects-only"
+	sidGrantedReadersReadOnly        = "granted-readers-read-only"
+)
+
 // S3 action names that appear in more than one of the action lists below.
 // Naming them makes a typo in one list a build failure rather than a silently
 // over- or under-permissive policy, and keeps the two lists spelling the same
@@ -215,14 +225,14 @@ func BuildIsolationPolicy(bucket, adminURN, workloadURN string, readerURNs []str
 
 	statements := []any{
 		map[string]any{
-			keySid:          "deny-all-except-admin-and-workload",
+			keySid:          sidDenyAllExceptAdminAndWorkload,
 			keyEffect:       effectDeny,
 			keyNotPrincipal: map[string]any{keyAWS: exempt},
 			keyAction:       []string{actionAll},
 			keyResource:     res,
 		},
 		map[string]any{
-			keySid:       "workload-objects-only",
+			keySid:       sidWorkloadObjectsOnly,
 			keyEffect:    effectDeny,
 			keyPrincipal: map[string]any{keyAWS: workloadURN},
 			keyNotAction: workloadAllowedActions,
@@ -231,7 +241,7 @@ func BuildIsolationPolicy(bucket, adminURN, workloadURN string, readerURNs []str
 	}
 	if len(readers) > 0 {
 		statements = append(statements, map[string]any{
-			keySid:       "granted-readers-read-only",
+			keySid:       sidGrantedReadersReadOnly,
 			keyEffect:    effectDeny,
 			keyPrincipal: map[string]any{keyAWS: readers},
 			keyNotAction: readerAllowedActions,
@@ -279,6 +289,68 @@ func sanitizeReaderURNs(readerURNs []string, adminURN, workloadURN string) []str
 	}
 	sort.Strings(out)
 	return out
+}
+
+// WorkloadPrincipalFromPolicy extracts the workload credentials-group URN from
+// an isolation policy written by BuildIsolationPolicy: the single principal of
+// the statement with Sid sidWorkloadObjectsOnly. It is the migration path of
+// ADR 0002 — a bucket provisioned before the credentials-group tag existed
+// still carries, in its own policy, the operator's record of which group it
+// trusts, and that policy is writable only with the admin key.
+//
+// The document is read leniently: the principal may be a bare string or a
+// one-element list (StorageGRID may normalize the form on read-back), and
+// unknown statements are ignored. It reports ok=false for anything that does
+// not name exactly one workload principal — an absent policy, a foreign
+// document, or a statement with several principals — so a caller never
+// attributes a group on a guess.
+func WorkloadPrincipalFromPolicy(policy string) (urn string, ok bool) {
+	if strings.TrimSpace(policy) == "" {
+		return "", false
+	}
+	var doc struct {
+		Statement []struct {
+			Sid       string `json:"Sid"`
+			Principal any    `json:"Principal"`
+		} `json:"Statement"`
+	}
+	if err := json.Unmarshal([]byte(policy), &doc); err != nil {
+		return "", false
+	}
+	for _, st := range doc.Statement {
+		if st.Sid != sidWorkloadObjectsOnly {
+			continue
+		}
+		principals := principalStrings(st.Principal)
+		if len(principals) != 1 || strings.TrimSpace(principals[0]) == "" {
+			return "", false
+		}
+		return strings.TrimSpace(principals[0]), true
+	}
+	return "", false
+}
+
+// principalStrings flattens the Principal element of a policy statement —
+// "urn", ["urn", ...], {"AWS": "urn"} or {"AWS": ["urn", ...]} — into the list
+// of principal strings it names. Anything else yields nil.
+func principalStrings(p any) []string {
+	switch v := p.(type) {
+	case string:
+		return []string{v}
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			s, ok := e.(string)
+			if !ok {
+				return nil
+			}
+			out = append(out, s)
+		}
+		return out
+	case map[string]any:
+		return principalStrings(v[keyAWS])
+	}
+	return nil
 }
 
 // PoliciesEquivalent reports whether two bucket-policy JSON documents are

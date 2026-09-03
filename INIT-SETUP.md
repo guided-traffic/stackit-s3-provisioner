@@ -11,7 +11,8 @@
 | Region | **`eu01`** (Single-Region, v1). Code dennoch region-parametrisiert. |
 | Lösch-Semantik | **Nur löschen wenn Bucket leer** — sonst Reconcile-Fehler, kein Datenverlust. |
 | Key-Rotation | **v1: Keys ohne Ablauf**, keine Auto-Rotation. Rotation später nachrüstbar. |
-| Namespace-Wirkungsradius (2026-09-03) | **Eine namespaced Ressource wie `Bucket` wirkt nur auf ihren eigenen Namespace** — Cluster-Objekte nur im eigenen Namespace, Cloud-Objekte eindeutig via `namespace/name` zugeordnet, Referenzen nur im eigenen Namespace, kein Spec-Feld darf das aufweichen. Erste Konsequenz: `spec.secretRef.namespace` entfernt. Regeln, Migration und die offene Verletzung (Group-Namenskollision) in [ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md). Ab hier leben Entscheidungen in `docs/adr/`. |
+| Namespace-Wirkungsradius (2026-09-03) | **Eine namespaced Ressource wie `Bucket` wirkt nur auf ihren eigenen Namespace** — Cluster-Objekte nur im eigenen Namespace, Cloud-Objekte eindeutig via `namespace/name` zugeordnet, Referenzen nur im eigenen Namespace, kein Spec-Feld darf das aufweichen. Erste Konsequenz: `spec.secretRef.namespace` entfernt. Regeln, Migration und die (seit ADR 0002 geschlossene) Verletzung (Group-Namenskollision) in [ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md). Ab hier leben Entscheidungen in `docs/adr/`. |
+| Group-Zuordnung (2026-09-03) | **Eine Credentials-Group wird ueber ihren Bucket zugeordnet** — Bucket-Tag `credentials-group-id` (Admin-Key-only, hinter dem Ownership-Check), Migration aus der eigenen Policy, nie per Anzeigename. Schliesst Befund 1 ohne Umbenennung oder Key-Wechsel. [ADR 0002](docs/adr/0002-a-credentials-group-is-attributed-through-its-bucket.md). |
 
 ## 1. Ziel
 
@@ -230,21 +231,19 @@ Mit ≥1 Reader kommt ein drittes Statement dazu, und Stmt 1 nimmt die Reader in
 - **Herkunft der Reader-URN ist sicherheitskritisch.** Sie wird **nie** aus
   `status.credentialsGroupURN` des referenzierten CR gelesen (`buckets/status`-Schreibrecht
   ist schwächer als Secret-Leserecht — eine gefälschte URN käme sonst wörtlich in die
-  Policy). Stattdessen: deterministischer Group-Name aus `namespace/name`
-  (`workloadGroupName`) → Lookup gegen die Control Plane. `BuildIsolationPolicy` filtert
-  zusätzlich Admin- und Workload-URN aus der Reader-Liste heraus.
-- **Grenze dieser Auflösung (verifiziert 2026-08-24).** `workloadGroupName` ist
-  `"s3op-<ns>-<name>"` auf 23 Zeichen gekürzt + 8-Hex-FNV-1a-32 über `"<ns>/<name>"`.
-  Das kollidiert über Namespaces hinweg, empirisch reproduziert:
-  `("gitlab","gitlab-artifacts")` und `("gitlab-gitlab","artifacts787ngo")` ergeben beide
-  `s3op-gitlab-gitlab-arti-70dbcfc2`. Die Namespace-Bindung des Grants ist also eine
-  Eigenschaft des **CR-Lookups**, keine kryptographische Zusicherung über das Principal.
-  Das ist **nicht** grant-spezifisch: derselbe Name entscheidet über
-  `EnsureCredentialsGroup` (Find-or-Create, **ohne** Ownership-Check) schon heute, welche
-  Credentials-Group ein Bucket besitzt — siehe offene Punkte in §5.
-- **Anzeigenamen sind nicht eindeutig.** Erscheint der abgeleitete Name mehrfach im
-  Projekt, wird der Grant **verweigert** (Event `ReadGrantPending`) statt geraten;
-  bei einem einzelnen Treffer gilt First-Match wie in `FindCredentialsGroupByName`.
+  Policy). Stattdessen (seit 2026-09-03, ADR 0002): physischer Bucket des Grantee
+  (`EffectiveBucketName()`) → dessen Ownership-Tags muessen zum Grantee-CR passen →
+  Tag `credentials-group-id` bzw. Workload-Principal der eigenen Policy → URN.
+  `BuildIsolationPolicy` filtert zusätzlich Admin- und Workload-URN aus der Reader-Liste heraus.
+- **Historische Grenze (verifiziert 2026-08-24, geschlossen 2026-09-03).** Bis ADR 0002 lief
+  die Auflösung über `workloadGroupName` — `"s3op-<ns>-<name>"` auf 23 Zeichen gekürzt +
+  8-Hex-FNV-1a-32 über `"<ns>/<name>"` — und dieser Name kollidiert über Namespaces hinweg
+  (`("gitlab","gitlab-artifacts")` und `("gitlab-gitlab","artifacts787ngo")` ergeben beide
+  `s3op-gitlab-gitlab-arti-70dbcfc2`). Derselbe Name entschied über `EnsureCredentialsGroup`
+  (Find-or-Create ohne Ownership-Check), welche Group ein Bucket besitzt. Heute ist der Name
+  nur noch Anzeigename; Zuordnung ausschliesslich ueber den Bucket.
+- **Anzeigenamen sind nicht eindeutig** (STACKIT erzwingt keine Eindeutigkeit). Seit ADR 0002
+  ohne Folge: weder Provisioning noch Grants noch Teardown suchen per Name.
 - **Warum das Filtern nötig ist:** Admin-URN als Reader ⇒ der Admin-Key verliert
   `PutBucketPolicy` auf diesem Bucket ⇒ **nicht reparierbarer Lockout** (Deny schlägt
   alles). Workload-URN als Reader ⇒ zweites, engeres Deny auf den Eigentümer; Denies

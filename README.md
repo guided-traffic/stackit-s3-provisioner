@@ -142,7 +142,11 @@ my-bucket   my-bucket   Ready   True    provisioned          eu01     18.0 GiB  
 
 Each `Bucket` is stamped with S3 ownership tags (`managed-by` + `owner=<ns>/<name>`)
 so the operator adopts only buckets it owns and refuses to clobber a pre-existing
-foreign or non-empty bucket. On bootstrap the operator creates a shared
+foreign or non-empty bucket. Two more tags, `credentials-group-id` and
+`credentials-group-urn`, bind the bucket to its workload credentials group: the group
+is found, released and granted through those tags (or, for buckets provisioned before
+they existed, through the bucket's own isolation policy), never through its display
+name. On bootstrap the operator creates a shared
 `operator-admin` credentials group + S3 key (persisted in its own admin Secret,
 default `stackit-s3-provisioner-admin`); that group's URN sits in every bucket
 policy's exemption list as a lockout safeguard.
@@ -429,10 +433,11 @@ Rules worth knowing:
 - **Namespace-scoped.** Entries name a `Bucket` CR and are resolved in the
   granting Bucket's own namespace, so a Bucket in another namespace cannot be
   named here and a same-named Bucket elsewhere resolves to a different
-  credentials group. Note that the principal written into the policy is located
-  by the operator's derived credentials-group name, which is what already decides
-  which group a Bucket owns — a namespace allowed to create `Bucket` resources is
-  inside the trust boundary either way.
+  credentials group. The principal written into the policy is resolved through
+  the referenced Bucket's own bucket: it must carry that Bucket's ownership tags,
+  and its `credentials-group-id` tag (or, for buckets provisioned before that tag
+  existed, its isolation policy) names the group. Nothing a namespace user can
+  write — status, annotations, Secrets — takes part in that resolution.
 - **Never blocking.** A referenced Bucket that does not exist yet (or is not
   finished provisioning) is skipped with a `ReadGrantPending` warning event; the
   granting bucket still becomes `Ready`. The grant is applied automatically as
@@ -582,6 +587,12 @@ excludes taxes.
 Deleting a `Bucket` CR tears down the access key, credentials group, bucket and
 credentials Secret — but only when the bucket is **empty**. A non-empty bucket
 blocks deletion (data-loss guard) until its objects are removed.
+
+The credentials group that is deleted is the one the bucket itself attributes
+through its `credentials-group-id` tag (or its isolation policy). A group the
+bucket does not attribute is left in place and reported with a
+`CredentialsGroupNotAttributable` event; the id recorded in status alone never
+triggers a deletion.
 
 A Bucket can opt into an automatic wipe instead: with `spec.wipeOnDelete: true`
 the operator deletes **all objects (including versions and delete markers)**
