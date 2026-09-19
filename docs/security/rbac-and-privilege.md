@@ -340,7 +340,12 @@ namespace-scoped reader roles and for the built-in `admin` that tenant teams hol
 qs stage. The chart deployed on mgmt-p on that date was 1.13.1, against a repository tip
 of 1.14.0. That observation comes from operating the cluster before the roles existed;
 nothing in this repository records it, so it is the one claim on this page a reader cannot
-follow to a file. It is nevertheless why the read fragment carries all three aggregation
+follow to a file. **A second doubt, noted 2026-09-19:** the command as typed was
+`kubectl get buckets`, and on a cluster running Flux that plural resolves to
+`buckets.source.toolkit.fluxcd.io`, not to this operator's CRD — so the refusal may have
+concerned Flux's `Bucket` rather than ours. Which one it hit was not recorded and can no
+longer be established. Use the shortname `bkt`, which only this CRD declares, for any repeat
+of that check. It is nevertheless why the read fragment carries all three aggregation
 labels unconditionally and why `bucketRoles.create` defaults to `true`: the failure being fixed was invisibility, not permissiveness.
 
 ## What this does not cover

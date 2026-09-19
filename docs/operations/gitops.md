@@ -72,7 +72,7 @@ both would recompose the name from the operator's *current* naming policy
 kubectl diff -f bucket.yaml
 
 # The operator did not re-enter its loop: generation is unchanged and matches what it observed.
-kubectl get bucket my-bucket -n team-a \
+kubectl get bkt my-bucket -n team-a \
   -o jsonpath='{.metadata.generation} {.status.observedGeneration}{"\n"}'
 ```
 
@@ -367,7 +367,7 @@ frozen-name annotation are covered in *What the operator puts on a Bucket* above
 operator's finalizer and annotation were never in a `kubectl apply` manifest and are left
 alone; `kubectl diff -f` therefore prints nothing for them. Not verified against a live
 cluster in this repository — that is kubectl's documented merge behaviour, not a property this
-repository tests. Note that `kubectl delete bucket` blocks until the teardown completes, for
+repository tests. Note that `kubectl delete bkt` blocks until the teardown completes, for
 the same reason a Flux prune does; see *Pruning a Bucket from Git*.
 
 ## What this page could not verify

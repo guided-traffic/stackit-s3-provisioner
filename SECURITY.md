@@ -33,7 +33,7 @@ A report is triaged by whoever can reproduce it fastest. These are the things th
 
 | Include | Why it matters, and how to get it |
 | --- | --- |
-| **Operator version** | `kubectl get bucket <name> -n <ns> -o jsonpath='{.status.operatorVersion}'` — the operator stamps it into every `Bucket` it reconciles; it is also in the deployment image tag and in the `starting stackit-s3-provisioner` log line at startup. Example value: `1.15.1` &nbsp;`# example` |
+| **Operator version** | `kubectl get bkt <name> -n <ns> -o jsonpath='{.status.operatorVersion}'` — the operator stamps it into every `Bucket` it reconciles; it is also in the deployment image tag and in the `starting stackit-s3-provisioner` log line at startup. Example value: `1.15.1` &nbsp;`# example` |
 | **Chart version** | `helm list -n <ns>` — the `CHART` column. Report it alongside the operator version, and say whether `image.tag` was overridden: the chart lets a deployment run an image tag that differs from its chart version, so the two numbers are not always the same build. |
 | **Which credential is involved** | Name the credential the finding concerns rather than describing it as "a key" — the operator holds and hands out several, with different blast radii, and they are listed and compared in [credentials-and-secrets.md](docs/security/credentials-and-secrets.md). **Send no credential material** — no private key, no access key, no secret half of a key pair; redact it and say what it was. |
 | **The `Bucket` spec that triggers it** | The full CR as applied, with `metadata.name` and the namespace, since several behaviours depend on both. The spec itself carries no secret, but it names Secrets by reference — do not attach the contents of those Secrets. |

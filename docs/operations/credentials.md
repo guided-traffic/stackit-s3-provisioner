@@ -129,7 +129,7 @@ metadata:
 2. **Set the annotation.** One `Bucket`:
 
    ```bash
-   kubectl annotate bucket reports -n analytics \
+   kubectl annotate bkt reports -n analytics \
      stackit-bucket.gtrfc.com/rotate-credentials-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
      --overwrite
    ```
@@ -137,7 +137,7 @@ metadata:
    Every `Bucket` matching a label selector:
 
    ```bash
-   kubectl annotate buckets -l team=payments \
+   kubectl annotate bkt -l team=payments \
      stackit-bucket.gtrfc.com/rotate-credentials-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
      --overwrite
    ```
@@ -148,7 +148,7 @@ metadata:
 3. **Verify the operator acted.** The recorded trigger must equal what you set:
 
    ```bash
-   kubectl get bucket reports -n analytics \
+   kubectl get bkt reports -n analytics \
      -o jsonpath='{.status.lastRotationTrigger}{"\n"}{.status.lastRotationTime}{"\n"}{.status.accessKeyID}{"\n"}'
    ```
 
@@ -367,7 +367,7 @@ verbosity 1 and leaves `status.usage` untouched; it never touches `Ready`
    `Ready=True`:
 
    ```bash
-   kubectl get buckets -A
+   kubectl get bkt -A
    ```
 
 On bootstrap the operator finds or creates the `operator-admin` group **by display

@@ -27,7 +27,7 @@ API is a failure to verify, so the `Bucket` keeps its phase and its `Ready`
 condition and records the degradation alongside them:
 
 ```
-$ kubectl get bucket -A
+$ kubectl get bkt -A
 NAMESPACE   NAME        BUCKET      PHASE   READY   STATUS                          REGION   SIZE       COST/MONTH   AGE
 team-a      my-bucket   my-bucket   Ready   True    ensure bucket: unexpected EOF   eu01     18.0 GiB   0.53 EUR     3h
 ```
@@ -285,7 +285,7 @@ Work down this list; each step distinguishes a case the one above cannot.
 2. **Which `Bucket`s, and since when?**
 
    ```bash
-   kubectl get bucket -A -o custom-columns=\
+   kubectl get bkt -A -o custom-columns=\
    'NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,DEGRADED:.status.degradedSince,MSG:.status.message'
    ```
 

@@ -23,7 +23,7 @@ is deliberate.
 | [configuration.md](configuration.md) | A value is set and you want to know what it actually does — what needs a restart, what the periodic drift resync re-checks and costs, and which single setting can park every `Bucket` in the cluster at once. |
 | [bucket-naming.md](bucket-naming.md) | The cloud bucket is not called what the CR asked for, or you are planning a restore into a fresh cluster and need to know which install-time values decide whether the operator recognises its own buckets. |
 | [bucket-status.md](bucket-status.md) | You have a `Bucket` in front of you: which column comes from which field, what each phase, condition and reason means, which faults park the object until somebody edits it, and what it means when the status and the cloud disagree. |
-| [deletion.md](deletion.md) | A `kubectl delete bucket` will not finish, or you need to know what a teardown removes, in which order, and what it leaves behind in the cloud. |
+| [deletion.md](deletion.md) | A `kubectl delete bkt` will not finish, or you need to know what a teardown removes, in which order, and what it leaves behind in the cloud. |
 | [credentials.md](credentials.md) | An application has to consume a workload Secret, a key must be rotated, or you are dealing with the operator's own admin Secret. |
 | [cloning.md](cloning.md) | You want a new bucket seeded once from an existing S3 bucket, or a clone is running, stuck or failing and you need to read it. |
 | [read-grants.md](read-grants.md) | A second workload in the same namespace needs read access to a bucket it does not own, or you are revoking such access. |

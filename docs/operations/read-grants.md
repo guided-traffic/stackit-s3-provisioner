@@ -66,7 +66,7 @@ spec:
 Apply both, then confirm the grant is in effect:
 
 ```console
-$ kubectl -n gitlab get bucket gitlab-artifacts -o jsonpath='{.status.grantedReadTo}'
+$ kubectl -n gitlab get bkt gitlab-artifacts -o jsonpath='{.status.grantedReadTo}'
 ["gitlab-backups"]
 ```
 
@@ -122,7 +122,7 @@ Alternatives):
    sibling's data, with no trace in the spec of the bucket being read.
 
 What you get in exchange, operationally: **a bucket's complete access list is
-readable in one object.** `kubectl -n <ns> get bucket <data-bucket> -o yaml` shows
+readable in one object.** `kubectl -n <ns> get bkt <data-bucket> -o yaml` shows
 every principal that may touch it. There is no second place to look, and a review
 of the data bucket's manifest is a complete review of who reads it.
 
@@ -131,7 +131,7 @@ grantee.** A Bucket cannot tell from its own CR which foreign buckets it may rea
 To answer "what can this credential reach?", search the namespace's grantors:
 
 ```console
-$ kubectl -n gitlab get buckets \
+$ kubectl -n gitlab get bkt \
     -o jsonpath='{range .items[?(@.status.grantedReadTo)]}{.metadata.name}{" -> "}{.status.grantedReadTo}{"\n"}{end}'
 gitlab-artifacts -> ["gitlab-backups"]
 gitlab-uploads -> ["gitlab-backups"]
@@ -255,19 +255,19 @@ Any of these drops the reader from the policy on the grantor's next reconcile:
 ```bash
 # 1a. Remove ONE grantee from the owner's spec (the normal path). The path is an
 #     index into the list, so read the current order first:
-#       kubectl -n gitlab get bucket gitlab-artifacts \
+#       kubectl -n gitlab get bkt gitlab-artifacts \
 #         -o jsonpath='{.spec.grantReadAccess[*].name}'
-kubectl -n gitlab patch bucket gitlab-artifacts --type=json \
+kubectl -n gitlab patch bkt gitlab-artifacts --type=json \
   -p '[{"op":"remove","path":"/spec/grantReadAccess/0"}]'   # example: the first entry
 
 # 1b. Or remove ALL grants at once by dropping the whole list. With more than one
 #     grantee this revokes every reader, not just the one you had in mind.
-kubectl -n gitlab patch bucket gitlab-artifacts --type=json \
+kubectl -n gitlab patch bkt gitlab-artifacts --type=json \
   -p '[{"op":"remove","path":"/spec/grantReadAccess"}]'
 
 # 2. Or delete the grantee Bucket entirely — access is dropped as soon as
 #    deletion starts, before its credentials group is actually gone.
-kubectl -n gitlab delete bucket gitlab-backups
+kubectl -n gitlab delete bkt gitlab-backups
 ```
 
 Verify, in this order — the S3 policy and the CR status converge separately, and
@@ -279,7 +279,7 @@ $ # the reader is locked out again (see the verification recipe below)
 $ aws --endpoint-url "https://$S3_ENDPOINT" s3api list-objects-v2 --bucket gitlab-artifacts
 An error occurred (AccessDenied) ...
 
-$ kubectl -n gitlab get bucket gitlab-artifacts -o jsonpath='{.status.grantedReadTo}'
+$ kubectl -n gitlab get bkt gitlab-artifacts -o jsonpath='{.status.grantedReadTo}'
 ```
 
 Removing the entry changes `spec`, which bumps the generation and wakes the
@@ -321,11 +321,11 @@ the grantee resolves fine. Both fill in together when the copy completes.
 
 ```bash
 # What is in effect right now, per bucket:
-kubectl -n gitlab get bucket gitlab-artifacts -o jsonpath='{.status.grantedReadTo}'
+kubectl -n gitlab get bkt gitlab-artifacts -o jsonpath='{.status.grantedReadTo}'
 
 # What was requested, for comparison — a requested entry missing from the list
 # above is pending or revoked:
-kubectl -n gitlab get bucket gitlab-artifacts -o jsonpath='{.spec.grantReadAccess[*].name}'
+kubectl -n gitlab get bkt gitlab-artifacts -o jsonpath='{.spec.grantReadAccess[*].name}'
 
 # Why an entry is missing:
 kubectl -n gitlab get events --field-selector reason=ReadGrantPending \
@@ -335,7 +335,7 @@ kubectl -n gitlab get events --field-selector reason=ReadGrantPending \
 `status.grantedReadTo` lists the entries that **resolved and were written into the
 policy**, so a pending or revoked grant is visible without reading the policy out
 of S3 — which no credential except the operator's admin key can do anyway. It is
-not a print column; `kubectl get bucket` will not show it.
+not a print column; `kubectl get bkt` will not show it.
 
 ---
 
@@ -361,7 +361,7 @@ EP=$(kubectl -n $NS get secret gitlab-backups-s3 \
 # The PHYSICAL name of the granting bucket — not necessarily spec.bucketName,
 # because the operator may compose a prefix (see bucket-naming.md).
 # gitlab-artifacts is an example: use the metadata.name of the granting Bucket CR.
-GRANTOR=$(kubectl -n $NS get bucket gitlab-artifacts \
+GRANTOR=$(kubectl -n $NS get bkt gitlab-artifacts \
   -o jsonpath='{.status.resolvedBucketName}')
 
 # The operator addresses this endpoint PATH-STYLE; the AWS CLI defaults to
