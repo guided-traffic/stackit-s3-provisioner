@@ -2,7 +2,7 @@
 {{- $alerts := .Values.monitoring.prometheusRule.alerts }}
 {{- /* Skip the whole resource when every alert is disabled: prometheus-operator
        rejects a rule group without rules. Extend the `or` when adding alerts. */}}
-{{- if or $alerts.bucketsWipeOnDelete.enabled $alerts.bucketFailed.enabled $alerts.bucketStuckProvisioning.enabled $alerts.bucketStuckDeleting.enabled $alerts.cloneFailed.enabled $alerts.skeletonMode.enabled $alerts.wipeRequestedButGateDisabled.enabled $alerts.reconcileErrors.enabled $alerts.bucketProviderDegraded.enabled $alerts.bucketMissing.enabled $alerts.bucketRecreated.enabled $alerts.usageMeasurementFailing.enabled $alerts.usageMeasurementTruncated.enabled }}
+{{- if or $alerts.bucketsWipeOnDelete.enabled $alerts.bucketFailed.enabled $alerts.bucketStuckProvisioning.enabled $alerts.bucketStuckDeleting.enabled $alerts.cloneFailed.enabled $alerts.skeletonMode.enabled $alerts.wipeRequestedButGateDisabled.enabled $alerts.reconcileErrors.enabled $alerts.bucketProviderDegraded.enabled $alerts.bucketMissing.enabled $alerts.bucketRecreated.enabled $alerts.usageMeasurementFailing.enabled $alerts.usageMeasurementTruncated.enabled $alerts.saKeyReloadFailing.enabled $alerts.saKeyExpiring.enabled $alerts.saKeyExpiringCritical.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -98,6 +98,67 @@ spec:
               provisions nothing, while its health probes stay green. Check
               stackit.serviceAccountKey in the Helm values and the referenced
               Secret.
+        {{- end }}
+        {{- if $alerts.saKeyReloadFailing.enabled }}
+        - alert: StackitS3SaKeyReloadFailing
+          expr: max(stackit_s3_provisioner_sa_key_reload_failing) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Operator keeps rejecting the service-account key on disk
+            description: >-
+              The key file mounted into the operator has changed and every
+              attempt to put it to work was rejected: it does not parse, it
+              names a different StackIT project, or the provider will not mint
+              a token with it. The operator deliberately carries on with the key
+              it already holds, so nothing is broken yet and nothing else
+              reports this — a rotation that silently failed looks exactly like
+              a healthy operator until the old key expires, which is what
+              StackitS3SaKeyExpiring watches. Read the operator log for the
+              rejection reason and check the Secret named by
+              stackit.serviceAccountKey.secretName — see
+              docs/operations/credentials.md.
+        {{- end }}
+        {{- if $alerts.saKeyExpiring.enabled }}
+        - alert: StackitS3SaKeyExpiring
+          expr: >-
+            min(stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds - time())
+            < {{ mul $alerts.saKeyExpiring.leadTimeDays 86400 }}
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: StackIT service-account key expires soon
+            description: >-
+              The service-account key the operator is running on expires in under
+              {{ $alerts.saKeyExpiring.leadTimeDays }} days. When it does, every
+              Bucket in the cluster drops to Failed at once, because a revoked key
+              is a definitive refusal and is never held through the degraded
+              grace. Issue a new key and write it to the Secret named by
+              stackit.serviceAccountKey.secretName; the operator picks it up
+              within stackit.serviceAccountKey.reloadInterval without a restart,
+              and StackitS3SaKeyReloadFailing fires if it will not take it — see
+              docs/operations/credentials.md.
+        {{- end }}
+        {{- if $alerts.saKeyExpiringCritical.enabled }}
+        - alert: StackitS3SaKeyExpiringCritical
+          expr: >-
+            min(stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds - time())
+            < {{ mul $alerts.saKeyExpiringCritical.leadTimeDays 86400 }}
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: StackIT service-account key expires within days
+            description: >-
+              The service-account key the operator is running on expires in under
+              {{ $alerts.saKeyExpiringCritical.leadTimeDays }} days. Rotate it now:
+              at expiry every Bucket in the cluster drops to Failed at once and
+              the fleet-wide provider circuit opens, and
+              nothing heals until a valid key is in place. Write the new key to
+              the Secret named by stackit.serviceAccountKey.secretName — see
+              docs/operations/credentials.md.
         {{- end }}
         {{- if $alerts.wipeRequestedButGateDisabled.enabled }}
         - alert: StackitS3WipeRequestedButGateDisabled

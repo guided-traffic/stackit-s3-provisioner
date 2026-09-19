@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // accountPaths returns the two SA key files at the repo root, skipping the test
@@ -65,5 +66,45 @@ func TestLoadAccountErrors(t *testing.T) {
 	}
 	if _, err := LoadAccount(bad); err == nil {
 		t.Fatal("expected error for key file without projectId")
+	}
+	empty := filepath.Join(t.TempDir(), "empty.json")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The operator has to reject an empty key itself. Handing empty content to
+	// the SDK does not fail cleanly: it falls through to the SDK's own
+	// credential search (environment variables, a credentials file in the home
+	// directory), so the outcome would depend on ambient state rather than on
+	// the key that was actually supplied.
+	if _, err := LoadAccount(empty); err == nil {
+		t.Fatal("expected error for an empty key file")
+	}
+}
+
+// TestLoadAccountValidUntil pins both shapes of the expiry field. The absent
+// one is not a fallback: neither e2e key file carries validUntil, so it is what
+// the offline and cloud suites actually run on.
+func TestLoadAccountValidUntil(t *testing.T) {
+	want := time.Date(2027, 3, 1, 12, 0, 0, 0, time.UTC)
+
+	withExpiry := newKeyFile(t, buildSAKey(t, withValidUntil(want)))
+	acc, err := LoadAccount(withExpiry.path)
+	if err != nil {
+		t.Fatalf("LoadAccount: %v", err)
+	}
+	if acc.ValidUntil == nil {
+		t.Fatalf("ValidUntil = nil, want %s", want)
+	}
+	if !acc.ValidUntil.Equal(want) {
+		t.Errorf("ValidUntil = %s, want %s", acc.ValidUntil, want)
+	}
+
+	withoutExpiry := newKeyFile(t, buildSAKey(t))
+	acc, err = LoadAccount(withoutExpiry.path)
+	if err != nil {
+		t.Fatalf("LoadAccount: %v", err)
+	}
+	if acc.ValidUntil != nil {
+		t.Errorf("ValidUntil = %s, want nil for a key file that carries none", acc.ValidUntil)
 	}
 }

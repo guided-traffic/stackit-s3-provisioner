@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,6 +36,11 @@ type rule struct {
 	Verbs     []string `json:"verbs"`
 }
 
+type container struct {
+	Name string   `json:"name"`
+	Args []string `json:"args"`
+}
+
 type object struct {
 	Kind     string `json:"kind"`
 	Metadata struct {
@@ -42,6 +48,15 @@ type object struct {
 		Labels map[string]string `json:"labels"`
 	} `json:"metadata"`
 	Rules []rule `json:"rules"`
+	// Spec reaches the Deployment's container args. Every other kind leaves it
+	// zero, which is what an absent field decodes to.
+	Spec struct {
+		Template struct {
+			Spec struct {
+				Containers []container `json:"containers"`
+			} `json:"spec"`
+		} `json:"template"`
+	} `json:"spec"`
 }
 
 // render runs `helm template` with the given --set arguments and indexes the
@@ -87,6 +102,26 @@ func verbsFor(o object, resource string) []string {
 		verbs = append(verbs, r.Verbs...)
 	}
 	return verbs
+}
+
+// managerArgs returns the args of the operator container in the rendered
+// Deployment.
+func managerArgs(t *testing.T, objs map[string]object) []string {
+	t.Helper()
+	dep, ok := objs["Deployment/"+fullname]
+	require.True(t, ok, "Deployment must be rendered")
+	require.Len(t, dep.Spec.Template.Spec.Containers, 1, "expected exactly one container")
+	return dep.Spec.Template.Spec.Containers[0].Args
+}
+
+// hasArgPrefix reports whether any arg starts with prefix.
+func hasArgPrefix(args []string, prefix string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(list []string, want string) bool {
@@ -148,4 +183,29 @@ func requireOperatorRole(t *testing.T, objs map[string]object) {
 		verbsFor(op, "buckets"))
 	assert.ElementsMatch(t, []string{"get", "patch", "update"}, verbsFor(op, "buckets/status"))
 	assert.ElementsMatch(t, []string{"update"}, verbsFor(op, "buckets/finalizers"))
+}
+
+// TestServiceAccountKeyArgsRenderTogether pins the two args behind the
+// secretName guard. Nothing else renders them: the CI Kind install runs in
+// skeleton mode, so without this the whole branch — including the reload
+// interval that has to reach the operator for a rotation to be picked up —
+// ships untested.
+func TestServiceAccountKeyArgsRenderTogether(t *testing.T) {
+	withKey := managerArgs(t, render(t,
+		"stackit.serviceAccountKey.secretName=my-key",
+		"stackit.serviceAccountKey.reloadInterval=2m",
+	))
+	assert.Contains(t, withKey, "--stackit-sa-key-path=/etc/stackit/sa-key.json")
+	assert.Contains(t, withKey, "--stackit-sa-key-reload-interval=2m")
+
+	byDefault := managerArgs(t, render(t, "stackit.serviceAccountKey.secretName=my-key"))
+	assert.Contains(t, byDefault, "--stackit-sa-key-reload-interval=30s",
+		"the shipped default must reach the operator unchanged")
+
+	// Skeleton mode: no key, therefore nothing to reload and no interval arg.
+	skeleton := managerArgs(t, render(t))
+	assert.False(t, hasArgPrefix(skeleton, "--stackit-sa-key-path="),
+		"skeleton mode must render no key path")
+	assert.False(t, hasArgPrefix(skeleton, "--stackit-sa-key-reload-interval="),
+		"a reload interval without a key is meaningless and must not be rendered")
 }

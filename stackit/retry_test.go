@@ -226,7 +226,7 @@ func TestNewRetryTransportDefaults(t *testing.T) {
 // a client-level deadline: the SDK's own default client has none, and adding one
 // would silently cap calls that work today.
 func TestRetryingHTTPClientHasNoTimeout(t *testing.T) {
-	c := retryingHTTPClient()
+	c, _ := retryingHTTPClient()
 	if c.Timeout != 0 {
 		t.Errorf("Timeout = %v, want 0 (context governs deadlines)", c.Timeout)
 	}

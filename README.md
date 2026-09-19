@@ -39,7 +39,8 @@ flowchart LR
 - 🩺 **A provider blip is not an outage of your fleet** — `Ready` reports the last *verified* state ([ADR 0012](docs/adr/0012-ready-describes-the-last-verified-state.md)) and a fleet-wide breaker stops calling a failing provider at all ([ADR 0013](docs/adr/0013-a-provider-outage-is-held-fleet-wide.md)).
 - 🚨 **A vanished bucket is reported, not quietly re-created** — a bucket deleted behind the operator's back fails its `Bucket` instead of reappearing empty under the same name; `spec.allowRecreate` opts one bucket into unattended rebuilds and reports every one ([ADR 0015](docs/adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)).
 - 🧭 **GitOps-safe by construction** — only `status`, the finalizer and one bookkeeping annotation are ever written.
-- 📊 **24 metrics and 13 opt-in alerts**, shipped as a `PrometheusRule` you can switch off rule by rule.
+- 📊 **28 metrics and 16 opt-in alerts**, shipped as a `PrometheusRule` you can switch off rule by rule.
+- 🗝️ **A rotated service-account key needs no restart** — the operator re-reads its key file, proves the replacement with one authenticated call and only then swaps; a truncated, revoked or foreign key is refused and never displaces the one that works ([ADR 0016](docs/adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)).
 - 🧱 **Skeleton mode** — without a service-account key the operator starts, reconciles and makes no cloud call at all.
 
 ## <a id="naming"></a>📛 Naming conventions
@@ -109,7 +110,7 @@ before anything is written. `S3_ENDPOINT` and `S3_BUCKET_URL` are omitted when t
 
 | Where | What lives there |
 | --- | --- |
-| [docs/adr/](docs/adr/README.md) | The fifteen decisions: what the operator does, why, what was rejected and what it costs. |
+| [docs/adr/](docs/adr/README.md) | The sixteen decisions: what the operator does, why, what was rejected and what it costs. |
 | [docs/operations/](docs/operations/README.md) | Running and integrating: prerequisites, deployment, GitOps, configuration, naming, status, deletion, credentials, cloning, read grants, usage and cost, provider outages, vanished buckets, monitoring. |
 | [docs/security/](docs/security/README.md) | The security design, one page per perspective — tenancy and isolation, credentials and Secrets, RBAC and privilege, ownership and attribution — each ending with what it does not cover. |
 | [docs/developer/](docs/developer/README.md) | How the subsystems work, for somebody about to change them — plus the repository layout, the build and test matrix, CI and release, and the extension checklists. |
@@ -376,23 +377,26 @@ monitoring:
   prometheusRule:
     enabled: false                       # default; needs the monitoring.coreos.com CRDs
     labels: {}                           # default
-    alerts:                              # abbreviated: thirteen keys, twelve enabled by default,
-                                         # plus five tuning values - see the alert table below
+    alerts:                              # abbreviated: sixteen keys, fifteen enabled by default,
+                                         # plus seven tuning values - see the alert table below
 stackit:
   region: eu01                           # default; every Bucket's spec.region must match
   serviceAccountKey:
     secretName: ""                       # default; empty = skeleton mode
     secretKey: sa-key.json               # default; mounted at /etc/stackit/<secretKey>
+    reloadInterval: "30s"                # default; how often the mounted key file is re-read and
+                                         # a changed key proven before it is swapped in - Go
+                                         # duration WITH a unit, "0" restores restart-only
 ```
 
 </details>
 
 <details>
-<summary><strong>Helm values</strong> — the thirteen alert toggles</summary>
+<summary><strong>Helm values</strong> — the sixteen alert toggles</summary>
 
-Every key below sits under `monitoring.prometheusRule.alerts` and has `enabled: true` as its
-default — except `bucketRecreated`, which ships off. The `PrometheusRule` is rendered only when
-`monitoring.prometheusRule.enabled` is `true` **and** at least one alert is enabled. What each
+Sixteen keys sit under `monitoring.prometheusRule.alerts`, fifteen of them with `enabled: true` as
+their default — `bucketRecreated` is the one that ships off. The `PrometheusRule` is rendered only
+when `monitoring.prometheusRule.enabled` is `true` **and** at least one alert is enabled. What each
 series counts, and what to do when one fires:
 [docs/operations/monitoring.md](docs/operations/monitoring.md).
 
@@ -404,6 +408,9 @@ series counts, and what to do when one fires:
 | `bucketStuckDeleting.enabled` | `StackitS3BucketStuckDeleting` | A finalizer teardown hangs for 30m — usually the non-empty guard. |
 | `cloneFailed.enabled` | `StackitS3CloneFailed` | A clone stays `Failed` for 30m. |
 | `skeletonMode.enabled` | `StackitS3SkeletonMode` | The operator runs without a service-account key (critical). |
+| `saKeyReloadFailing.enabled` | `StackitS3SaKeyReloadFailing` | The key file on disk keeps being rejected; the operator carries on with the key it already holds, so nothing else shows it. |
+| `saKeyExpiring.enabled`, `.leadTimeDays` (`14` — default) | `StackitS3SaKeyExpiring` | The service-account key in use expires within `leadTimeDays`. Silent for a key file carrying no `validUntil`: the series is then absent. |
+| `saKeyExpiringCritical.enabled`, `.leadTimeDays` (`3` — default) | `StackitS3SaKeyExpiringCritical` | The same measurement at a shorter lead time (critical) — at expiry every `Bucket` fails at once. Both expiry alerts fire below this lead; route them apart by severity. |
 | `wipeRequestedButGateDisabled.enabled` | `StackitS3WipeRequestedButGateDisabled` | A `Bucket` requests a wipe the operator-wide gate forbids. |
 | `reconcileErrors.enabled`, `.threshold` (`6` — default), `.sustainedFor` (`"15m"` — default), `.suppressWhileCircuitOpen` (`true` — default) | `StackitS3ReconcileErrors` | Reconcile errors the circuit breaker did **not** absorb exceed the threshold continuously. |
 | `bucketProviderDegraded.enabled`, `.holdForSeconds` (`1200` — default) | `StackitS3BucketProviderDegraded` | A `Ready` state has been held through failures for longer than `holdForSeconds`. Must stay below `providerDegradedGrace`. |

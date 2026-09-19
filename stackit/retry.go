@@ -111,6 +111,22 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 }
 
+// CloseIdleConnections drains the connection pool underneath this transport.
+//
+// It exists because the obvious call does nothing. A key reload retires the
+// whole SDK client, but by then objectstorage.NewAPIClient has replaced the
+// http.Client's Transport with the key flow's round tripper, and
+// http.Client.CloseIdleConnections only forwards to a transport that implements
+// the method — which neither the key flow nor this type does by default. So the
+// retired pool would sit idle for the full idleConnTimeout while the code
+// pretended otherwise. Closing the base transport reaches both the API and the
+// token-endpoint pools, because the key flow's own auth client is built on it.
+func (t *retryTransport) CloseIdleConnections() {
+	if c, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+}
+
 // retryableRequest reports whether repeating req is safe. Beyond the read-only
 // method check it refuses any request carrying a body: a body is consumed by the
 // first attempt, so replaying one would need GetBody bookkeeping for a case the
@@ -146,10 +162,20 @@ func retryableResult(resp *http.Response, err error) bool {
 	return resp.StatusCode >= http.StatusInternalServerError
 }
 
-// retryingHTTPClient builds the http.Client handed to the SDK. It deliberately
-// sets no Timeout, matching the SDK's own default (an http.Client with zero
-// value fields): request deadlines stay the caller's context's business, and
-// adding one here would silently cap long-running calls that work today.
-func retryingHTTPClient() *http.Client {
-	return &http.Client{Transport: newRetryTransport(retryAttempts, retryBackoff)}
+// retryingHTTPClient builds the http.Client handed to the SDK, and returns the
+// transport alongside it. The transport handle is what lets a retired client's
+// connection pool be drained after a key reload: once the SDK has replaced the
+// http.Client's Transport with its auth round tripper, the client itself can no
+// longer reach the pool.
+//
+// It deliberately sets no Timeout, matching the SDK's own default (an
+// http.Client with zero value fields): request deadlines stay the caller's
+// context's business, and adding one here would silently cap long-running calls
+// that work today.
+//
+// A fresh client and a fresh transport per call, always: objectstorage.NewAPIClient
+// mutates the http.Client it is handed, so sharing one would rewire a live client.
+func retryingHTTPClient() (*http.Client, *retryTransport) {
+	transport := newRetryTransport(retryAttempts, retryBackoff)
+	return &http.Client{Transport: transport}, transport
 }

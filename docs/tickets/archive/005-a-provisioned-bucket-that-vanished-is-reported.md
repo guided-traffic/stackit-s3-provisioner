@@ -15,7 +15,7 @@ that the credentials group is deliberately **left behind** because nothing can a
 its bucket. The verified behaviour was implemented and tested: teardown completes, the Secret is
 removed, the group stays and is reported as `CredentialsGroupNotAttributable`.
 **Scope:** this repo (`stackit-s3-provisioner`).
-**Blocks:** [hot-reload the StackIT service-account key](../007-hot-reload-the-stackit-service-account-key.md) —
+**Blocks:** [hot-reload the StackIT service-account key](007-hot-reload-the-stackit-service-account-key.md) —
 that ticket's Q12 concluded that this guard, not a project-identity check, is what makes a foreign key
 safe. This one stands on its own merit and should land first.
 **ADR:** written as part of implementing this ticket, as its own ADR — decided in review on
@@ -398,7 +398,7 @@ an unattended re-creation the only durable evidence is the Warning event while i
 
 ## References
 
-* [hot-reload the StackIT service-account key](../007-hot-reload-the-stackit-service-account-key.md) — the ticket
+* [hot-reload the StackIT service-account key](007-hot-reload-the-stackit-service-account-key.md) — the ticket
   whose Q12 produced this one
 * [internal/controller/bucket_controller.go](../../../internal/controller/bucket_controller.go) — `ensureBucket`, `resolveWorkloadGroup`, `guardGroupCreate`, `assertBucketEmpty`, `deleteBucketIfOwned`
 * [stackit/client.go](../../../stackit/client.go) — `HasBucket`, `WaitBucketVisible`, `BucketConnInfo`

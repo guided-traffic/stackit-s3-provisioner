@@ -16,7 +16,8 @@ rather than explained twice.
 - [How a setting reaches the process](#how-a-setting-reaches-the-process)
 - [A minimal configuration](#a-minimal-configuration)
 - [Durations carry a unit, always](#durations-carry-a-unit-always)
-- [Nothing is hot-reloaded](#nothing-is-hot-reloaded)
+- [Exactly one setting is hot-reloaded](#exactly-one-setting-is-hot-reloaded)
+- [The service-account key reload interval](#the-service-account-key-reload-interval)
 - [The region, and the trap under it](#the-region-and-the-trap-under-it)
 - [The drift resync interval](#the-drift-resync-interval)
 - [Leader election](#leader-election)
@@ -170,28 +171,80 @@ The complete list of startup faults, their log lines and their fixes is in
 
 ---
 
-## Nothing is hot-reloaded
+## Exactly one setting is hot-reloaded
 
 Every flag is read once, in `main()`, and copied into the reconcilers before the manager starts.
-There is no configuration watch and no SIGHUP path. **Changing any operator setting takes effect on
-the next process start, and on no earlier event.**
+There is no configuration watch and no SIGHUP path. **Changing an operator setting takes effect on
+the next process start**, with exactly one exception: the *contents* of the service-account key
+file, which the operator re-reads on a timer
+([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D1).
+
+The line is not arbitrary. Every other setting is a flag or a Helm value, so changing it already
+rolls the pod; the key is the only input that changes *without anybody touching the deployment*,
+because an external rotation mechanism writes the Secret. `ownership.name` is the example that
+shows why the contract stays narrow rather than growing: it is part of the bucket ownership key, so
+re-reading it at runtime would make the operator treat its own buckets as foreign.
 
 In practice `helm upgrade` handles most of this for you, because a changed flag changes the pod
 template and Kubernetes rolls the Deployment. The cases where it does *not* are the ones that bite:
 
 | What you changed | Does the pod restart? | Effect |
 | --- | --- | --- |
-| Any value rendered into `args:` — region, drift resync, grace, circuit, naming, ownership, wipe gate, clone image, usage settings | Yes, the pod template changed | Applies after the rollout completes |
+| Any value rendered into `args:` — region, drift resync, grace, circuit, naming, ownership, wipe gate, clone image, usage settings, the key reload interval | Yes, the pod template changed | Applies after the rollout completes |
 | `resources`, `clone.resources`, `podAnnotations`, `podLabels`, `nodeSelector`, `tolerations`, `affinity`, `image.*`, `replicaCount` | Yes | Applies after the rollout completes |
 | `leaderElection.enabled` | Yes, and the ClusterRole rule changes with it | See [Leader election](#leader-election) |
-| **The contents of the service-account key Secret** | **No** — the Deployment is unchanged | The running process keeps using the key it started with |
+| **The contents of the service-account key Secret** | **No** — the Deployment is unchanged | Picked up by the running process within the window below, after the new key has been proven |
 | `monitoring.*`, `bucketRoles.create`, `crds.install` | No — they render other objects | Applies immediately; nothing in the operator process depends on them |
 
-The service-account key is the sharp edge. The key file is read once at startup, and project,
-credential and region are fixed for the lifetime of the process
-([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D8). Replacing the Secret's
-contents — a rotated key, a key moved to another project — changes nothing until you restart the
-operator yourself:
+---
+
+## The service-account key reload interval
+
+`stackit.serviceAccountKey.reloadInterval` (`"30s"` # default) is how often the operator re-reads
+the mounted key file. It is rendered as `--stackit-sa-key-reload-interval` and only when a key is
+configured at all; skeleton mode has nothing to reload.
+
+### The window, end to end
+
+Three waits add up, and the one you configure here is the smallest of them:
+
+| Stage | How long | Whose |
+| --- | --- | --- |
+| The kubelet refreshes the Secret volume inside the container | up to about 90 seconds | Kubernetes', not this operator's |
+| The operator notices the changed content and proves the new key | up to one `reloadInterval` | yours |
+| Every failed `Bucket` retries and goes healthy again | up to one `driftResyncInterval` (`"10m"` # default) | yours |
+
+Nothing is re-enqueued on a successful reload
+([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D9): the
+ordinary requeue machinery is the recovery path, which is why the drift resync bounds the last
+stage. Lowering `reloadInterval` below `30s` therefore buys very little — the kubelet dominates the
+front of the window and the resync dominates the back.
+
+### A new key is proven before it is used
+
+The operator compares a hash of the file's content, so a rewrite that changes nothing costs no API
+call. When the content *has* changed, the candidate must parse, carry a `projectId`, name the **same
+project** the process started with, be accepted as key material, and mint a token in one live call —
+and only then does it replace the running credential. A candidate that fails any of those is
+discarded and the running key is kept.
+
+That is the whole point of the feature being safe to switch on: a truncated write, an empty file or
+a key the provider has already revoked cannot take down a healthy operator. The price is that a
+rotation which never lands is **silent from the outside** — the operator keeps working on the old
+key — so the two things to watch are the operator log and
+`stackit_s3_provisioner_sa_key_reload_failing`, with `StackitS3SaKeyReloadFailing` as the alert
+([monitoring.md](monitoring.md)).
+
+The project check holds for one process lifetime only. A restarted pod has no memory of the previous
+project and adopts whatever the file names; what bounds the damage there is
+[ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md), not this check.
+
+### Switching it off
+
+`reloadInterval: "0"` disables the poll entirely and restores the behaviour that needed a restart,
+exactly — no polling, no validation calls, and none of the four `sa_key` series exported. It is a
+values-only rollback that needs no new image, the same escape hatch `providerCircuit.threshold`
+offers. With it off, a rotation is:
 
 ```bash
 NS=stackit-s3-provisioner-system      # example; the release namespace
@@ -201,17 +254,8 @@ kubectl -n $NS logs deploy/stackit-s3-provisioner \
 # expected: the project id from the NEW key, and the configured region
 ```
 
-Until that restart, an operator whose key was revoked out of band keeps authenticating with a dead
-credential. The failure arrives as a structured `400` from the token endpoint rather than the
-authorisation error one would expect, and it is one of the errors that is *not* held through the
-degraded grace — see [provider-outages.md](provider-outages.md#what-is-not-held).
-
-*Not verified, and this is the gap:* whether the provider SDK re-reads the key file from disk on each
-token refresh, which would matter for a Secret updated in place rather than by a rollout. The
-operator's own binding is fixed either way, because the project id is parsed once; the ADR states the
-rule and the SDK's internal behaviour was not tested.
-
----
+The step-by-step rotation procedure, with and without the reload, is
+[credentials.md](credentials.md#rotating-the-stackit-service-account-key).
 
 ## The region, and the trap under it
 
@@ -401,7 +445,7 @@ the [README reference](../../README.md) and nowhere else.
 
 | Values block | What it controls | Explained in |
 | --- | --- | --- |
-| `stackit.serviceAccountKey` | The project binding and the account setup behind it | [prerequisites.md](prerequisites.md) |
+| `stackit.serviceAccountKey` | The project binding and the account setup behind it | [prerequisites.md](prerequisites.md); the rotation itself is [credentials.md](credentials.md#rotating-the-stackit-service-account-key), the reload interval is [above](#the-service-account-key-reload-interval) |
 | `crds`, `image`, `replicaCount`, `resources`, scheduling keys | Install, upgrade, uninstall | [deployment.md](deployment.md) |
 | `bucketRoles` | Who may create a `Bucket`, and what that delegates | [deployment.md](deployment.md), [rbac-and-privilege.md](../security/rbac-and-privilege.md) |
 | `bucketNaming`, `ownership` | The physical bucket name and the ownership identity a restore must reproduce | [bucket-naming.md](bucket-naming.md) |
@@ -426,7 +470,9 @@ the pod crash-loops with the reason in its log rather than running half-configur
 | Every `Bucket` in `Failed` with `spec.region "…" does not match this operator's region "…"` | `stackit.region` and the CRD's `eu01` default for `spec.region` disagree. Definitive, never retried ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D3/D4). | Either set `stackit.region: eu01`, or set `spec.region` explicitly on every `Bucket`. |
 | A new operator version's policy has not reached existing buckets | The `Bucket` watch does not fire for untouched CRs; only the drift resync does ([ADR 0003](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md) D8). | Wait one `driftResyncInterval`. Confirm it is not `"0"`. **Never delete a `Bucket` CR to force it** — deletion is a teardown ([ADR 0006](../adr/0006-a-bucket-is-deleted-only-when-it-is-empty.md)). |
 | No `bucket provisioned` log line for minutes, `Bucket` resources exist | `driftResyncInterval: "0"`, skeleton mode, or an open provider circuit. | Check the startup log line for the interval; check `stackit_s3_provisioner_skeleton_mode` and `stackit_s3_provisioner_provider_circuit_open` ([monitoring.md](monitoring.md)). |
-| A rotated service-account key still fails after `helm upgrade` | Replacing the Secret's contents does not change the Deployment, so the pod never restarted and still holds the old key ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D8). | `kubectl rollout restart` the Deployment, then confirm the project id in the `StackIT client configured` log line. |
+| A rotated service-account key still has not taken effect | Either the reload is switched off (`reloadInterval: "0"`), or the window has not elapsed: the kubelet needs up to about 90 seconds to refresh the Secret volume, then one `reloadInterval`, then one `driftResyncInterval` for the fleet. | Wait out the window. If the reload is off, `kubectl rollout restart` the Deployment and confirm the project id in the `StackIT client configured` log line. |
+| `stackit_s3_provisioner_sa_key_reload_failing` is `1`, the fleet is healthy | The operator is **refusing** the key on disk and carrying on with the one it holds: the file does not parse, it names a different StackIT project, or the provider will not mint a token with it ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D3). | Read the operator log for the rejection reason — it is logged once per distinct file content — and fix the Secret. Nothing breaks until the old key expires, which is what `StackitS3SaKeyExpiring` watches. |
+| The operator log says a candidate key `names project … , the operator is bound to …` | The mounted Secret was replaced with a key for a different project. The running process refuses it. | Mount the right key. Note that this guard is gone after a restart: the new process adopts whatever the file names, and the protection is then [ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) reporting every bucket as missing. |
 | Provider answers `rate limit on IP level exceeded` during normal operation | Steady drift-resync traffic scaled past the provider's per-IP limit. Resync requeues are not paced by the workqueue rate limiter. | Raise `driftResyncInterval`. Background and the 2026-09-02 incident: [provider-outages.md](provider-outages.md). |
 | Two operator pods **from two different releases** in one namespace, only one ever reconciles (for one release, this is the intended `replicaCount: 2` behaviour and not a fault) | The leader-election lease identity is a constant, not release-scoped, so both releases contend for one lease. | Install each release into its own namespace. |
 | `leases.coordination.k8s.io is forbidden` in the operator log | `--leader-elect` is on the command line while the `leases` RBAC rule is absent. **The chart cannot produce this**: both are gated on `leaderElection.enabled`, so it means the Deployment was patched out of band or the binary runs outside this chart. | Put the setting back under the Helm value, or add the `coordination.k8s.io/leases` rule to whatever role the process runs with. |

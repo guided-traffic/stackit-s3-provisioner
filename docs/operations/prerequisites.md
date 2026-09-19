@@ -218,6 +218,7 @@ What each party uses:
 | --- | --- |
 | `projectId` | The operator, to bind the deployment to a project (`LoadAccount` in [stackit/client.go](../../stackit/client.go)) |
 | `credentials.iss` | The operator, for log lines only |
+| `validUntil`, where the key carries one | The operator, to export when the key in use expires ([ADR 0016 D10](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)). A key file without the field is a normal shape, and then nothing is exported rather than a zero — see [monitoring.md](monitoring.md) |
 | everything else | The SDK's key flow; the operator never parses the private key |
 
 Two consequences of how it is read:
@@ -225,9 +226,23 @@ Two consequences of how it is read:
 * **A key path that is configured but unusable aborts startup.** A file that cannot be read, or JSON
   without a `projectId`, makes the process exit rather than fall back to provisioning nothing
   ([ADR 0005 D7](../adr/0005-the-operator-serves-one-project-in-one-region.md)).
-* **The key is read once, at process start.** Replacing it takes effect on the next restart, and
-  until then the running process keeps authenticating with the key it started with
-  ([ADR 0005 D8](../adr/0005-the-operator-serves-one-project-in-one-region.md)).
+* **The key is re-read while the operator runs, and a replacement is proven before it is used.** The
+  process polls the file every `stackit.serviceAccountKey.reloadInterval` (`30s` `# default`) and
+  compares its content against the key in use; identical content is a no-op and costs no API call.
+  Content that differs is validated first — it must parse, carry a `projectId`, name the same
+  project the process started with, be accepted by the SDK, and mint a token in one live call made
+  with the candidate — and only then is the authenticated client swapped over. A candidate that
+  fails any of those steps is refused and the running key is left exactly where it is, which is what
+  keeps a truncated write or an already-revoked key from taking down a healthy operator
+  ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)). Setting
+  the interval to `"0"` switches the reload off and restores the restart-only behaviour.
+
+How long a replacement takes to land is the sum of three waits, and the first is the largest and is
+not this operator's: the kubelet needs **up to about 90 seconds** to refresh a Secret volume inside
+a running container, then up to one poll interval for the operator to notice, and then up to one
+`driftResyncInterval` (`10m` `# default`) for the `Bucket` resources that had already failed on the
+old key to be reconciled again. Rotating the key is a procedure with steps of its own —
+[credentials.md](credentials.md).
 
 The file is a credential for the whole project. Keep it out of Git — `account-*.json` is in
 [.gitignore](../../.gitignore) for exactly this reason — and hand it to the cluster as a Secret, as
@@ -291,10 +306,13 @@ stackit:
     secretKey: sa-key.json          # default
 ```
 
-Both are read once at startup. Changing either needs a pod restart
-([ADR 0005 D8](../adr/0005-the-operator-serves-one-project-in-one-region.md)); `helm upgrade` rolls
-the Deployment, so an upgrade that changes them restarts on its own. Every other value in the chart
-is documented in [the README reference](../../README.md).
+Both are read once at startup. Changing the region needs a pod restart
+([ADR 0005 D8](../adr/0005-the-operator-serves-one-project-in-one-region.md)), and so does pointing
+the operator at a different Secret or a different data key, because both are rendered into the
+Deployment. Changing the *contents* of the Secret already referenced is the one change that needs no
+restart ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)).
+`helm upgrade` rolls the Deployment anyway, so an upgrade that changes any of these restarts on its
+own. Every other value in the chart is documented in [the README reference](../../README.md).
 
 ---
 
@@ -361,8 +379,14 @@ deleted out of band — is on [credentials.md](credentials.md).
 
 Nothing pins which project a deployment is *expected* to serve. The project is whatever the mounted
 key names, so mounting the wrong key moves an entire cluster's provisioning into a different project
-with no configuration looking wrong and no check firing. Recorded under *Residual risks* in
-[ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md).
+with no configuration looking wrong and nothing checking it at startup. One narrow check exists and
+does not close this: a key *replaced while the operator runs* is compared against the project that
+process started with and refused if it names another one, but a restart erases that reference point
+and the new process adopts whatever the file says
+([ADR 0016 D4](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)).
+Recorded under *Residual risks* in
+[ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) and as a gap in
+[../security/tenancy-and-isolation.md](../security/tenancy-and-isolation.md).
 
 ---
 
@@ -433,8 +457,8 @@ whole project and are never torn down with a `Bucket`.
 | What went wrong | What the operator shows | What to do |
 | --- | --- | --- |
 | No key configured at all | Pod healthy, probes green, log `running in skeleton mode`; every `Bucket` at phase `Pending`, `Ready=False`, reason `NotImplemented`, message `operator skeleton: no StackIT service-account key configured`; metric `stackit_s3_provisioner_skeleton_mode` = 1 (always exported); alert `StackitS3SkeletonMode` after 15m, severity critical, **only when `monitoring.prometheusRule.enabled` is set to true — it defaults to `false`, so a default install shows no alert at all** | Set `stackit.serviceAccountKey.secretName` and check the referenced Secret exists |
-| Key path configured but the file is missing, unreadable or has no `projectId` | Startup aborts: log `unable to load StackIT service-account key` with the path, then `CrashLoopBackOff`. This is intentional — the operator never degrades from "should provision" to "provisions nothing" ([ADR 0005 D7](../adr/0005-the-operator-serves-one-project-in-one-region.md)) | Check the Secret's data key name against `stackit.serviceAccountKey.secretKey`, and that the exported JSON is complete |
-| Key revoked or deleted after startup | `Ready=False`, reason `Failed`, immediately — no grace period. The failure arrives as a structured `400 {"error":"invalid_grant"}` from the token endpoint, not the `401`/`403` one would expect, because the key flow never reaches the object-storage API; a structured `400` is one of the enumerated definitive refusals ([ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md)). Verified live on 2026-08-25 | Issue a new key, replace the Secret, **restart the pod** — the key is read only at start |
+| Key path configured but the file is missing, unreadable, empty or has no `projectId` | Startup aborts: log `unable to configure the StackIT client` with the path and the underlying `load StackIT service-account key: …`, then `CrashLoopBackOff`. This is intentional — the operator never degrades from "should provision" to "provisions nothing" ([ADR 0005 D7](../adr/0005-the-operator-serves-one-project-in-one-region.md)) | Check the Secret's data key name against `stackit.serviceAccountKey.secretKey`, and that the exported JSON is complete |
+| Key revoked or deleted after startup | `Ready=False`, reason `Failed`, immediately — no grace period. The failure arrives as a structured `400 {"error":"invalid_grant"}` from the token endpoint, not the `401`/`403` one would expect, because the key flow never reaches the object-storage API; a structured `400` is one of the enumerated definitive refusals ([ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md)). Verified live on 2026-08-25 | Issue a new key and write it into the **same** Secret; the operator picks it up without a restart once it has proven it ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)) — see [credentials.md](credentials.md) for the procedure and [the window above](#the-key-file) for how long it takes. If the operator refuses the replacement it says so in the log and holds `stackit_s3_provisioner_sa_key_reload_failing` at `1` while it keeps using the old key. **Restarting the pod** is the fallback, and the only route when the reload is switched off (`stackit.serviceAccountKey.reloadInterval: "0"`) |
 | Role missing, too narrow, or removed from the project | Structured `403` from the API, classified as a definitive refusal ([ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md)): `Ready=False`, reason `Failed`, no readiness hold. `status.message` names the operation that was refused | Re-grant the role at project level and let the next reconcile run |
 | Role granted at **organisation** level | **Nothing.** Every `Bucket` goes `Ready`, every metric is green, and the tenant boundary is gone ([ADR 0005 D5](../adr/0005-the-operator-serves-one-project-in-one-region.md)) | Audit the grant in the portal. There is no in-cluster signal to wait for |
 | A workload handed a key from the project's **default credentials group** | **Nothing.** Its `Bucket` reaches `Ready`, its own credentials group is created and untouched, and the extra key is invisible to the operator — the reach it carries is over everything in the project the operator has not written a policy for | Audit the project's credentials groups and access keys in the portal, then move the workload onto the Secret its `Bucket` writes ([credentials.md](credentials.md)) |
@@ -455,9 +479,10 @@ on [provider-outages.md](provider-outages.md).
 | --- | --- |
 | [deployment.md](deployment.md) | Installing, upgrading and uninstalling the chart |
 | [configuration.md](configuration.md) | What the settings do and when a restart is needed |
-| [credentials.md](credentials.md) | The operator's admin Secret and rotating a workload key |
+| [credentials.md](credentials.md) | The operator's admin Secret, rotating the service-account key, and rotating a workload key |
 | [bucket-status.md](bucket-status.md) | Reading a parked or held `Bucket` |
 | [monitoring.md](monitoring.md) | The skeleton-mode metric and the rest of the alert set |
 | [ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) | Why one project, one region, one deployment |
+| [ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) | Why a replacement key is proven before it is used, and what a refused one does |
 | [ADR 0004](../adr/0004-the-operator-bootstraps-its-own-s3-admin-credential.md) | Why the operator mints its own S3 admin credential |
 | [../security/tenancy-and-isolation.md](../security/tenancy-and-isolation.md) | What the project boundary defends against, and what it does not |

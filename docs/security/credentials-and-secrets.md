@@ -14,7 +14,7 @@ cluster may reach these Secrets through Kubernetes RBAC is in
 
 | Credential | Where it lives | Minted by | Scope of what it can do | Rotatable by this operator |
 |---|---|---|---|---|
-| STACKIT service-account key | a Secret in the operator namespace, mounted read-only into the pod | a human, in the cloud console | the whole project's **control plane**: create and delete buckets, credentials groups and access keys | no — replaced out of band, takes effect on restart |
+| STACKIT service-account key | a Secret in the operator namespace, mounted read-only into the pod | a human, in the cloud console | the whole project's **control plane**: create and delete buckets, credentials groups and access keys | no — replaced out of band, and picked up at runtime once the operator has proven the new key ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)) |
 | Operator S3 admin credential | the operator-owned Secret in the operator namespace | the operator itself, on first need | the whole project's **data plane**: exempt from the deny statement of every bucket policy the operator writes | only by deleting the Secret and restarting ([ADR 0004](../adr/0004-the-operator-bootstraps-its-own-s3-admin-credential.md) D9) |
 | Workload credential | the Secret named by `spec.secretRef.name`, in the `Bucket`'s own namespace | the operator, per `Bucket` | object operations inside that one bucket, plus read on buckets that grant it | yes, on request ([ADR 0007](../adr/0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md) D8) |
 | Clone source credential | a Secret the CR author supplies in the `Bucket`'s namespace, copied into a staging Secret in the operator namespace for the duration of the copy | whoever owns the source endpoint | whatever the foreign endpoint grants it | no — it is not this operator's credential |
@@ -53,12 +53,45 @@ skeleton mode and makes no cloud call at all. Because the key arrives as a volum
 never reads it through the API server, and nothing in the cluster has to grant it access to that
 particular Secret.
 
-**It is read once.** `LoadAccount` reads the file at process start, and the SDK's own
-`auth.SetupAuth` does a single `os.ReadFile` of the path while the API client is being constructed
-(verified in `core@v0.26.0/auth/auth.go`). The key material then lives in process memory for the
-life of the process. Replacing the mounted Secret changes nothing until the pod restarts — which
-is the same shape as the admin credential's cache and is recorded as an open item in
-[ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md).
+**The SDK snapshots it, so the operator replaces the whole client.** `clients.KeyFlow.Init` parses
+the RSA material into process memory when the API client is constructed and every later token
+refresh signs from there; the file is never looked at again (verified in `core@v0.26.0`). There is
+therefore nothing smaller to swap than the authenticated client itself, which is what the operator
+does: it polls the mounted file every
+`stackit.serviceAccountKey.reloadInterval` (`"30s"` # default), and when the content has changed it
+builds a candidate client, proves it with one authenticated call, and only then replaces the live
+one ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)).
+
+**Replacing the Secret is therefore a live operation, and that is a real change in blast radius.**
+It used to need a restart; now it takes effect by itself within the poll window, and the change no
+longer coincides with a restart somebody would have noticed. The restart requirement was never a
+security control — anybody who can write that Secret can already make the operator authenticate as
+whatever they put there, and can trigger the restart by deleting the pod — so what changed is the
+time to effect, not who can do it. The sharpest form of "authenticate as whatever they put there"
+is worth spelling out, because it is easy to miss: the key file also names its own token endpoint
+(`credentials.tokenEndpoint`), and the SDK honours it, so a written key sends the operator's signed
+assertion to a host of the writer's choosing. That was already true at startup before this record;
+what the reload changes is that it no longer waits for one, and that a *refused* candidate still
+reaches its endpoint once per validation attempt, on the backoff of
+[ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D7. The
+assertion is signed with the private key from that same file, so nothing of the operator's own
+credential leaks; what the writer gains is an outbound request from the operator's network
+position, which is a `NetworkPolicy` question and not a credential one. Who can write it is
+[rbac-and-privilege.md](rbac-and-privilege.md), and it is unchanged.
+
+**A candidate is refused rather than adopted if it cannot be proven.** It must parse, carry a
+`projectId`, name the same project the running process started with, be usable key material, and
+mint a token. A refusal is a complete no-op — the running credential stays — which is what stops a
+truncated write or an already-revoked key from taking a healthy operator down within a poll
+interval. The residual risk is the opposite one, and it is H-25 below: a refusal is quiet from the
+outside, so it has to be alarmed on rather than noticed.
+
+**The key's own expiry is now read.** STACKIT stamps `validUntil` into the key file — 90 days after
+issue on the keys checked on 2026-09-19 — and the operator exports it as
+`stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds`, so the remaining lifetime of the
+project's master credential is a query rather than a diary entry. The series is absent for a key
+file that carries none, and the operator still manages nothing about this key's lifetime: it
+reports, it does not renew.
 
 **Revocation is loud, and deliberately so.** A revoked or deleted key fails at the token endpoint,
 not at the storage API: HTTP 400 with `{"error":"invalid_grant"}`, measured against the live
@@ -91,7 +124,8 @@ and a fresh key, which is what the operator used to do to the whole fleet at onc
 operator accepts as the provider's own answer, rather than as a failure to reach it, is in
 [ownership-and-attribution.md](ownership-and-attribution.md)). No reconcile destroys anything while
 the wrong key is in use, and the fleet recovers by itself once the right one is back in the process
-— which takes a restart, see [H-12](#h-12--replacing-the-service-account-key-requires-a-restart).
+— which no longer takes a restart, because the operator picks the corrected key up from the mounted
+file within the poll window.
 That covers reconciles only: a `Bucket` *deleted* meanwhile still tears down, and its teardown reads
 the bucket as absent through the same project listing, so it skips the empty check and the bucket
 delete, removes the workload Secret and drops the finalizer, leaving the real bucket and its
@@ -470,17 +504,6 @@ somewhere its owner cannot see and would not think to rotate. An operator can li
 `app.kubernetes.io/component: clone` in the operator namespace and match them against `Bucket`
 objects still cloning.
 
-### H-12 — Replacing the service-account key requires a restart
-
-The key is read once at process start, by this operator and by the SDK underneath it, and the
-material then lives in process memory. Replacing the mounted Secret — after a suspected compromise,
-or as routine hygiene — has no effect until the pod restarts, and nothing in the operator reports
-that the file on disk and the key in use have diverged. Live today. The adversary is whoever
-obtained the old key; revoking it in the cloud console does take effect immediately and is visible
-(`invalid_grant`, see *The service-account key is the project's master credential*), so the safe
-order is revoke first, then replace and restart — not replace and assume. There is no expiry on
-this key and nothing in this operator manages its lifetime.
-
 ### H-13 — Nothing records who requested a rotation
 
 `status.lastRotationTrigger`, `status.lastRotationTime` and the `CredentialsRotated` event say that
@@ -489,3 +512,16 @@ operator never mutates it, so the object itself does not carry the actor either.
 `Bucket` is enough to destroy its live credential, an unexplained outage has no attribution inside
 the cluster's own state. Live today. The only record is the API server's audit log, if one is
 enabled — which is the one thing an operator can do about it in advance.
+
+### H-25 — A refused service-account key is silent outside the metrics
+
+Replacing the mounted key no longer needs a restart, but a replacement the operator *refuses* leaves
+nothing broken: it carries on with the key it already holds, every `Bucket` stays healthy, and the
+cluster's own state says nothing at all. The whole signal is
+`stackit_s3_provisioner_sa_key_reload_failing`, the `StackitS3SaKeyReloadFailing` alert over it, and
+one log line per distinct file content. Live today. The adversary is nobody — this is an
+availability and hygiene gap, not an attack path — but it matters after a suspected compromise: the
+safe order is still revoke first, then replace, and revoking makes the refusal an outage instead of
+a silence. Whoever rotates without scraping these metrics, or with
+`stackit.serviceAccountKey.reloadInterval: "0"` set (which exports none of them), finds out at
+expiry, when every `Bucket` in the cluster drops at once.

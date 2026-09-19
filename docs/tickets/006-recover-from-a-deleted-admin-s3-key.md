@@ -3,7 +3,7 @@
 **Status:** Draft — split out of the hot-reload ticket in review on 2026-09-19. Design proposal, open
 questions listed. Not approved for implementation.
 **Scope:** this repo (`stackit-s3-provisioner`).
-**Relates to:** [hot-reload the StackIT service-account key](007-hot-reload-the-stackit-service-account-key.md)
+**Relates to:** [hot-reload the StackIT service-account key](archive/007-hot-reload-the-stackit-service-account-key.md), which landed as [ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)
 — its Q8. Different credential, different cause, different fix: the SA key is rotated *from outside*
 and lives in a file; the admin S3 key is minted *by the operator* and only ever breaks when somebody
 deletes it in the cloud. A file watch would not help here.

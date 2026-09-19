@@ -335,8 +335,9 @@ bootstrap itself.
 The Secret's name and namespace come from `--admin-credentials-secret-name` /
 `ADMIN_CREDENTIALS_SECRET_NAME` (default `stackit-s3-provisioner-admin`) and
 `--operator-namespace` / `POD_NAMESPACE`, wired in
-[cmd/main.go:78-83](../../cmd/main.go#L78-L83). A configured service-account key with no
-known namespace exits at startup ([cmd/main.go:275-277](../../cmd/main.go#L275-L277)), which is
+[cmd/main.go:90-95](../../cmd/main.go#L90-L95). A configured service-account key with no
+known namespace exits at startup, in `newStackitClient`
+([cmd/main.go:363-365](../../cmd/main.go#L363-L365)), which is
 [ADR 0004 D4](../adr/0004-the-operator-bootstraps-its-own-s3-admin-credential.md). The
 Helm chart does not template either setting and does not create the Secret — verified by
 grep over [deploy/helm/stackit-s3-provisioner/](../../deploy/helm/stackit-s3-provisioner/):

@@ -150,6 +150,28 @@ The flip side: `400` also covers a genuinely malformed request the API rejects. 
 will never accept does not fix itself — but it means a provider-side tightening of request
 validation surfaces as a hard failure, not as a degradation.
 
+**The same classification is what the key reload's retry policy keys off.** When a rotated key is
+put on trial, `(*Client).reload` in [`stackit/keyreload.go`](../../stackit/keyreload.go) makes one
+live `GetServiceStatus` call with the candidate client and asks `ProviderRefused` about the answer.
+A match is the provider itself deciding: either the token endpoint refusing to mint a token for the
+candidate (`400 invalid_grant`, the case above) or the API refusing the probe made with it
+(a structured `401`/`403`). Either way the rejection is marked *definitive* and the same bytes are
+retried on a doubling schedule from one poll interval up to ten minutes. Anything else is the provider not answering at all — a `5xx`, a
+gateway page, a transport failure — and says nothing about the key, so the candidate is retried
+every interval with no backoff
+([ADR 0016 D7](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)). It is
+the same `apiAnswer` body test doing the same job one layer over: an nginx page carrying `403` must
+not be allowed to condemn a key that is perfectly good.
+
+**Not verified: whether a freshly issued key answers with a definitive `400` while it propagates.**
+Nothing here has measured how long STACKIT's token endpoint takes to recognise a key it has just
+issued, and if there is such a window the answer during it is indistinguishable from a revoked key —
+a structured `400`, classified definitive, backed off. The backoff is written so the answer does not
+change the outcome: the retry is capped at ten minutes and is never given up on while the file
+content differs from the loaded key, so a key that needed time activates by itself within ten
+minutes at worst. Holding a definitively rejected hash until the file changes again was rejected for
+exactly this case.
+
 ## Service status: only a structured 404 may lead to a write
 
 `EnsureService` in [`stackit/client.go`](../../stackit/client.go) is the one place where reading an
@@ -231,8 +253,10 @@ question is asked on the control plane only.
 The SDK does not retry: `config.WithMaxRetries` has been `func WithMaxRetries(_ int)` — a literal
 no-op — since `core v0.26.0`, verified in the pinned module. Without a transport of its own, a
 single dropped keep-alive connection is a failed reconcile.
-[`stackit/retry.go`](../../stackit/retry.go) supplies one, installed by `NewClient` through
-`config.WithHTTPClient(retryingHTTPClient())`.
+[`stackit/retry.go`](../../stackit/retry.go) supplies one, installed by `newKeyFlowAPIClient` in
+[`stackit/client.go`](../../stackit/client.go) through
+`config.WithHTTPClient(&http.Client{Transport: newRetryTransport(…)})` — the one constructor both
+`NewClient` and a key reload build through, each getting its own transport.
 
 **It sits beneath the SDK's auth.** `auth.KeyAuth` in the SDK's `core/auth/auth.go` adopts
 `cfg.HTTPClient.Transport` as the key flow's *inner* transport (verified in `core v0.26.0`, the
@@ -269,8 +293,8 @@ Two predicates decide a retry, and both are narrow on purpose:
 **The token fetch is a POST and is therefore not retried.** It traverses the same transport
 unretried, so a token fetch failing during a blip fails the whole reconcile. That is deliberate:
 the requeue and the readiness hold already cover it, and it is preferable to carving a per-endpoint
-exception into the rule that no write is ever repeated. The reasoning is recorded in `NewClient`'s
-doc comment in [`stackit/client.go`](../../stackit/client.go).
+exception into the rule that no write is ever repeated. The reasoning is recorded in
+`newKeyFlowAPIClient`'s doc comment in [`stackit/client.go`](../../stackit/client.go).
 
 **The S3 data plane is not covered by this transport and does not need to be.** `S3Admin` in
 [`stackit/s3.go`](../../stackit/s3.go) is a `minio-go` client that overrides only credentials, TLS,

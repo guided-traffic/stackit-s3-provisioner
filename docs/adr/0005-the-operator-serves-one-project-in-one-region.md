@@ -5,16 +5,19 @@
 Accepted. Date: 2026-09-19. The deployment model itself was decided on 2026-06-30, before any code
 existed; this record states it as a rule and is written after the fact, so the alternatives below are
 reconstructed from the feasibility findings of that date rather than from a design discussion.
+Amended on 2026-09-19 by
+[ADR 0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md): D8 held for the
+project, the region *and* the credential; the credential half is struck through there and replaced
+by that record. Project and region remain fixed at process start.
 
 Implemented and in use: the project comes from the service-account key, the region is an install-time
 setting defaulting to `eu01`, a `Bucket` whose `spec.region` disagrees with the operator's region is
 parked as a configuration fault, and an operator started without a key runs in skeleton mode and
-makes no provider call. Four items are open and all four are named under Residual risks: the key is
-read once at process start, so replacing it needs a restart; nothing declares or checks which project
-a deployment is expected to serve, so the binding is whatever the mounted key names; the exact
-minimal project-scoped role the service account should hold is still unknown, so deployments today
-are granted a broader role than the decision wants; and whether bucket names are unique per project
-or shared across the projects of a region was never answered.
+makes no provider call. Three items are open and all three are named under Residual risks: nothing
+declares or checks which project a deployment is expected to serve, so the binding is whatever the
+mounted key names; the exact minimal project-scoped role the service account should hold is still
+unknown, so deployments today are granted a broader role than the decision wants; and whether bucket
+names are unique per project or shared across the projects of a region was never answered.
 
 ## Context
 
@@ -119,9 +122,14 @@ is entered only when no key path is configured at all. A key path that cannot be
 carries no `projectId`, aborts startup. The operator never falls back from "should provision" to
 "provisions nothing".
 
-**D8 — The binding is fixed for the lifetime of the process.** Project, credential and region are
-resolved at start. Replacing the key or changing the region takes effect on the next restart, and
-until then the running process keeps serving the binding it started with.
+**D8 — The project and the region are fixed for the lifetime of the process.** They are resolved at
+start, and changing either takes effect on the next restart; until then the running process keeps
+serving the binding it started with. ~~The credential is fixed too: replacing the key takes effect on
+the next restart.~~ The credential half was struck on 2026-09-19 and is now
+[ADR 0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md), which re-reads the
+key file at runtime and swaps it after proving it. The project cannot change with it: a candidate key
+naming a different project is refused for as long as that process lives — a guardrail, not a
+boundary, as that record's D4 states.
 
 **D9 — A second project or a second region means a second deployment, and two deployments never share
 a project.** Each deployment carries its own key, its own region, its own operator namespace and its
@@ -205,15 +213,21 @@ provider calls rather than a startup error.
 
 ## Residual risks
 
-Replacing the service-account key requires restarting the operator, because the key is read once at
-start. A key revoked out of band leaves the process authenticating with a dead credential until it is
-restarted, and that failure arrives as a structured 400 from the token endpoint rather than the
-authorisation error one would expect.
+A key revoked out of band leaves the process authenticating with a dead credential until a working
+one reaches the mounted file, and that failure arrives as a structured 400 from the token endpoint
+rather than the authorisation error one would expect. Recovering from it no longer requires a
+restart — [ADR 0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) — but the
+window until the replacement lands is still an outage for the whole fleet.
 
 Nothing pins the project a deployment is expected to serve. The project is whatever the mounted key
 names, so mounting the wrong key moves an entire cluster's provisioning into a different project
 without any configuration looking wrong. There is no setting to declare the expected project id and
-no check that the key matches it.
+no check that the key matches it. The in-process check of
+[ADR 0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D4 does not close
+this: it compares a candidate against the project the *running process* started with, so a restart
+erases the reference point and the new process adopts whatever the file says. What bounds the damage
+is [ADR 0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md), which reports every
+provisioned bucket as missing rather than re-creating it.
 
 The exact minimal project-scoped role the service account needs is still unknown, so deployments are
 granted a broader role than this decision wants. The requirement is only that the role stays scoped to
@@ -248,6 +262,8 @@ accounts have since been replaced; they have not been repeated against the curre
   depends on, including the project-level-roles-only rule
 * [docs/operations/deployment.md](../operations/deployment.md) — running one deployment per project and
   supplying the key
+* [ADR 0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) — the record that
+  took the credential out of D8 and re-reads the key at runtime
 * [docs/operations/configuration.md](../operations/configuration.md) — what the region and key settings
   do and when a restart is needed
 * [docs/operations/bucket-status.md](../operations/bucket-status.md) — reading a `Bucket` parked on a
