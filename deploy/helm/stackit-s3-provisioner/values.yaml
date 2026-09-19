@@ -269,8 +269,9 @@ monitoring:
     # the object is created, is valid, and is silently never read.
     labels: {}
   # prometheusRule ships the operator's alerting rules. Every alert can be
-  # switched off individually; all alerts default to enabled. The resource is
-  # only rendered when enabled is true AND at least one alert is enabled.
+  # switched off individually; all default to enabled except bucketRecreated,
+  # which ships off. The resource is only rendered when enabled is true AND at
+  # least one alert is enabled.
   prometheusRule:
     enabled: false
     # labels are added to the PrometheusRule, e.g. `release: <name>` — the same
@@ -342,6 +343,32 @@ monitoring:
         # degraded series disappears and StackitS3BucketFailed takes over.
         # 1200s = 20m, leaving 10m of the default 30m grace to react.
         holdForSeconds: 1200
+      # bucketMissing fires (critical) when a Bucket that was provisioned finds
+      # its bucket gone from the provider. That is data loss, not an outage: the
+      # operator refuses to re-create the bucket, so the Bucket parks in Failed
+      # with reason BucketMissing rather than quietly handing the workload an
+      # empty bucket under the same name. Only the provider's own structured
+      # answer reaches this alert; an unreachable API is bucketProviderDegraded.
+      bucketMissing:
+        enabled: true
+      # bucketRecreated fires (warning) when a Bucket with spec.allowRecreate
+      # had its vanished bucket rebuilt automatically. The rebuild is authorised,
+      # the data loss behind it is not any less real, and the workload needs a
+      # restart to pick up its replaced credentials Secret.
+      #
+      # Off by default, unlike every other alert here: it can only ever fire on a
+      # deployment that actually uses spec.allowRecreate, so it is switched on
+      # deliberately by whoever adopts that opt-in rather than shipped to
+      # everyone. Turn it on together with the first Bucket that sets the field —
+      # an unattended re-creation leaves no durable trace on the CR, so this
+      # counter and the Warning event are the only records that it happened.
+      bucketRecreated:
+        enabled: false
+        # window is the lookback for increase(); it bounds how long after an
+        # unattended re-creation the alert can still fire, so it must outlast the
+        # time somebody needs to notice. The counter is a process counter and
+        # restarts at zero with the operator.
+        window: "6h"
       # usageMeasurementFailing fires (warning) when bucket size measurements
       # keep failing. Measurement failures deliberately do NOT mark a Bucket
       # unhealthy — the bucket itself is fine, only its size is unknown — so

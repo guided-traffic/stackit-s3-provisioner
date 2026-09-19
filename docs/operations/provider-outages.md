@@ -27,7 +27,7 @@ API is a failure to verify, so the `Bucket` keeps its phase and its `Ready`
 condition and records the degradation alongside them:
 
 ```
-$ kubectl get bucket -A
+$ kubectl get bkt -A
 NAMESPACE   NAME        BUCKET      PHASE   READY   STATUS                          REGION   SIZE       COST/MONTH   AGE
 team-a      my-bucket   my-bucket   Ready   True    ensure bucket: unexpected EOF   eu01     18.0 GiB   0.53 EUR     3h
 ```
@@ -72,17 +72,19 @@ disappear the moment it is given up - see
 
 ## What is not held
 
-These drop `Ready` immediately, whatever the grace says. The list is closed and
-is maintained in
-[ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md); anything
-not on it is held, so a provider failure mode nobody has seen yet cannot land on
-the wrong side of the line
+These drop `Ready` immediately, whatever the grace says. The list is maintained
+in [ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md) and
+grows only by being amended - its most recent entry is the vanished bucket of
+[ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md).
+Anything not on it is held, so a provider failure mode nobody has seen yet cannot
+land on the wrong side of the line
 ([ADR 0012 D3](../adr/0012-ready-describes-the-last-verified-state.md)).
 
 | Case | What you see | Why it is definitive |
 | --- | --- | --- |
 | A structured `400`, `401` or `403` from the provider | Phase `Failed` at once, `status.message` carrying the API error | The provider's own refusal, not a failure to reach it. `401`/`403` is the Object Storage API declining an authenticated request; **`400` is how a revoked service-account key surfaces** - the key flow never reaches the Object Storage API and the token endpoint answers `400 {"error":"invalid_grant"}` (measured live 2026-08-25) |
-| A gateway or WAF error page carrying `403`, `503`, … | Held, like any other unreachability | It is a failure *in front of* the provider. The discriminator is the body - a structured JSON answer against anything else - never the status code alone ([ADR 0012 D2](../adr/0012-ready-describes-the-last-verified-state.md)). An HTML error page carrying `403` was the 2026-08-25 incident |
+| A gateway or WAF error page carrying `403`, `404`, `503`, … | Held, like any other unreachability | It is a failure *in front of* the provider. The discriminator is the body - a structured JSON answer against anything else - never the status code alone ([ADR 0012 D2](../adr/0012-ready-describes-the-last-verified-state.md)). An HTML error page carrying `403` was the 2026-08-25 incident |
+| A structured `404` for a bucket this operator provisioned | Phase `Failed`, `Ready=False` and a parallel `BucketPresent=False`, both with reason `BucketMissing` | The provider's own answer about that one bucket, asked as a per-bucket read rather than read out of a listing: the bucket is gone, and re-creating it would hand the workload an empty bucket under the same name ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D1, D3). A `404` carried by an error page, a `404` with an empty body and a dropped connection are held exactly like the row above - same discriminator, and the right status code with the wrong provenance is still not an answer. See [vanished-buckets.md](vanished-buckets.md) |
 | A workload credential the operator destroyed | Phase `Failed`, message naming the failed key replacement | The previous access key was deleted and its replacement could not be published. The operator knows the credential in the Secret is dead: local certainty, not an unverifiable provider state. See [credentials.md](credentials.md) |
 | A configuration fault | Phase `Failed`, no requeue hammer; it re-reconciles on the next spec change | A Secret key collision, a `spec.secretRef` aimed at the operator's own admin Secret, a `spec.region` other than the operator's, a composed name outside the permitted range, an ownership collision, an unusable clone source. Each is a statement the operator made about *this* `Bucket` on its own |
 | A `Bucket` being deleted | Phase `Deleting` or `Failed`, finalizer retained | Holding `Ready` through a teardown would hide a delete blocked by the emptiness guard of [ADR 0006](../adr/0006-a-bucket-is-deleted-only-when-it-is-empty.md). See [deletion.md](deletion.md) |
@@ -283,7 +285,7 @@ Work down this list; each step distinguishes a case the one above cannot.
 2. **Which `Bucket`s, and since when?**
 
    ```bash
-   kubectl get bucket -A -o custom-columns=\
+   kubectl get bkt -A -o custom-columns=\
    'NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,DEGRADED:.status.degradedSince,MSG:.status.message'
    ```
 
@@ -365,14 +367,14 @@ What to do:
    upgrading holds the fleet green for longer. This is a deliberate trade: it
    widens the window in which every `Bucket` claims a state nobody has verified.
 
-### Two gaps worth knowing about
+### One gap worth knowing about
 
-**A bucket that vanished at the provider is not covered by any of this.** The
-provider answers - it answers that the bucket is absent - so the reconcile
-succeeds, nothing is held and none of the signals on this page ever appear. What
-the operator does instead, and what it costs, is in
-[bucket-status.md](bucket-status.md) under *When the status disagrees with the
-cloud*.
+**A bucket that vanished at the provider is the other failure, and it has its own
+page.** The provider answers - it answers that the bucket is absent - so nothing
+on this page applies: no hold, no `degradedSince`, no `ProviderReachable`. The
+`Bucket` drops to `Failed` with reason `BucketMissing` and a
+`BucketPresent=False` condition, and the operator does not re-create the bucket.
+See [vanished-buckets.md](vanished-buckets.md).
 
 **The breaker lives in the operator process.** It does not survive a restart, so
 a crash-looping operator re-learns the outage from scratch each time and can, in
@@ -399,6 +401,7 @@ measured distribution of outage lengths.
 | [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) | The decision behind the breaker, the 2026-09-02 incident record, and the alerting retune |
 | [monitoring.md](monitoring.md) | The full metric catalogue and every alert |
 | [bucket-status.md](bucket-status.md) | Phases, conditions and the faults that park a `Bucket` |
+| [vanished-buckets.md](vanished-buckets.md) | The other failure: the provider answered, and answered that the bucket is gone |
 | [deletion.md](deletion.md) | What a delete does, and the other reasons one hangs |
 | [configuration.md](configuration.md) | The settings in their wider context |
 | [docs/developer/circuit-breaker.md](../developer/circuit-breaker.md) | The mechanism: state, counting, probe scheduling, the workqueue limiter |

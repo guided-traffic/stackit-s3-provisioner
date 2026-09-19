@@ -2,7 +2,7 @@
 {{- $alerts := .Values.monitoring.prometheusRule.alerts }}
 {{- /* Skip the whole resource when every alert is disabled: prometheus-operator
        rejects a rule group without rules. Extend the `or` when adding alerts. */}}
-{{- if or $alerts.bucketsWipeOnDelete.enabled $alerts.bucketFailed.enabled $alerts.bucketStuckProvisioning.enabled $alerts.bucketStuckDeleting.enabled $alerts.cloneFailed.enabled $alerts.skeletonMode.enabled $alerts.wipeRequestedButGateDisabled.enabled $alerts.reconcileErrors.enabled $alerts.bucketProviderDegraded.enabled $alerts.usageMeasurementFailing.enabled $alerts.usageMeasurementTruncated.enabled }}
+{{- if or $alerts.bucketsWipeOnDelete.enabled $alerts.bucketFailed.enabled $alerts.bucketStuckProvisioning.enabled $alerts.bucketStuckDeleting.enabled $alerts.cloneFailed.enabled $alerts.skeletonMode.enabled $alerts.wipeRequestedButGateDisabled.enabled $alerts.reconcileErrors.enabled $alerts.bucketProviderDegraded.enabled $alerts.bucketMissing.enabled $alerts.bucketRecreated.enabled $alerts.usageMeasurementFailing.enabled $alerts.usageMeasurementTruncated.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -137,6 +137,51 @@ spec:
               StackIT API is reachable from the operator. The per-Bucket series
               stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds names
               which Buckets are affected.
+        {{- end }}
+        {{- if $alerts.bucketMissing.enabled }}
+        - alert: StackitS3BucketMissing
+          expr: max(stackit_s3_provisioner_bucket_provisioned_missing) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: A provisioned bucket has vanished from the provider
+            description: >-
+              {{ `{{ $value }}` }} Bucket resource(s) were provisioned successfully
+              and the provider now answers definitively that their bucket does not
+              exist — deleted in the StackIT console, removed by a cleanup script,
+              or the operator is running against a project that never held them.
+              The data in those buckets is gone. The operator deliberately does NOT
+              re-create them, because an empty bucket under the same name would let
+              the workload keep writing as if nothing happened. This is NOT a
+              provider outage: an unreachable API is reported by
+              StackitS3BucketProviderDegraded instead, and only the provider's own
+              structured answer reaches this alert. The per-Bucket series
+              stackit_s3_provisioner_bucket_provisioned_missing names which Buckets
+              are affected; their Ready condition carries reason BucketMissing and
+              a BucketPresent=False condition sits next to it. To provision a fresh
+              bucket, delete and re-apply the Bucket CR — see
+              docs/operations/vanished-buckets.md.
+        {{- end }}
+        {{- if $alerts.bucketRecreated.enabled }}
+        - alert: StackitS3BucketRecreated
+          expr: >-
+            sum(increase(stackit_s3_provisioner_bucket_recreated_total[{{ $alerts.bucketRecreated.window }}]))
+            > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: A vanished bucket was re-created automatically
+            description: >-
+              A Bucket with spec.allowRecreate set lost its bucket and the operator
+              rebuilt it empty, unattended. The previous contents are gone and the
+              workload credentials Secret was replaced, so consumers keep failing
+              with 403 until they re-read it (restart them). The previous
+              credentials group is left standing and needs manual cleanup. The
+              Warning event on the Bucket names both; it is the only other record,
+              because an authorised re-creation leaves no durable trace on the CR.
+              See docs/operations/vanished-buckets.md.
         {{- end }}
         {{- if $alerts.usageMeasurementFailing.enabled }}
         - alert: StackitS3UsageMeasurementFailing

@@ -175,7 +175,7 @@ and object removal are plain S3 calls made with an access key the operator mints
 If the granted role is too narrow, the failure is visible: the API answers a structured `403`, which
 is classified as a definitive provider refusal and drops the `Bucket` to `Failed` immediately rather
 than holding its readiness ([ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md) —
-a closed exception list, classified by origin and never by status code alone, per
+an enumerated exception list, classified by origin and never by status code alone, per
 [ADR 0012 D2](../adr/0012-ready-describes-the-last-verified-state.md); `ProviderRefused` in
 [stackit/errors.go](../../stackit/errors.go)). See
 [Failure modes](#failure-modes).

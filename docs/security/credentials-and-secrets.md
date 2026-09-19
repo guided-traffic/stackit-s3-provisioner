@@ -81,6 +81,26 @@ compiling. The published image is distroless and contains only the compiled bina
 slipped past `.dockerignore` would sit in a build-stage layer rather than the shipped one; that is
 a smaller leak, not a safe one.
 
+**A valid key for the wrong project is not a refusal, and it is now reported per `Bucket`.**
+Pointing the operator at a key for a different project authenticates cleanly: every call succeeds,
+and the operator's own buckets are simply not in the project it now serves. Each
+already-provisioned `Bucket` then reports its bucket as gone — `Ready=False`, reason
+`BucketMissing` — instead of being re-provisioned as an empty bucket with a fresh credentials group
+and a fresh key, which is what the operator used to do to the whole fleet at once
+([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D1; what the
+operator accepts as the provider's own answer, rather than as a failure to reach it, is in
+[ownership-and-attribution.md](ownership-and-attribution.md)). No reconcile destroys anything while
+the wrong key is in use, and the fleet recovers by itself once the right one is back in the process
+— which takes a restart, see [H-12](#h-12--replacing-the-service-account-key-requires-a-restart).
+That covers reconciles only: a `Bucket` *deleted* meanwhile still tears down, and its teardown reads
+the bucket as absent through the same project listing, so it skips the empty check and the bucket
+delete, removes the workload Secret and drops the finalizer, leaving the real bucket and its
+credentials group standing in the project the operator is no longer authenticated against. The
+other exception is a `Bucket` carrying `spec.allowRecreate`, which authorises exactly that
+unattended rebuild: it creates a bucket in whichever project the current key names and overwrites
+the workload Secret with credentials for it (D9, D10). Derived from reading the guard, not
+exercised against a second project.
+
 **In a cluster the key must be encrypted at rest in Git.** The README's GitOps path ships it as a
 SOPS-encrypted Secret manifest alongside the `HelmRelease`; SealedSecrets or ExternalSecrets are
 equally fine. What is not fine is a plain-text Secret manifest in a repository, because the RSA
@@ -245,6 +265,21 @@ indistinguishable from a never-provisioned one, so the next pass mints a replace
 previous credential dies. Restoring a backup does not undo that: the restored values are already
 invalid if a pass ran in between. A backup of this Secret is a backup of a live credential and has
 to be protected like one.
+
+**Losing the bucket costs no credential — unless a rebuild is authorised.** When the provider
+reports a provisioned bucket as gone, the pass stops before anything is provisioned, so the Secret
+and the live key in it are left exactly as they are
+([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D1): the credential
+outlives the bucket and addresses a name that no longer resolves. `spec.allowRecreate` buys
+unattended recovery and pays for it here — the rebuilt bucket gets a fresh credentials group and a
+fresh key, the Secret is overwritten, and until the workload re-reads it, it presents a key the new
+bucket's policy does not name and fails with `403` (D10). That is the one credential replacement
+this operator makes without being asked for it; it is event-driven and not a schedule, so the
+no-time-based-rotation rule of
+[ADR 0007](../adr/0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md) D3
+is untouched. The previous group is left standing with a live key that reaches nothing, its removal
+is manual, and it accumulates — see
+[H-23](ownership-and-attribution.md#h-23-a-bucket-deleted-out-of-band-orphans-a-keyed-credentials-group).
 
 ## A clone brings two credentials together, and neither may meet the other's namespace
 

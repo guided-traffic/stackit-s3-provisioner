@@ -112,6 +112,31 @@ spec:
               dedicated, isolated workload credentials (one CR = one isolated workload, see
               ADR 0003 D1).
             properties:
+              allowRecreate:
+                description: |-
+                  AllowRecreate permits the operator to re-create this bucket automatically,
+                  unattended, if it ever finds that the already-provisioned bucket has
+                  vanished from the provider. It declares that this bucket's content is
+                  regenerable.
+
+                  Without it — the default — a vanished bucket is NOT re-created: the Bucket
+                  goes to phase Failed with Ready=False, reason BucketMissing, and a
+                  BucketPresent=False condition, so the data loss is reported instead of
+                  being silently repaired into an empty bucket under the same name. To
+                  re-create once, delete the CR and re-apply it.
+
+                  With it set, the re-created bucket gets a FRESH credentials group and
+                  access key and the workload credentials Secret is overwritten, so
+                  consuming workloads must re-read it (e.g. via pod restart) — until they
+                  do, their requests fail with 403. The previous credentials group is left
+                  standing and has to be removed by hand. Each automatic re-creation is
+                  still reported, as a Warning event and on
+                  stackit_s3_provisioner_bucket_recreated_total.
+
+                  Unlike WipeOnDelete this needs no operator-wide feature gate: a wipe
+                  destroys data that is still there, a re-create only rebuilds what is
+                  already gone.
+                type: boolean
               bucketName:
                 description: |-
                   BucketName is the DNS-compliant name of the bucket in StackIT Object Storage.

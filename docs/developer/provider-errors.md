@@ -3,9 +3,10 @@
 This page is about one question: a call to the StackIT API came back with an error — what *is* that
 error, and what may the operator conclude from it? It covers the recognition helpers in
 [`stackit/errors.go`](../../stackit/errors.go), the retrying transport in
-[`stackit/retry.go`](../../stackit/retry.go), and the classification path in
+[`stackit/retry.go`](../../stackit/retry.go), the classification path in
 [`internal/controller/bucket_controller.go`](../../internal/controller/bucket_controller.go) that
-turns a recognised error into a readiness decision. The rule it implements is
+turns a recognised error into a readiness decision, and the two questions about *existence* that are
+answered from an error shape in [`stackit/client.go`](../../stackit/client.go). The rule it implements is
 [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md); the fleet-wide behaviour that
 sits *after* classification is [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) and
 its mechanism is [circuit-breaker.md](circuit-breaker.md). If you wanted which call site routes
@@ -45,17 +46,20 @@ plane, the data plane and the Kubernetes API alike — see
 [How classification maps onto reconcile outcomes](#how-classification-maps-onto-reconcile-outcomes)
 and [The retry round-tripper](#the-retry-round-tripper).
 
-Four helpers read the control-plane type, and they are not interchangeable:
+Five helpers read the control-plane type, and they are not interchangeable:
 
 | Helper | File | Answers | Body-aware |
 | --- | --- | --- | --- |
 | `apiAnswer(err) (status, ok)` | [`stackit/errors.go`](../../stackit/errors.go) | Did *the provider* decide this, and with which status? | Yes — `json.Valid` over the raw body |
 | `ProviderRefused(err) bool` | [`stackit/errors.go`](../../stackit/errors.go) | Is this a structured refusal the operator must treat as definitive? | Yes, via `apiAnswer` |
-| `isServiceNotEnabled(err) bool` | [`stackit/errors.go`](../../stackit/errors.go) | Is this the API's definitive "Object Storage is not enabled here"? | Yes, via `apiAnswer` |
+| `isStructuredNotFound(err) bool` | [`stackit/errors.go`](../../stackit/errors.go) | Is this the API's own definitive "this does not exist"? | Yes, via `apiAnswer` |
+| `isServiceNotEnabled(err) bool` | [`stackit/errors.go`](../../stackit/errors.go) | Is this the API's definitive "Object Storage is not enabled here"? | Yes — it is `isStructuredNotFound` under a name that says which resource |
 | `StatusCode(err) int` | [`stackit/client.go`](../../stackit/client.go) | What status does this error carry, whichever of the two producers filled it? (`0` for anything that is not the SDK type) | **No** |
 
-`apiAnswer` is unexported on purpose: the two questions above it are the only ones the operator is
-entitled to ask of a status code. `StatusCode` is the deliberate exception and is discussed in
+`apiAnswer` and `isStructuredNotFound` are unexported on purpose: the questions spelled out above
+are the only ones the operator is entitled to ask of a status code, and the two that read a `404` do
+it through a helper rather than by comparing a number. `StatusCode` is the deliberate exception and
+is discussed in
 [Where a bare status code is still used](#where-a-bare-status-code-is-still-used).
 
 ## Why the discriminator is the body shape, not the status code
@@ -175,6 +179,53 @@ restart re-verifies. Nothing invalidates the cache — a project that genuinely 
 underneath a running operator would surface as failures on the subsequent calls instead, which are
 non-definitive and therefore held.
 
+## Absence is the second question a structured 404 answers
+
+`isServiceNotEnabled` is one line — `return isStructuredNotFound(err)` — because the shape it tests
+was never specific to the service status. A structured JSON `404` is the API saying "this does not
+exist" about whatever was asked for, and two callers act on that same shape for two different
+resources:
+
+| Caller | Asks about | What the structured 404 means | What it does with it |
+| --- | --- | --- | --- |
+| `EnsureService`, via `isServiceNotEnabled` | the project's Object Storage service | not enabled for this project | Calls `EnableService` — turns a read into a **write** |
+| `Client.BucketExists` | one named bucket | that bucket is not there | Returns `(false, nil)` — the caller may conclude a provisioned bucket is **gone** |
+
+Both consequences are damaging when the provider never actually answered, which is why neither
+caller is allowed to see a raw status code.
+
+`BucketExists` in [`stackit/client.go`](../../stackit/client.go) asks `GetBucket`, a per-bucket
+control-plane read, and it is the only place in the tree where "absent" is permitted to mean *a
+bucket the operator provisioned is gone*. The full truth table:
+
+| What comes back from `GetBucket` | `BucketExists` | Why |
+| --- | --- | --- |
+| `200` | `(true, nil)` | The bucket is there |
+| `404` with a structured JSON body | `(false, nil)` | The provider's own answer about this one bucket |
+| `404` carrying an intermediary's HTML page | error | A failure in front of the provider, not a decision by it — the nastiest case, because the status code is right and the provenance is wrong |
+| `404` with an empty body | error | An intermediary that drops the body must not look authoritative |
+| `404` with a truncated or otherwise invalid JSON body | error | `json.Valid` fails, so nothing answered |
+| A structured `401`/`403` | error, and `ProviderRefused` matches it | A refusal is not an absence; it is definitive for readiness and never reaches this decision as "gone" |
+| Any `5xx`, after the transport's retries | error | Nothing on the provider side decided |
+| A transport failure or a dropped connection | error | Same, one layer lower |
+
+**The classification lives in the client, not at the call site**
+([ADR 0015 D4](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)). A caller could
+have asked `GetBucket` itself and compared `StatusCode(err) == 404`; the point of not doing that is
+that conflating "absent" with "could not find out" is then *structurally impossible* rather than a
+rule somebody has to remember, and the cost of forgetting it once is a fleet-wide false report of
+data loss. There is no path from a gateway page to `false`.
+
+It is also deliberately not `HasBucket`. That one scans the project-wide listing and can only answer
+"not in the list I got", which is weaker: the listing is known to lag a create (which is why
+`WaitBucketVisible` exists), and whether it is complete for a large project is **not verified**,
+because `ListBuckets` takes no pagination parameters in the SDK. Good enough to decide whether to
+create a bucket, not good enough to declare one gone — the two existence questions and who asks
+which are in
+[reconcile-pipeline.md](reconcile-pipeline.md#two-existence-questions-and-only-one-of-them-is-a-listing).
+The S3 data plane takes no part in this decision at all: it has its own error shapes, and the
+question is asked on the control plane only.
+
 ## The retry round-tripper
 
 The SDK does not retry: `config.WithMaxRetries` has been `func WithMaxRetries(_ int)` — a literal
@@ -258,8 +309,8 @@ the data plane in the same pass.
 
 ## How classification maps onto reconcile outcomes
 
-Recognition feeds exactly one decision: may this bucket keep claiming the state the operator last
-verified? That decision lives in `degrade` and `holdsReadyThrough` in
+Inside the reconciler, recognition feeds exactly one decision: may this bucket keep claiming the
+state the operator last verified? That decision lives in `degrade` and `holdsReadyThrough` in
 [`bucket_controller.go`](../../internal/controller/bucket_controller.go).
 
 The classification is **by origin**, never by parsing the error text
@@ -270,22 +321,24 @@ plane or the Kubernetes API*. An unrecognised failure of any of those is "could 
 ([D3](../adr/0012-ready-describes-the-last-verified-state.md)) — a new provider failure mode cannot
 land on the wrong side of the line by being unknown.
 
-`holdsReadyThrough` is the closed exception list in executable form. Each rule of
-[ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md) maps to one check, in this
-order:
+`holdsReadyThrough` is the part of the
+[ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md) exception list that `degrade`
+has to decide, in executable form. Each of those rules maps to one check, in this order:
 
 | Check in `holdsReadyThrough` | Implements | Note |
 | --- | --- | --- |
 | `r.ProviderDegradedGrace <= 0` | [D5](../adr/0012-ready-describes-the-last-verified-state.md) | `--provider-degraded-grace` / `PROVIDER_DEGRADED_GRACE` / Helm `providerDegradedGrace`, `30m` `# default`; `0` disables the hold entirely |
 | `!b.DeletionTimestamp.IsZero()` | D6, teardown | A hold would hide a delete blocked by [ADR 0006](../adr/0006-a-bucket-is-deleted-only-when-it-is-empty.md) |
-| `stackit.ProviderRefused(err)` | D6, structured `400`/`401`/`403` | The only provider-shaped exception, and the reason this page exists |
+| `stackit.ProviderRefused(err)` | D6, structured `400`/`401`/`403` | The only provider-shaped exception `degrade` ever sees, and the reason this page exists |
 | `errors.Is(err, errCredentialDestroyed)` | D6, destroyed credential | See below |
 | `ObservedGeneration == Generation` | D6, unobserved spec | A spec that was never achieved has no verified state to defend |
 | `Phase == Ready && ConditionReady` | D6, never-`Ready` | Initial provisioning failures surface at once |
 
-Configuration faults never reach `degrade` at all — they are routed to `failNoRequeue` up front; the
-four call sites are enumerated in
-[reconcile-pipeline.md](reconcile-pipeline.md#guards-and-their-outcome-class).
+The other two D6 cases never reach `degrade` at all. Configuration faults are routed to
+`failNoRequeue` up front — the four call sites are enumerated in
+[reconcile-pipeline.md](reconcile-pipeline.md#guards-and-their-outcome-class) — and a provisioned
+bucket the provider reports as absent is marked by `guardBucketPresent` itself, on the third outcome
+class described there.
 
 **`errCredentialDestroyed` is what makes the local-certainty exception effective.**
 `ensureAccessKeyAndSecret` deletes every key of the workload group *before* creating the replacement,
@@ -356,9 +409,11 @@ the breaker
 | `TestRetryTransportLeavesWritesAlone` | [`stackit/retry_test.go`](../../stackit/retry_test.go) | `POST`/`PUT`/`PATCH`/`DELETE` get one try even on `503` |
 | `TestRetryTransportHonoursContext` | [`stackit/retry_test.go`](../../stackit/retry_test.go) | A cancelled reconcile aborts the backoff |
 | `TestNewRetryTransportDefaults` | [`stackit/retry_test.go`](../../stackit/retry_test.go) | The transport clone and the idle timeout |
+| `TestBucketExistsOnlyTrustsAStructuredAnswer` | [`stackit/client_fake_test.go`](../../stackit/client_fake_test.go) | Every row of the `BucketExists` truth table above: only the structured `404` yields `false`, while the HTML page at `404`, the empty body, the truncated body, a `503`, a structured `403` and a closed endpoint all come back as errors |
+| `TestUnreachableProviderNeverTripsTheGuard` | [`internal/controller/reconciler_missing_bucket_test.go`](../../internal/controller/reconciler_missing_bucket_test.go) | The same distinction as the reconciler sees it: `BucketPresent` is never written and the Bucket stays held |
 | `TestProviderRefusalIsNeverHeld` / `TestGatewayPageIsHeldEvenWith403` | [`internal/controller/reconciler_degraded_test.go`](../../internal/controller/reconciler_degraded_test.go) | The body-shape discriminator as the reconciler sees it |
 | `TestDegradedHoldsReadyThroughTransientFailures` / `…RecoversOnNextSuccess` / `…GraceExpires` / `…DisabledByZeroGrace` | [`internal/controller/reconciler_degraded_test.go`](../../internal/controller/reconciler_degraded_test.go) | Hold, recovery, grace expiry and the `0` rollback |
-| `TestInitialProvisioningFailureIsNotHeld` / `TestSpecChangeFailureIsNotHeld` / `TestTeardownFailureIsNotHeld` / `TestConfigFaultIsNotHeld` / `TestDestroyedCredentialIsNeverHeld` | [`internal/controller/reconciler_degraded_test.go`](../../internal/controller/reconciler_degraded_test.go) | The remaining five D6 exceptions |
+| `TestInitialProvisioningFailureIsNotHeld` / `TestSpecChangeFailureIsNotHeld` / `TestTeardownFailureIsNotHeld` / `TestConfigFaultIsNotHeld` / `TestDestroyedCredentialIsNeverHeld` | [`internal/controller/reconciler_degraded_test.go`](../../internal/controller/reconciler_degraded_test.go) | Five more of the D6 exceptions. The seventh, a provisioned bucket the provider reports as absent, never reaches `holdsReadyThrough` and is pinned in [reconciler_missing_bucket_test.go](../../internal/controller/reconciler_missing_bucket_test.go) |
 
 All of these are offline; they run in the default `go test ./...` suite
 ([testing.md](testing.md)).
@@ -379,9 +434,10 @@ interpretation and should not be quoted as measured fact
 revoked-key `400` was measured separately at the token endpoint on the same day. Neither has been
 repeated.
 
-**The absence checks bypass the discriminator.** The five `StatusCode` call sites listed
+**The tolerance checks bypass the discriminator.** The five `StatusCode` call sites listed
 [above](#where-a-bare-status-code-is-still-used) read a status code without the `json.Valid` guard.
-The failure mode is unobserved and untested.
+The failure mode is unobserved and untested. `BucketExists` is the one absence check that does not
+bypass it, and it is the one where being wrong reports data loss.
 
 **`ProviderRefused` cannot tell a revoked key from a malformed request.** Both are a structured
 `400`, and both drop `Ready` at once. The operator log carries the difference (`invalid_grant`

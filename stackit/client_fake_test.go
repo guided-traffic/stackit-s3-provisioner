@@ -350,3 +350,86 @@ func TestSleepCtxCancelled(t *testing.T) {
 		t.Error("sleepCtx returned false after elapsed duration")
 	}
 }
+
+// TestBucketExistsOnlyTrustsAStructuredAnswer is the decision the vanished-bucket
+// guard hangs on. BucketExists is allowed to say "no" only when the provider
+// itself said so, in its own structured JSON. Everything else — an intermediary
+// serving an error page, a dropped body, a 5xx, a transport failure — leaves
+// existence unknown, and unknown must surface as an error so the caller keeps
+// treating it as a failure to reach the provider.
+//
+// Getting this wrong in the permissive direction is not a missed retry: it tells
+// a caller that a bucket it provisioned is gone, on the word of a gateway.
+func TestBucketExistsOnlyTrustsAStructuredAnswer(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("bucket exists", func(t *testing.T) {
+		c, fake := newFakeClient(t)
+		fake.SeedBucket("present", nil)
+		ok, err := c.BucketExists(ctx, "present")
+		if err != nil {
+			t.Fatalf("BucketExists: %v", err)
+		}
+		if !ok {
+			t.Error("BucketExists = false, want true")
+		}
+	})
+
+	t.Run("structured JSON 404 is the provider's own answer", func(t *testing.T) {
+		c, _ := newFakeClient(t)
+		ok, err := c.BucketExists(ctx, "never-existed")
+		if err != nil {
+			t.Fatalf("BucketExists: %v", err)
+		}
+		if ok {
+			t.Error("BucketExists = true, want false for a bucket the API reports as absent")
+		}
+	})
+
+	// Each of these must come back as an error, never as false.
+	unknown := []struct {
+		name   string
+		inject func(fake *stackitfake.Server)
+	}{
+		{"503", func(f *stackitfake.Server) { f.FailNext("GetBucket", 503) }},
+		{"structured 403", func(f *stackitfake.Server) { f.FailNext("GetBucket", 403) }},
+		{"gateway HTML page carrying 404", func(f *stackitfake.Server) {
+			f.FailNextRaw("GetBucket", 404, "text/html", gatewayHTMLPage)
+		}},
+		{"404 with an empty body", func(f *stackitfake.Server) {
+			f.FailNextRaw("GetBucket", 404, "application/json", "")
+		}},
+		{"404 with a truncated JSON body", func(f *stackitfake.Server) {
+			f.FailNextRaw("GetBucket", 404, "application/json", `{"message":`)
+		}},
+	}
+	for _, tc := range unknown {
+		t.Run(tc.name+" is not an answer", func(t *testing.T) {
+			c, fake := newFakeClient(t)
+			fake.SeedBucket("present", nil)
+			tc.inject(fake)
+			ok, err := c.BucketExists(ctx, "present")
+			if err == nil {
+				t.Fatalf("BucketExists = (%v, nil), want an error: nothing on the provider side answered", ok)
+			}
+			if ok {
+				t.Error("BucketExists returned true alongside an error")
+			}
+		})
+	}
+
+	t.Run("transport failure is not an answer", func(t *testing.T) {
+		c, fake := newFakeClient(t)
+		fake.SeedBucket("present", nil)
+		fake.Close()
+		if _, err := c.BucketExists(ctx, "present"); err == nil {
+			t.Fatal("BucketExists succeeded against a dead endpoint, want an error")
+		}
+	})
+}
+
+// gatewayHTMLPage is the shape of the 2026-08-25 incident: an intermediary
+// answering with an HTML error page that the SDK surfaces as an ordinary API
+// error carrying that page's status code.
+const gatewayHTMLPage = "<html>\r\n<head><title>404 Not Found</title></head>\r\n" +
+	"<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"

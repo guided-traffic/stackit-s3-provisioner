@@ -37,8 +37,9 @@ flowchart LR
 - 🧹 **Deletion cannot lose data by accident** — a non-empty bucket blocks teardown; wiping needs two switches, one of them cluster-wide ([ADR 0006](docs/adr/0006-a-bucket-is-deleted-only-when-it-is-empty.md)).
 - 📏 **Size and a monthly cost estimate on the CR** — measured by a separate controller that can never affect readiness ([ADR 0014](docs/adr/0014-bucket-size-is-measured-by-a-separate-controller.md)).
 - 🩺 **A provider blip is not an outage of your fleet** — `Ready` reports the last *verified* state ([ADR 0012](docs/adr/0012-ready-describes-the-last-verified-state.md)) and a fleet-wide breaker stops calling a failing provider at all ([ADR 0013](docs/adr/0013-a-provider-outage-is-held-fleet-wide.md)).
+- 🚨 **A vanished bucket is reported, not quietly re-created** — a bucket deleted behind the operator's back fails its `Bucket` instead of reappearing empty under the same name; `spec.allowRecreate` opts one bucket into unattended rebuilds and reports every one ([ADR 0015](docs/adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)).
 - 🧭 **GitOps-safe by construction** — only `status`, the finalizer and one bookkeeping annotation are ever written.
-- 📊 **22 metrics and 11 opt-in alerts**, shipped as a `PrometheusRule` you can switch off rule by rule.
+- 📊 **24 metrics and 13 opt-in alerts**, shipped as a `PrometheusRule` you can switch off rule by rule.
 - 🧱 **Skeleton mode** — without a service-account key the operator starts, reconciles and makes no cloud call at all.
 
 ## <a id="naming"></a>📛 Naming conventions
@@ -108,8 +109,8 @@ before anything is written. `S3_ENDPOINT` and `S3_BUCKET_URL` are omitted when t
 
 | Where | What lives there |
 | --- | --- |
-| [docs/adr/](docs/adr/README.md) | The fourteen decisions: what the operator does, why, what was rejected and what it costs. |
-| [docs/operations/](docs/operations/README.md) | Running and integrating: prerequisites, deployment, GitOps, configuration, naming, status, deletion, credentials, cloning, read grants, usage and cost, provider outages, monitoring. |
+| [docs/adr/](docs/adr/README.md) | The fifteen decisions: what the operator does, why, what was rejected and what it costs. |
+| [docs/operations/](docs/operations/README.md) | Running and integrating: prerequisites, deployment, GitOps, configuration, naming, status, deletion, credentials, cloning, read grants, usage and cost, provider outages, vanished buckets, monitoring. |
 | [docs/security/](docs/security/README.md) | The security design, one page per perspective — tenancy and isolation, credentials and Secrets, RBAC and privilege, ownership and attribution — each ending with what it does not cover. |
 | [docs/developer/](docs/developer/README.md) | How the subsystems work, for somebody about to change them — plus the repository layout, the build and test matrix, CI and release, and the extension checklists. |
 | [docs/tickets/](docs/tickets/) | Work still outstanding. |
@@ -260,6 +261,7 @@ change it is on the matching page under [docs/operations/](docs/operations/READM
 | `cloneFrom.secretRef.keys.secretAccessKey` | string | `AWS_SECRET_ACCESS_KEY` | Data-key override on the source Secret. |
 | `cloneFrom.holdSecretUntilCloned` | bool | `true` | Withhold the workload Secret until the copy succeeded. `Ready` waits for the clone either way. |
 | `wipeOnDelete` | bool | `false` | Delete all objects, versions and delete markers before removing the bucket. Mutable, and only honoured when `wipeOnDelete.enabled` is on. |
+| `allowRecreate` | bool | `false` | Re-create this bucket automatically and unattended if the provider ever reports it gone — a permanent opt-in for content that is regenerable, and unlike `wipeOnDelete` it needs no operator-wide gate. The rebuilt bucket gets a fresh credentials group and key, so the workload must restart to re-read its Secret. Without it a vanished bucket is reported and never re-created ([ADR 0015](docs/adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)). |
 | `usage.enabled` | bool | inherits `bucketUsage.defaultEnabled` | Cannot switch measurement on while `bucketUsage.enabled` is off. |
 | `usage.interval` | Go duration string | inherits `bucketUsage.interval` | Clamped up to `bucketUsage.minInterval`. |
 | `usage.includeVersions` | bool | inherits `bucketUsage.includeVersions` | Count non-current versions and delete markers. |
@@ -294,7 +296,7 @@ Everything below is written by the operator. `spec` and labels never are.
 | `usage.estimatedMonthlyCost` / `usage.estimatedMonthlyCostCents` / `usage.currency` | string, int64, string | An estimate at the configured list price, not an invoice. |
 | `usage.lastMeasurementTime` / `usage.measurementDuration` | time, string | When it was measured, and how long the pass took. |
 | `usage.truncated` / `usage.message` | bool, string | The object cap was hit, so every size and cost value is a lower bound; `message` carries a failure or a note about the effective config. |
-| `conditions` | []Condition | `Ready` (`Provisioned`, `Failed`, `NotImplemented`), `CloneCompleted` (`Cloning`, `Cloned`, `CloneFailed`), `ProviderReachable` (`ProviderUnreachable`; absent when healthy). Provisioning still in flight shows as `phase: Provisioning`, never as a `Ready` reason. |
+| `conditions` | []Condition | `Ready` (`Provisioned`, `Failed`, `NotImplemented`, `BucketMissing`), `CloneCompleted` (`Cloning`, `Cloned`, `CloneFailed`), `ProviderReachable` (`ProviderUnreachable`; absent when healthy), `BucketPresent` (`BucketMissing`; absent when healthy). Provisioning still in flight shows as `phase: Provisioning`, never as a `Ready` reason. |
 
 </details>
 
@@ -374,8 +376,8 @@ monitoring:
   prometheusRule:
     enabled: false                       # default; needs the monitoring.coreos.com CRDs
     labels: {}                           # default
-    alerts:                              # abbreviated: eleven keys, each enabled by default,
-                                         # plus four tuning values - see the alert table below
+    alerts:                              # abbreviated: thirteen keys, twelve enabled by default,
+                                         # plus five tuning values - see the alert table below
 stackit:
   region: eu01                           # default; every Bucket's spec.region must match
   serviceAccountKey:
@@ -386,11 +388,12 @@ stackit:
 </details>
 
 <details>
-<summary><strong>Helm values</strong> — the eleven alert toggles</summary>
+<summary><strong>Helm values</strong> — the thirteen alert toggles</summary>
 
 Every key below sits under `monitoring.prometheusRule.alerts` and has `enabled: true` as its
-default. The `PrometheusRule` is rendered only when `monitoring.prometheusRule.enabled` is `true`
-**and** at least one alert is enabled. What each series counts, and what to do when one fires:
+default — except `bucketRecreated`, which ships off. The `PrometheusRule` is rendered only when
+`monitoring.prometheusRule.enabled` is `true` **and** at least one alert is enabled. What each
+series counts, and what to do when one fires:
 [docs/operations/monitoring.md](docs/operations/monitoring.md).
 
 | Key | Alert | Fires when |
@@ -404,6 +407,8 @@ default. The `PrometheusRule` is rendered only when `monitoring.prometheusRule.e
 | `wipeRequestedButGateDisabled.enabled` | `StackitS3WipeRequestedButGateDisabled` | A `Bucket` requests a wipe the operator-wide gate forbids. |
 | `reconcileErrors.enabled`, `.threshold` (`6` — default), `.sustainedFor` (`"15m"` — default), `.suppressWhileCircuitOpen` (`true` — default) | `StackitS3ReconcileErrors` | Reconcile errors the circuit breaker did **not** absorb exceed the threshold continuously. |
 | `bucketProviderDegraded.enabled`, `.holdForSeconds` (`1200` — default) | `StackitS3BucketProviderDegraded` | A `Ready` state has been held through failures for longer than `holdForSeconds`. Must stay below `providerDegradedGrace`. |
+| `bucketMissing.enabled` | `StackitS3BucketMissing` | A `Bucket` that was provisioned finds its bucket gone from the provider — data loss, not an outage (critical). |
+| `bucketRecreated.enabled` (`false` — default), `.window` (`"6h"` — default) | `StackitS3BucketRecreated` | A `Bucket` carrying `spec.allowRecreate` had its vanished bucket rebuilt unattended. Off by default: it can only fire where that opt-in is used. |
 | `usageMeasurementFailing.enabled` | `StackitS3UsageMeasurementFailing` | Size measurements keep failing — readiness is unaffected, so nothing else would show it. |
 | `usageMeasurementTruncated.enabled` | `StackitS3UsageMeasurementTruncated` | A `Bucket` keeps hitting `bucketUsage.maxObjects`; its size and cost are lower bounds. |
 

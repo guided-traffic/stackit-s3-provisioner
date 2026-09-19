@@ -32,6 +32,23 @@ const (
 	// nothing is written to Buckets that were provisioned before this existed.
 	ConditionProviderReachable = "ProviderReachable"
 
+	// ConditionBucketPresent is set to False when a Bucket that was already
+	// provisioned once asks the provider for its bucket and gets the provider's
+	// own definitive answer that it does not exist — somebody deleted it out of
+	// band, or the operator is running against a project that never held it.
+	//
+	// It exists next to ConditionReady and ConditionProviderReachable so the
+	// three answer three different questions without anyone parsing a reason
+	// string: Ready says usable, ProviderReachable says the provider answered,
+	// BucketPresent says the bucket is there. A provider outage and a vanished
+	// bucket are then distinguishable directly from the conditions.
+	//
+	// Like ConditionProviderReachable it is absent on a healthy Bucket rather
+	// than present-and-True, so a Bucket that never lost its bucket and one that
+	// recovered look identical and an operator upgrade writes nothing to Buckets
+	// that are simply healthy.
+	ConditionBucketPresent = "BucketPresent"
+
 	// ReasonProvisioned indicates the bucket and its credentials are ready.
 	ReasonProvisioned = "Provisioned"
 	// ReasonProvisioning indicates provisioning is in progress.
@@ -53,6 +70,20 @@ const (
 	// provisioned Bucket failed for a non-definitive reason and its Ready state
 	// is being held. It is the reason on ConditionProviderReachable.
 	ReasonProviderUnreachable = "ProviderUnreachable"
+
+	// ReasonBucketMissing indicates that the bucket this Bucket was provisioned
+	// with is gone: the provider answered definitively that it does not exist.
+	// It is the reason on both ConditionBucketPresent and ConditionReady, which
+	// drops to False — the operator refuses to re-create the bucket, because
+	// doing so would hand the workload an empty bucket under the old name and
+	// erase the evidence that its data is gone.
+	ReasonBucketMissing = "BucketMissing"
+
+	// ReasonBucketRecreated indicates that a vanished bucket was re-created
+	// automatically because spec.allowRecreate authorises it. The data that was
+	// in the bucket is still gone, so this is reported as the incident it is
+	// even though no human has to act on it.
+	ReasonBucketRecreated = "BucketRecreated"
 )
 
 // BucketPhase is a coarse, human-readable summary of where a Bucket is in its
@@ -640,6 +671,31 @@ type BucketSpec struct {
 	// event is emitted.
 	// +optional
 	WipeOnDelete bool `json:"wipeOnDelete,omitempty"`
+
+	// AllowRecreate permits the operator to re-create this bucket automatically,
+	// unattended, if it ever finds that the already-provisioned bucket has
+	// vanished from the provider. It declares that this bucket's content is
+	// regenerable.
+	//
+	// Without it — the default — a vanished bucket is NOT re-created: the Bucket
+	// goes to phase Failed with Ready=False, reason BucketMissing, and a
+	// BucketPresent=False condition, so the data loss is reported instead of
+	// being silently repaired into an empty bucket under the same name. To
+	// re-create once, delete the CR and re-apply it.
+	//
+	// With it set, the re-created bucket gets a FRESH credentials group and
+	// access key and the workload credentials Secret is overwritten, so
+	// consuming workloads must re-read it (e.g. via pod restart) — until they
+	// do, their requests fail with 403. The previous credentials group is left
+	// standing and has to be removed by hand. Each automatic re-creation is
+	// still reported, as a Warning event and on
+	// stackit_s3_provisioner_bucket_recreated_total.
+	//
+	// Unlike WipeOnDelete this needs no operator-wide feature gate: a wipe
+	// destroys data that is still there, a re-create only rebuilds what is
+	// already gone.
+	// +optional
+	AllowRecreate bool `json:"allowRecreate,omitempty"`
 
 	// Usage configures the periodic bucket-size measurement and the monthly cost
 	// estimate derived from it. Omitting the block follows the operator-wide

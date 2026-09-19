@@ -48,7 +48,14 @@ writes before the status (so a Bucket that crashed between the two is still torn
 down by the right name), otherwise the raw `spec.bucketName`
 ([`api/v1/bucket_types.go`](../../api/v1/bucket_types.go), `EffectiveBucketName`) —
 see [bucket-naming.md](bucket-naming.md). If the bucket no longer exists in the
-provider, steps 3–5 are all skipped, the Secret is deleted and the CR is released.
+provider, steps 3–5 are all skipped, the Secret is deleted and the CR is released —
+and the credentials group is left behind, reported as
+`CredentialsGroupNotAttributable`, because without its bucket nothing can prove
+which group belongs to this CR (see
+[The credentials group left behind](#the-credentials-group-left-behind)). This is
+why a `Bucket` reporting `BucketMissing` tears down cleanly instead of hanging on
+its finalizer, and therefore why delete-and-re-apply is a way back from a vanished
+bucket — [vanished-buckets.md](vanished-buckets.md).
 
 ### Deleting a namespace
 
@@ -302,7 +309,8 @@ would be an outage in a foreign namespace.
 
 So there are cases where the CR is released and a group remains:
 
-* the physical bucket no longer exists, so nothing can prove the attribution;
+* the physical bucket no longer exists, so nothing can prove the attribution
+  ([vanished-buckets.md](vanished-buckets.md));
 * the bucket exists but carries no attribution, and no isolation policy naming a
   principal;
 * the bucket's ownership tags are not this CR's.
@@ -368,6 +376,7 @@ operator action and it is not blocked; it leaves live cloud resources unreferenc
 | --- | --- |
 | [bucket-status.md](bucket-status.md) | reading phases, conditions and the columns used throughout this page |
 | [provider-outages.md](provider-outages.md) | the on-call view of the open circuit that defers a teardown |
+| [vanished-buckets.md](vanished-buckets.md) | deleting a `Bucket` whose bucket is already gone, and the group that survives it |
 | [monitoring.md](monitoring.md) | the metrics and alerts named here, and their tuning constraints |
 | [cloning.md](cloning.md) | the clone that step 1 of the teardown stops |
 | [credentials.md](credentials.md) | the workload credential you use to empty a bucket by hand |

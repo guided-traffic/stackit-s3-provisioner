@@ -408,12 +408,12 @@ key after a restart is then just a second failure mode that the same single chec
 Confirmed in review on 2026-09-19: a bucket deleted by a third party puts the CR into a failure state
 so the incident is visible, and an explicit annotation overrides that to authorize a re-creation.
 
-Carried out of this ticket into its own:
-**[a provisioned bucket that vanished is reported, never silently re-created](005-a-provisioned-bucket-that-vanished-is-reported.md)**,
-which holds the design, the standing `spec.allowRecreate` opt-in, delete-and-re-apply as the way to
-re-create once, and its own open questions. It is a **precondition** of hot reload, not a dependent of it: it
-stands on the out-of-band-deletion bug alone, and it is what lets this ticket's ADR describe the
-project check honestly as a guardrail.
+Carried out of this ticket into its own work, which **landed on 2026-09-19** as
+[ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md):
+the guard, the standing `spec.allowRecreate` opt-in and delete-and-re-apply as the way to re-create
+once. It was a **precondition** of hot reload, not a dependent of it: it stood on the
+out-of-band-deletion bug alone, and it is what lets this ticket's ADR describe the project check
+honestly as a guardrail rather than as the thing that makes a foreign key safe.
 
 ### Q13 — ANSWERED: ADR 0005 D8 is struck through, the reload contract gets its own record
 **Decision (2026-09-19): approved.** ADR 0005 D8 ("the binding is fixed for the lifetime of the
@@ -434,8 +434,9 @@ than one rule and has alternatives of its own (fsnotify, self-restart, checksum 
 record.
 
 ### Q14 — ANSWERED: the vanished-bucket guard lands first
-**Decision (2026-09-19): confirmed — [005](005-a-provisioned-bucket-that-vanished-is-reported.md)
-is implemented before this ticket.** Put to the user again because the dependency is one of
+**Decision (2026-09-19): confirmed — the vanished-bucket guard is implemented before this ticket.**
+It has since landed, as [ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md).
+Put to the user again because the dependency is one of
 documentation honesty, not of code: the restart-with-a-foreign-key path exists today and hot reload
 does not widen it (the in-process project check rejects a foreign key where today's restart adopts
 it). The alternative — this ticket first, with the gap named under Residual risks and closed when the

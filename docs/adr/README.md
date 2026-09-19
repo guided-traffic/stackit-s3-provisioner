@@ -98,8 +98,9 @@ The **State** column is a coarse reading aid, last trued up on 2026-09-19. Each 
 
 | ADR | Decision (one line) | State |
 |---|---|---|
-| [0012](0012-ready-describes-the-last-verified-state.md) | `Ready` describes the last verified state of a bucket, not the last verification attempt | Implemented, except that a provisioned bucket which vanished at the provider is re-created rather than reported |
+| [0012](0012-ready-describes-the-last-verified-state.md) | `Ready` describes the last verified state of a bucket, not the last verification attempt | Implemented |
 | [0013](0013-a-provider-outage-is-held-fleet-wide.md) | A provider outage is held fleet-wide, and the trip condition is the absence of success rather than a parsed error | Implemented, except that the size-measurement queue is not held by the breaker |
+| [0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md) | A provisioned bucket that has vanished is reported, never re-created implicitly, unless `spec.allowRecreate` authorises it | Implemented, except that only this guard asks per bucket — provisioning, read grants and teardown still decide existence from a project-wide listing |
 
 ### Measurement
 

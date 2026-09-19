@@ -136,14 +136,14 @@ spec:
   secretRef:
     name: probe-credentials
 EOF
-kubectl -n default get bucket probe -w      # PHASE must reach Ready
+kubectl -n default get bkt probe -w         # PHASE must reach Ready
 kubectl -n default get secret probe-credentials
 
 # 5. The admin credential exists now - it is minted on the FIRST reconcile, not at startup.
 kubectl -n $NS get secret stackit-s3-provisioner-admin
 
 # 6. Clean up. Deletion only succeeds while the bucket is empty, which a probe bucket is.
-kubectl -n default delete bucket probe
+kubectl -n default delete bkt probe
 ```
 
 Step 5 is the reason a fresh install against a healthy project still makes **no** cloud call until
@@ -437,14 +437,14 @@ leaves CRs that nothing can finish deleting until an operator runs again.
 NS=stackit-s3-provisioner-system      # example
 
 # 1. While the operator is still running: delete every Bucket CR, cluster-wide.
-kubectl get buckets -A
+kubectl get bkt -A
 
 # 2. Delete them namespace by namespace, and wait. A bucket that still holds objects is
 #    NOT deleted - the CR keeps its finalizer and stays in Terminating on purpose.
-kubectl -n <namespace> delete bucket <name>
+kubectl -n <namespace> delete bkt <name>
 
 # 3. Confirm nothing is left before touching the release.
-kubectl get buckets -A            # must be empty
+kubectl get bkt -A                # must be empty
 
 # 4. Now remove the release.
 helm uninstall stackit-s3-provisioner -n $NS

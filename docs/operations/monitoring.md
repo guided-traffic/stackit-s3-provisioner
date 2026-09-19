@@ -29,9 +29,11 @@ port. Verified in `cmd/main.go` and
 **The health probes say nothing about the provider.** Both are registered as
 `healthz.Ping`: they report that the process is alive, not that the StackIT API
 is reachable or that a service-account key was ever loaded. That is precisely
-why `StackitS3SkeletonMode` exists and why it is the one `critical` alert in the
-set — an operator with no key comes up, passes both probes forever and
-provisions nothing.
+why `StackitS3SkeletonMode` exists and why it is one of only two `critical`
+alerts in the set — an operator with no key comes up, passes both probes forever
+and provisions nothing. The other one, `StackitS3BucketMissing`, reports the
+other thing a green probe says nothing about: a provisioned bucket the provider
+answers for as gone ([vanished-buckets.md](vanished-buckets.md)).
 
 ---
 
@@ -58,9 +60,10 @@ monitoring:
     enabled: true                      # false # default
     labels:
       release: kube-prometheus-stack   # example — same selector as above
-    # alerts.<name>.enabled toggles each rule individually; all eleven default
-    # to true. The whole PrometheusRule is skipped when every toggle is false,
-    # because prometheus-operator rejects a rule group with no rules.
+    # alerts.<name>.enabled toggles each rule individually; twelve of the
+    # thirteen default to true and bucketRecreated is the one that ships off.
+    # The whole PrometheusRule is skipped when every toggle is false, because
+    # prometheus-operator rejects a rule group with no rules.
 ```
 
 Both switches default to `false` for the same reason: the chart would otherwise
@@ -119,7 +122,7 @@ stackit_s3_provisioner_skeleton_mode
 
 ## The metric catalogue
 
-22 series in total, on top of the standard controller-runtime and Go collectors.
+24 series in total, on top of the standard controller-runtime and Go collectors.
 The controller-runtime series matter too: the reconcile-error alert is built on
 `controller_runtime_reconcile_errors_total`, and the two controllers are labelled
 `controller="bucket"` (provisioning) and `controller="bucketusage"` (size
@@ -135,12 +138,13 @@ consequences follow, and alert expressions depend on all three:
 | --- | --- |
 | The gauges cannot drift | There is no per-reconcile bookkeeping to get out of step with reality; a wrong value self-heals on the next scrape |
 | A failed cache list omits **every** bucket-derived series for that scrape | An absent series, not a zero. The collector bounds the wait at 10s so a scrape during startup cannot hang the handler |
-| Every replica exports the full fleet, leader or not | The metrics server is not gated on leader election. During a rolling update two pods export the same numbers, which is why the fleet-gauge expressions wrap their selector in `max(…)` rather than `sum(…)`. This does not apply to the three counter-based expressions: reconciling and measuring *are* gated on leader election (`leaderElection.enabled: true` # default), so a non-leader replica never increments `controller_runtime_reconcile_errors_total` or `..._usage_measurement_failures_total` and `sum(increase(…))` over them is safe. Verified in `cmd/main.go` and `deploy/helm/stackit-s3-provisioner/values.yaml` |
+| Every replica exports the full fleet, leader or not | The metrics server is not gated on leader election. During a rolling update two pods export the same numbers, which is why the fleet-gauge expressions wrap their selector in `max(…)` rather than `sum(…)`. This does not apply to the counter-based expressions: reconciling and measuring *are* gated on leader election (`leaderElection.enabled: true` # default), so a non-leader replica never increments `controller_runtime_reconcile_errors_total`, `..._usage_measurement_failures_total` or `..._bucket_recreated_total` and `sum(increase(…))` over them is safe. Verified in `cmd/main.go` and `deploy/helm/stackit-s3-provisioner/values.yaml` |
 
-The two `usage_measurement_*` process metrics are the deliberate exception. They
-cannot be derived from the resources: a failed measurement leaves nothing on the
-`Bucket` beyond a message, and the duration of a listing pass is gone once it
-finished.
+The three process metrics are the deliberate exception, and none of them can be
+derived from the resources: a failed measurement leaves nothing on the `Bucket`
+beyond a message, the duration of a listing pass is gone once it finished, and an
+authorised re-creation leaves no durable trace on the CR at all
+([ADR 0015 D13](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)).
 
 ### Fleet-wide series
 
@@ -165,6 +169,7 @@ them — that is the design, so `absent()` separates "no measurement" from "zero
 | Metric | Type | Present when | Meaning |
 | --- | --- | --- | --- |
 | `stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds` | gauge | The bucket is being held (`status.degradedSince` set **and** phase still `Ready`) | When the run of failures began. `time() - <series>` is the age of the hold; the series disappears when the hold is given up |
+| `stackit_s3_provisioner_bucket_provisioned_missing` | gauge | The provider answered that this provisioned bucket is gone (the `BucketPresent` condition is `False`) | `1` means the data is lost, not that a call failed — only the provider's own structured answer gets a `Bucket` into this state ([ADR 0015 D3](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)). Derived from the condition, not from the phase: a `Bucket` that is `Failed` for any other reason carries no series at all |
 | `stackit_s3_provisioner_credentials_last_rotation_timestamp_seconds` | gauge | The bucket was rotated at least once | When its workload credential was last rotated ([ADR 0007](../adr/0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md)) |
 | `stackit_s3_provisioner_bucket_size_bytes` | gauge | Measured at least once | Size in bytes of the bucket's current objects at the last measurement |
 | `stackit_s3_provisioner_bucket_objects` | gauge | Measured at least once | Number of current objects |
@@ -180,11 +185,12 @@ them — that is the design, so `absent()` separates "no measurement" from "zero
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `stackit_s3_provisioner_usage_measurement_failures_total` | counter | Measurements that could not complete. A failed measurement deliberately returns **no** reconcile error ([ADR 0014 D3](../adr/0014-bucket-size-is-measured-by-a-separate-controller.md)), so this counter is the only place they aggregate — `controller_runtime_reconcile_errors_total{controller="bucketusage"}` stays flat through them |
+| `stackit_s3_provisioner_bucket_recreated_total` | counter | Vanished buckets rebuilt automatically because `spec.allowRecreate` authorised it ([ADR 0015 D9](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)). The one series in this table that carries `{namespace, name}`, because it has to name the `Bucket` whose workload is now holding a replaced Secret — and it belongs here rather than with the per-`Bucket` gauges because it cannot be derived from the cache: an authorised re-creation ends with the CR back in `Ready` and leaves nothing behind on it. A process counter, so it restarts at zero with the operator |
 | `stackit_s3_provisioner_usage_measurement_duration_seconds` | histogram | Duration of one successful listing pass. Buckets: `0.1, 0.5, 1, 5, 15, 60, 300, 900, 1800` seconds. This is the number to look at before lowering `bucketUsage.interval`, and the one that shows a bucket outgrowing its cap |
 
 ### Absent is not zero
 
-The three cases an expression has to keep apart:
+The four cases an expression has to keep apart:
 
 | You see | It means |
 | --- | --- |
@@ -197,13 +203,17 @@ The three cases an expression has to keep apart:
 
 ## The shipped alerts
 
-Eleven rules, each with its own `enabled` toggle under
-`monitoring.prometheusRule.alerts.<name>`, all defaulting to `true`. They are
-only rendered when `monitoring.prometheusRule.enabled` is `true` **and** at least
-one toggle is on.
+Thirteen rules, each with its own `enabled` toggle under
+`monitoring.prometheusRule.alerts.<name>`. Twelve default to `true`;
+`StackitS3BucketRecreated` is the single exception and ships disabled, because it
+can only ever fire on a deployment that has adopted `spec.allowRecreate`
+([ADR 0015 D12](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)).
+They are only rendered when `monitoring.prometheusRule.enabled` is `true` **and**
+at least one toggle is on.
 
-The alert names, their toggle keys and their severities are in the
-[README reference](../../README.md). What that list does not carry is the `for`
+The alert names, their toggle keys and which two of them are `critical` are in
+the [README reference](../../README.md); the other eleven are `warning`. What
+that list does not carry is the `for`
 window each rule waits out before it fires, and the rendered expression behind
 it — and the `for` window is what separates an alert reporting a state from one
 reporting a transient:
@@ -218,21 +228,24 @@ reporting a transient:
 | `StackitS3SkeletonMode` | 15m |
 | `StackitS3WipeRequestedButGateDisabled` | 15m |
 | `StackitS3BucketProviderDegraded` | 1m |
+| `StackitS3BucketMissing` | 5m |
+| `StackitS3BucketRecreated` | 1m (ships disabled) |
 | `StackitS3UsageMeasurementFailing` | none |
 | `StackitS3UsageMeasurementTruncated` | 30m |
 | `StackitS3ReconcileErrors` | `sustainedFor` (15m # default) |
 
-Only `StackitS3ReconcileErrors` has a configurable window, and it is the one to
-read carefully: `sustainedFor` stacks **on top of** the rule's own 15-minute
-`increase()` window, so the error rate has to hold across a second window before
-the alert pages. The two short or absent windows are not oversights — for both
-`StackitS3BucketProviderDegraded` and `StackitS3UsageMeasurementFailing` the
-window that matters is inside the expression itself (`holdForSeconds` and a
+Only `StackitS3ReconcileErrors` has a configurable `for` window, and it is the
+one to read carefully: `sustainedFor` stacks **on top of** the rule's own
+15-minute `increase()` window, so the error rate has to hold across a second
+window before the alert pages. The short and absent windows are not oversights —
+for `StackitS3BucketProviderDegraded`, `StackitS3BucketRecreated` and
+`StackitS3UsageMeasurementFailing` the window that matters is inside the
+expression itself (`holdForSeconds`, the `increase()` lookback `window` and a
 30-minute `increase()` respectively), so a `for` clause would only add a second,
 redundant delay.
 
 <details>
-<summary>The eleven expressions as rendered</summary>
+<summary>The thirteen expressions as rendered</summary>
 
 ```promql
 # StackitS3BucketsWipeOnDelete            for: 5m
@@ -259,6 +272,12 @@ max(stackit_s3_provisioner_buckets_wipe_on_delete) > 0
 
 # StackitS3BucketProviderDegraded         for: 1m
 max(time() - stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds) > 1200   # holdForSeconds # default
+
+# StackitS3BucketMissing                  for: 5m    severity: critical
+max(stackit_s3_provisioner_bucket_provisioned_missing) > 0
+
+# StackitS3BucketRecreated                for: 1m    (disabled # default)
+sum(increase(stackit_s3_provisioner_bucket_recreated_total[6h])) > 0   # window # default
 
 # StackitS3UsageMeasurementFailing        (no for:)
 sum(increase(stackit_s3_provisioner_usage_measurement_failures_total[30m])) > 3
@@ -289,10 +308,11 @@ not in the alert; it is in `kubectl get bkt -A`.
 
 ## The alerts that carry a number
 
-Eight of the eleven are threshold-free statements about a state that should not
-persist. Three carry numbers. Two of those numbers are Helm values constrained by
-something else in the configuration; the third is hardcoded in the rule template
-and is explained here because its implications are not obvious.
+Nine of the thirteen are threshold-free statements about a state that should not
+persist. Four carry numbers. Three of those numbers are Helm values — two
+constrained by something else in the configuration, the third by a property of
+the counter it reads; the fourth is hardcoded in the rule template. All four are
+here because their implications are not obvious.
 
 ### `StackitS3ReconcileErrors` — and why it excludes provider outages
 
@@ -376,6 +396,36 @@ falling to `Failed`. Lowering the grace without lowering `holdForSeconds` silent
 disables the alert — change both or neither. The mechanism itself is documented in
 [provider-outages.md](provider-outages.md).
 
+### `StackitS3BucketRecreated` — a lookback, not a state
+
+```promql
+sum(increase(stackit_s3_provisioner_bucket_recreated_total[6h])) > 0   # window # default
+```
+
+Every other alert in the set fires on something that has not stopped — a state
+that is still there, or, for the two other `increase()` rules, a run of failures
+that is still arriving. This one reports an event that is already over: a
+`Bucket` carrying `spec.allowRecreate` lost its bucket, the operator rebuilt it
+empty and unattended, and the CR went back to `Ready` with no durable record of
+any of it
+([ADR 0015 D13](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)).
+There is nothing left to test afterwards, so `window` is the whole visibility of
+the incident — it decides how long after the rebuild the alert can still fire,
+and it has to outlast the time somebody needs to notice.
+
+| Value | Default | Constraint |
+| --- | --- | --- |
+| `monitoring.prometheusRule.alerts.bucketRecreated.window` | `"6h"` | The lookback of the `increase()`, and the only thing keeping the incident visible |
+| `monitoring.prometheusRule.alerts.bucketRecreated.enabled` | `false` | The one alert in the set that ships off. Turn it on with the first `Bucket` that sets `spec.allowRecreate`, not before — until then it can never fire |
+
+**The caveat no window fixes:** `..._bucket_recreated_total` is a process counter
+and restarts at zero with the operator, so an `increase()` across a restart
+under-reports —
+[ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)
+names that the accepted weakest link in the record of an unattended re-creation,
+since the Warning event beside it lives only as long as the cluster keeps events.
+What to do when the alert fires is in [vanished-buckets.md](vanished-buckets.md).
+
 ### `StackitS3UsageMeasurementFailing` — what the threshold implies
 
 `> 3` failures per 30 minutes, with no `for` clause. This is the one number that
@@ -395,7 +445,9 @@ default interval floor, not a measured figure.
 | Alert | What you look at | What it usually is |
 | --- | --- | --- |
 | `StackitS3SkeletonMode` | `kubectl logs` for `running in skeleton mode`; `stackit.serviceAccountKey.secretName` and the referenced Secret | The key Secret is missing, misnamed, or the release was installed without it. See [prerequisites.md](prerequisites.md) |
-| `StackitS3BucketFailed` | `kubectl get bkt -A`, then `status.message` on the failed ones | A configuration fault that parks without requeueing: a Secret key collision, a `spec.region` mismatch, a `secretRef` aimed at the admin Secret, an ownership collision. See [bucket-status.md](bucket-status.md) |
+| `StackitS3BucketMissing` | `stackit_s3_provisioner_bucket_provisioned_missing` for **which** `Bucket` — the alert expression drops the labels — then its `BucketPresent` condition and `status.message` | Data loss, not an outage: a bucket the operator provisioned was deleted behind its back, or the operator is authenticated against a project that never held it. It is deliberately **not** re-created. Runbook in [vanished-buckets.md](vanished-buckets.md) |
+| `StackitS3BucketRecreated` | `stackit_s3_provisioner_bucket_recreated_total` for which `Bucket`, then the `BucketRecreated` event on it and the workloads mounting its Secret | An authorised rebuild under `spec.allowRecreate` that already happened: the contents are gone, the credentials Secret was replaced, and consumers keep failing with `403` until they re-read it. The previous credentials group is left standing and its cleanup is manual. See [vanished-buckets.md](vanished-buckets.md) |
+| `StackitS3BucketFailed` | `kubectl get bkt -A`, then `status.message` on the failed ones | A configuration fault that parks without requeueing: a Secret key collision, a `spec.region` mismatch, a `secretRef` aimed at the admin Secret, an ownership collision. A vanished bucket lands here too — it keeps retrying rather than parking, and `StackitS3BucketMissing` has already fired ten minutes earlier. See [bucket-status.md](bucket-status.md) |
 | `StackitS3BucketStuckProvisioning` | `status.message` and `status.clone` | A long clone, provider trouble, or a quota limit |
 | `StackitS3BucketStuckDeleting` | `status.message` on the terminating CR | Almost always the emptiness guard refusing to delete a non-empty bucket ([ADR 0006](../adr/0006-a-bucket-is-deleted-only-when-it-is-empty.md)). Runbook in [deletion.md](deletion.md) |
 | `StackitS3CloneFailed` | `status.clone`, then the clone Job's logs in the release namespace | Dead source credentials or a source bucket that no longer exists. See [cloning.md](cloning.md) |
@@ -432,7 +484,7 @@ which is exactly why the failure counter and its alert exist.
 
 **The operator being absent.** This is a gap, stated plainly: every shipped
 expression tests a series the operator itself exports — a fleet gauge, a
-per-bucket gauge, or an `increase()` over a counter it exports — and all eleven
+per-bucket gauge, or an `increase()` over a counter it exports — and all thirteen
 evaluate to nothing when the operator is down, not scraped, or its
 `ServiceMonitor` was never discovered because of the label trap above. Nothing in
 this chart notices that.
@@ -464,7 +516,7 @@ context of [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md).
 
 That alert is **not** shipped by this chart. It lives in the consuming cluster's
 own monitoring stack — nothing in this repository renders a rule watching Flux
-resources, and the eleven rules in `prometheusrule.yaml` all test series the
+resources, and the thirteen rules in `prometheusrule.yaml` all test series the
 operator itself exports. On that cluster it carried severity `warning` and
 `for: 5m` over the Flux readiness conditions:
 
@@ -511,7 +563,8 @@ then looks like two, two hours apart.
 
 - [provider-outages.md](provider-outages.md) — the hold and the breaker, and the two settings that bound them
 - [usage-and-cost.md](usage-and-cost.md) — what the size and cost series are measured from
+- [vanished-buckets.md](vanished-buckets.md) — what the two alerts on a missing bucket mean on the `Bucket` itself, and what to do
 - [bucket-status.md](bucket-status.md) — phases, conditions and events on a single `Bucket`
 - [deployment.md](deployment.md) — replicas, leader election and rolling updates
 - [README reference](../../README.md) — the complete Helm value and `Bucket` field list
-- [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md), [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md), [ADR 0014](../adr/0014-bucket-size-is-measured-by-a-separate-controller.md)
+- [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md), [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md), [ADR 0014](../adr/0014-bucket-size-is-measured-by-a-separate-controller.md), [ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)
