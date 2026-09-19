@@ -61,10 +61,10 @@ func grantorCR(ns, name string, grantees ...string) *s3v1.Bucket {
 	return b
 }
 
-// TestReadGrantAppliedToPolicy is the ticket's core acceptance at the offline
-// level: a data bucket that grants read access to a sibling ends up with that
-// sibling's workload group as a reader principal in its policy, and the sibling
-// is recorded in status.
+// TestReadGrantAppliedToPolicy is ADR 0008 D1 and D3 at the offline level: a
+// data bucket that grants read access to a sibling ends up with that sibling's
+// workload group as a reader principal in its policy, and the sibling is
+// recorded in status.
 func TestReadGrantAppliedToPolicy(t *testing.T) {
 	e := newTestEnv(t)
 
@@ -176,7 +176,7 @@ func TestReadGrantRevokedOnGranteeDeletion(t *testing.T) {
 	}
 }
 
-// TestReadGrantIsNamespaceScoped is the isolation guarantee from the ticket: a
+// TestReadGrantIsNamespaceScoped is the isolation guarantee of ADR 0008 D2: a
 // Bucket with the same CR name in another namespace must never be resolved,
 // even though StackIT credentials groups live in one flat project namespace.
 func TestReadGrantIsNamespaceScoped(t *testing.T) {

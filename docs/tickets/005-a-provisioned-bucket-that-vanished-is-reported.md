@@ -185,7 +185,7 @@ Two consequences to document rather than hide:
 * The **credentials Secret is deleted with the CR** — verified: `teardown` calls `deleteSecret`
   unconditionally as its last step ([bucket_controller.go:1232-1239](../../internal/controller/bucket_controller.go#L1232-L1239),
   the only exception being the operator's own admin Secret), and `upsertSecret` additionally sets a
-  controller owner reference ([bucket_controller.go:1506](../../internal/controller/bucket_controller.go#L1506))
+  controller owner reference ([bucket_controller.go:1505](../../internal/controller/bucket_controller.go#L1505))
   so Kubernetes garbage collection would remove it even if teardown never ran. Operationally this means
   a gap: between deleting the CR and re-applying it the workload has no Secret. Pods that consumed it
   via `envFrom` keep their environment until they restart; anything reading it live fails. Plan the

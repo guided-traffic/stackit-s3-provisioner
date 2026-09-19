@@ -56,9 +56,8 @@ untested one.
 | --- | --- |
 | [README.md](../../README.md) | The front page: the pitch, the naming conventions, the fast start — and the complete reference for every Helm value and every `Bucket` field. |
 | [docs/adr/](../adr/README.md) | The decisions. Every rule these pages cite as `ADR 0012 D5` is defined there, with what it costs and what was rejected. An ADR names no file and no function on purpose, so it stays true when the tree moves. |
-| [docs/developer/](../developer/README.md) | How the subsystems work, for somebody about to change them: the package map, the reconcile pipeline, the policy builder, the circuit breaker, the clone machinery, the provider-error classification, the test layout. |
+| [docs/developer/](../developer/README.md) | How the subsystems work, for somebody about to change them: the package map, the reconcile pipeline, the policy builder, the circuit breaker, the clone machinery, the provider-error classification, the test layout — and the whole-repo view beside them, the build and release page and the extension checklists. |
 | [docs/security/](../security/README.md) | The security design, one page per perspective — tenancy and isolation, credentials and Secrets, RBAC and privilege, ownership and attribution — each ending with what it does not cover and which gaps are open. |
-| [DEVELOPER.md](../../DEVELOPER.md) | The contributor guide: repository layout, the build and test matrix, CI and the release process, the extension checklists. |
 | [SECURITY.md](../../SECURITY.md) | How to report a vulnerability. The security *design* is `docs/security/`; this file is the reporting convention and nothing else. |
 
 ---

@@ -28,9 +28,10 @@ its reasoning to.
 
 Six live tickets, none approved for implementation. Five carry **2026-09-19** on the file itself, the
 date they were raised or last refined; 010 is older than its file — it was open question Q2 of the
-feasibility findings on **2026-06-30** and was given a file on 2026-09-19, because three durable pages
-now say "unknown" in the place its answer belongs. States below are judged from each file's own
-answered and unanswered questions on 2026-09-19.
+feasibility findings on **2026-06-30** and was given a file on 2026-09-19, because seven statements
+across five durable pages now say "unknown" in the place its answer belongs — two of them as an
+instruction to somebody standing in the provider's portal. States below are judged from each file's
+own answered and unanswered questions on 2026-09-19.
 
 | Ticket | State | What it covers |
 | --- | --- | --- |
@@ -94,7 +95,7 @@ produced lives in the ADR beside it; verified on 2026-09-19 that each named reco
 | --- | --- | --- |
 | [001 — multipart management actions are allowed for the workload](archive/001-multipart-management-actions-are-allowed-for-the-workload.md) | 2026-07-22 | [ADR 0003 D7](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md) — a container registry's blob commits died with 403 because listing and aborting its own multipart uploads was treated as bucket management; multipart management is object work |
 | [002 — a bucket can grant read access to siblings](archive/002-a-bucket-can-grant-read-access-to-siblings.md) | 2026-08-24 | [ADR 0008](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) — a backup job could not read the sibling buckets of its own namespace, so read access became something the bucket that owns the data declares |
-| [003 — a ready bucket survives a transient provider error](archive/003-a-ready-bucket-survives-a-transient-provider-error.md) | 2026-08-25 | [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) — a provider blip flipped every provisioned bucket out of `Ready` on the first failed call; readiness now describes the last verified state, and the ticket's own error taxonomy was rejected in favour of classification by origin |
+| [003 — a ready bucket survives a transient provider error](archive/003-a-ready-bucket-survives-a-transient-provider-error.md) | 2026-08-27 | [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) — a provider blip flipped every provisioned bucket out of `Ready` on the first failed call; readiness now describes the last verified state, and the ticket's own error taxonomy was rejected in favour of classification by origin |
 | [004 — user-facing ClusterRoles are shipped aggregated](archive/004-user-facing-clusterroles-are-shipped-aggregated.md) | 2026-09-03 | [ADR 0001](../adr/0001-a-bucket-only-affects-its-own-namespace.md) — the chart ships `Bucket` read and write as aggregation fragments for the built-in roles, and write is deliberately never handed out without Secret access; the privilege inventory behind that is [docs/security/rbac-and-privilege.md](../security/rbac-and-privilege.md) |
 
 ---

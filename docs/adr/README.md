@@ -110,8 +110,7 @@ The **State** column is a coarse reading aid, last trued up on 2026-09-19. Each 
 ## Related documents
 
 * [README.md](../../README.md) — the front page and the single reference table
-* [DEVELOPER.md](../../DEVELOPER.md) — repository layout, build and test matrix, CI and release
-* [docs/developer/](../developer/README.md) — how each subsystem works, with the code references a record may not carry
+* [docs/developer/](../developer/README.md) — how each subsystem works, with the code references a record may not carry; also the repository layout, the build and test matrix, CI and the release
 * [docs/operations/](../operations/README.md) — what somebody deploying, configuring or integrating with the operator needs
 * [docs/security/](../security/README.md) — the threat model, each mechanism and the gap it leaves
 * [docs/tickets/](../tickets/README.md) — work that is still outstanding

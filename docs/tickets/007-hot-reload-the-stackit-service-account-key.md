@@ -166,10 +166,15 @@ Log the `projectId` and the SA issuer on a successful reload. Never the file con
 
 ### A7 — Documentation touched in the same change
 
-[README.md](../../README.md) (the flag and the rotation procedure), [docs/developer/stackit-api.md](../developer/stackit-api.md)
-(the SDK finding that the key is snapshotted at client construction), the Helm values and
-[CLAUDE.md](../../CLAUDE.md). `DEVELOPER.md` and `SECURITY_ARCHITECTURE.md` do not exist in this repo
-yet, so there is nothing to update there.
+[README.md](../../README.md) (the new flag and the chart value, in the reference table that is their
+only home), [docs/operations/configuration.md](../operations/configuration.md) (what the setting does
+and that it is the first thing here that is hot-reloaded),
+[docs/operations/credentials.md](../operations/credentials.md) (the rotation procedure an operator
+follows), [docs/security/credentials-and-secrets.md](../security/credentials-and-secrets.md) (what a
+write to the key Secret now does, per the security considerations below),
+[docs/developer/stackit-api.md](../developer/stackit-api.md) (the SDK finding that the key is
+snapshotted at client construction) and the Helm values. The decision itself goes into this ticket's
+own ADR, written with the implementation.
 
 ## Security considerations
 

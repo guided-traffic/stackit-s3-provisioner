@@ -252,9 +252,9 @@ func TestDegradedDisabledByZeroGrace(t *testing.T) {
 	}
 }
 
-// TestInitialProvisioningFailureIsNotHeld covers the case the ticket explicitly
-// carved out: a Bucket that has never been Ready has no verified state to
-// defend, so a failure during first provisioning must stay visible immediately.
+// TestInitialProvisioningFailureIsNotHeld covers the carve-out of ADR 0012 D6:
+// a Bucket that has never been Ready has no verified state to defend, so a
+// failure during first provisioning must stay visible immediately.
 func TestInitialProvisioningFailureIsNotHeld(t *testing.T) {
 	e := newTestEnv(t)
 	e.r.ProviderDegradedGrace = defaultGrace

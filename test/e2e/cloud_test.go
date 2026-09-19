@@ -361,10 +361,10 @@ func TestCloudProvisioning(t *testing.T) {
 	t.Log("OK: bucket provisioned and its Secret credentials work")
 }
 
-// TestCloudReadGrant is the ticket's acceptance criteria end to end, through the
-// operator rather than against a hand-built policy: a sibling Bucket in the same
-// namespace can list and get, cannot write or delete, and a Bucket of the same
-// name in another namespace is not granted anything.
+// TestCloudReadGrant proves ADR 0008 end to end, through the operator rather
+// than against a hand-built policy: a sibling Bucket in the same namespace can
+// list and get and cannot write or delete (D6), and a Bucket of the same name in
+// another namespace is not granted anything (D2).
 func TestCloudReadGrant(t *testing.T) {
 	requireCloud(t)
 	kube, dyn := clients(t)

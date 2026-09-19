@@ -51,8 +51,7 @@ obvious.
 ## The tree
 
 Every directory, and the files whose ownership is not obvious from the name. The sections below
-carry what each one actually does; this is the index into them. The contributor guide,
-[DEVELOPER.md](../../DEVELOPER.md), carries the one-line-per-directory version of the same tree.
+carry what each one actually does; this is the index into them.
 
 ```
 api/v1/                     the Bucket API: spec, status, kubebuilder markers, and every
@@ -130,7 +129,7 @@ The build and packaging files at the root, none of which any other section of th
 | [`.releaserc.json`](../../.releaserc.json), [`package.json`](../../package.json) | semantic-release: conventional-commit analysis on `main`, GitHub release, and a commit that carries the coverage badge JSON. The `package.json` exists only to pin those Node dev-dependencies; no JavaScript ships. |
 | [`LICENSE`](../../LICENSE) | Apache 2.0. |
 | [`Chart.yaml`](../../deploy/helm/stackit-s3-provisioner/Chart.yaml) | Chart metadata. `version` and `appVersion` are both `0.1.0` in git and are meant to stay that way: [`build.yml`](../../.github/workflows/build.yml) rewrites both from the release tag with `sed` before packaging, so bumping them by hand achieves nothing. |
-| [`.github/workflows/`](../../.github/workflows/) | `release.yml` runs on push and pull request to `main` — lint, gosec, vuln, cyclo, unit and envtest coverage, chart render, Kind e2e, and the semantic-release step. `build.yml` runs only when a GitHub release is published — image build, chart package and GitHub Pages publish, plus the generated-code drift check. `renovate.yml` runs the dependency bot. What each executes, in detail, is in [testing.md](testing.md#what-ci-runs). |
+| [`.github/workflows/`](../../.github/workflows/) | `release.yml` runs on push and pull request to `main` — lint, gosec, vuln, cyclo, unit and envtest coverage, chart render, Kind e2e, and the semantic-release step. `build.yml` runs only when a GitHub release is published — image build, chart package and GitHub Pages publish, plus the generated-code drift check. `renovate.yml` runs the dependency bot. What each executes, in detail, is in [testing.md](testing.md#what-ci-runs); the triggers, the version cut and the pinned toolchain are in [build-and-release.md](build-and-release.md). |
 
 ## `stackit/` — the provider client
 
@@ -404,11 +403,11 @@ so it ends up in `kubectl explain` on every cluster that installs the chart. Wri
 a cluster operator, not for a reviewer, and remember that changing one is a CRD change: it needs
 `make generate-all` and it ships a chart version.
 
-**A stale generated CRD merges green.** The `make generate-all` drift check runs only in the release
-workflow, on `release: published`; the pull-request pipeline has no generate or diff step at all, and
-none of its make targets pulls one in. Forgetting `make generate-all` after an `api/v1` change is
-therefore caught at release time, by the person cutting the release, rather than at review time by
-the person who made the change.
+**A stale generated CRD merges green.** Nothing in the pull-request pipeline regenerates or diffs
+the artefacts above, and none of its make targets pulls a generate step in. Forgetting `make
+generate-all` after an `api/v1` change is caught by the release gate, which is to say by the person
+cutting the release rather than by the person who made the change
+([build-and-release.md](build-and-release.md#make-generate-all-is-a-release-gate)).
 
 **The kustomize path cannot provision.** [`config/manager/manager.yaml`](../../config/manager/manager.yaml)
 passes only `--metrics-bind-address` and `--health-probe-bind-address` and mounts no service-account
@@ -424,6 +423,15 @@ currently agree on every rule, except that the generated role has no `leases` ru
 election has no kubebuilder marker, and the chart adds that rule itself when
 `leaderElection.enabled` is on. A kustomize deployment with `--leader-elect` would therefore lack the
 permission, which is a second reason not to use that path.
+
+The same asymmetry is why the two user-facing ClusterRoles,
+[`clusterrole-view.yaml`](../../deploy/helm/stackit-s3-provisioner/templates/clusterrole-view.yaml)
+and [`clusterrole-edit.yaml`](../../deploy/helm/stackit-s3-provisioner/templates/clusterrole-edit.yaml),
+exist as chart templates only and were **deliberately not mirrored into `config/rbac/`**: `make
+manifests` generates nothing there but `role.yaml`, so a viewer and an editor role beside it would be
+hand-maintained copies on an install path nothing tests — both e2e suites install through the chart.
+The mirror would add a second set of role definitions that no render check and no cluster run ever
+reads, and the copy that silently drifts is the one in `config/rbac/`.
 
 **`bucket_controller.go` is about two thousand lines** and holds the provisioning pipeline, ownership,
 attribution, grants, credentials, teardown, the watches and the error-outcome helpers. Nothing is

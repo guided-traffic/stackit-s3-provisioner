@@ -9,7 +9,7 @@ something is written down, it is in the wrong file — move it to the home below
 `github.com/guided-traffic/stackit-s3-provisioner` (`go.mod` is the authority for that path). What
 it does and how to run it is [README.md](README.md); why it is built that way is
 [docs/adr/README.md](docs/adr/README.md); the repository layout, the build, the test suites and the
-release process are [DEVELOPER.md](DEVELOPER.md).
+release process are [docs/developer/](docs/developer/README.md).
 
 ## Documentation has five homes, and a statement goes to exactly one
 
@@ -95,5 +95,7 @@ else is a duplicate**, and two lists drift invisibly.
   sentence that makes the claim. An assumption never travels as a fact.
 - **Dates are absolute**, enumerations of five or more parallel items are tables, links are
   relative, and generated files are never hand-edited.
-- The remaining project conventions — commit format, the test-suite contract, credential custody —
-  are in [DEVELOPER.md](DEVELOPER.md).
+- The remaining project conventions live with the mechanism they belong to: the commit format in
+  [docs/developer/build-and-release.md](docs/developer/build-and-release.md), the test-suite
+  contract in [docs/developer/testing.md](docs/developer/testing.md), credential custody in
+  [docs/security/credentials-and-secrets.md](docs/security/credentials-and-secrets.md).

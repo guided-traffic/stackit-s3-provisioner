@@ -111,9 +111,8 @@ before anything is written. `S3_ENDPOINT` and `S3_BUCKET_URL` are omitted when t
 | [docs/adr/](docs/adr/README.md) | The fourteen decisions: what the operator does, why, what was rejected and what it costs. |
 | [docs/operations/](docs/operations/README.md) | Running and integrating: prerequisites, deployment, GitOps, configuration, naming, status, deletion, credentials, cloning, read grants, usage and cost, provider outages, monitoring. |
 | [docs/security/](docs/security/README.md) | The security design, one page per perspective — tenancy and isolation, credentials and Secrets, RBAC and privilege, ownership and attribution — each ending with what it does not cover. |
-| [docs/developer/](docs/developer/README.md) | How the subsystems work, for somebody about to change them. |
+| [docs/developer/](docs/developer/README.md) | How the subsystems work, for somebody about to change them — plus the repository layout, the build and test matrix, CI and release, and the extension checklists. |
 | [docs/tickets/](docs/tickets/) | Work still outstanding. |
-| [DEVELOPER.md](DEVELOPER.md) | Repository layout, the build and test matrix, CI and release, the extension checklists. |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability. The design is `docs/security/`. |
 
 <details>
@@ -448,7 +447,7 @@ it, the row says so.
 
 Decisions live in [docs/adr/](docs/adr/README.md) and are binding — read the record before changing
 the behaviour it describes. Layout, the full test matrix, CI and the extension checklists are in
-[DEVELOPER.md](DEVELOPER.md).
+[docs/developer/](docs/developer/README.md).
 
 ```bash
 make help                      # every target

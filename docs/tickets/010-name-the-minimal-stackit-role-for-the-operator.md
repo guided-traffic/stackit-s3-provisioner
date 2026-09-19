@@ -8,14 +8,11 @@ itself comes from the provider.
 
 Raised on 2026-06-30 as open question Q2 of the feasibility findings — *which project-scoped role
 does the provisioner's service account actually need* — and never answered. It is given a file on
-2026-09-19 because it now blocks a written statement in three places:
-[ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) records under *Residual
-risks* that the minimal role is unknown and deployments are therefore granted something broader than
-the decision wants; [docs/operations/prerequisites.md](../operations/prerequisites.md#which-role)
-tells an installer, in the section where the role name belongs, that the name is not established;
-and [docs/security/tenancy-and-isolation.md](../security/tenancy-and-isolation.md#h-1-an-organisation-level-role-dissolves-layer-1-and-nothing-here-can-see-it)
-carries the same sentence inside gap H-1. Three pages say "we do not know" in the place where the
-answer goes.
+2026-09-19 because the unanswered question is now written down as a gap in **seven places across
+five durable pages**: a decision record and its index, the page an installer follows, and two
+security pages. Each of them says "we do not know" in exactly the place the answer belongs, and each
+of them has to be rewritten by the change that answers it — the inventory is
+[below](#where-the-gap-is-written-down-today).
 
 ## What it is
 
@@ -46,6 +43,27 @@ no call in the tree enumerates roles, the SDK exposes none, and the key file car
 a private key and nothing about grants (verified 2026-09-19). The answer comes from StackIT's own
 documentation or from a support answer, and the repository's part is to state exactly what the role
 has to cover and then prove a candidate.
+
+## Where the gap is written down today
+
+Enumerated on 2026-09-19 by grepping `docs/` and [README.md](../../README.md) for every statement
+that the role is unnamed, unknown, not established or an open gap. Seven statements, five pages. Each
+row is a place the answering change has to rewrite, and the last two are the ones a narrow reading of
+this ticket would miss.
+
+| # | Page | Section | What it says today |
+| --- | --- | --- | --- |
+| 1 | [ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md#status) | *Status* | Lists the unknown role as one of four open items of the record |
+| 2 | [ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md#residual-risks) | *Residual risks* | The gap itself: the minimal role is unknown, so deployments are granted a broader role than the decision wants; only the project scope is enforceable |
+| 3 | [docs/adr/README.md](../adr/README.md#index) | *Index*, the `0005` row | The `State` column reads "the minimal role is still unnamed" |
+| 4 | [docs/operations/prerequisites.md](../operations/prerequisites.md#which-role) | *Which role* | Tells the installer, in the section where the role name belongs, that the name is not established |
+| 5 | [docs/operations/prerequisites.md](../operations/prerequisites.md#what-stays-manual) | *What stays manual*, the `Grant the role` row | "**Project scope only.** Exact minimal role is an open gap" |
+| 6 | [docs/security/tenancy-and-isolation.md](../security/tenancy-and-isolation.md#h-1-an-organisation-level-role-dissolves-layer-1-and-nothing-here-can-see-it) | Gap H-1, *What an operator can do meanwhile* | The role a service account should hold is not yet settled, so deployments hold something broader |
+| 7 | [docs/security/rbac-and-privilege.md](../security/rbac-and-privilege.md#what-this-does-not-cover) | *What this does not cover* | The strongest of the seven: the exact role "is not enumerated anywhere in this repository", and the page deliberately does not guess |
+
+Rows 1-3 and 6-7 are *statements of a gap* and are rewritten or removed. Rows 4 and 5 are
+**instructions to an installer** and are the reason this ticket exists at all: somebody standing in
+the StackIT portal is told there that nobody knows which role to click.
 
 ## What the tree looks like today
 
@@ -125,15 +143,19 @@ reports which call is missing rather than hanging.
    already enabled never calls it (verified in `EnsureService`, `stackit/client.go`). Either use a
    project where the service is not yet enabled, or record that this one operation of the twelve is
    unproven and why.
-7. **Write the answer into its homes**, in the same change: the role name and its source into the
-   *Which role* section of [docs/operations/prerequisites.md](../operations/prerequisites.md#which-role),
-   replacing the gap statement; a new rule in
-   [ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) naming the role beside
-   the scope rule of D5, with the *Residual risks* paragraph about the unknown role removed and the
-   `Status` section amended and dated; and the sentence inside gap H-1 of
+7. **Write the answer into its homes**, in the same change — every row of
+   [Where the gap is written down today](#where-the-gap-is-written-down-today), none left behind:
+   the role name and its source replace the gap statement in the *Which role* section and shorten the
+   `Grant the role` row of the install table (rows 4 and 5); a new rule in
+   [ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) names the role beside the
+   scope rule of D5, its *Residual risks* paragraph about the unknown role goes and its `Status`
+   section is amended and dated (rows 1 and 2), which also re-words the `0005` row of the ADR index
+   (row 3); the sentence inside gap H-1 of
    [docs/security/tenancy-and-isolation.md](../security/tenancy-and-isolation.md#h-1-an-organisation-level-role-dissolves-layer-1-and-nothing-here-can-see-it)
-   trimmed to what stays true — H-1 itself does not close, because a wrong *scope* remains invisible
-   whatever the role is called.
+   is trimmed to what stays true (row 6); and the *What this does not cover* paragraph of
+   [docs/security/rbac-and-privilege.md](../security/rbac-and-privilege.md#what-this-does-not-cover)
+   stops saying the role is enumerated nowhere and points at the record instead (row 7). H-1 itself
+   does not close, because a wrong *scope* remains invisible whatever the role is called.
 8. **Decide the record.** The privilege model is architectural, so the outcome is either an amendment
    to ADR 0005 or its own ADR (Q3), agreed before it is written.
 
@@ -190,7 +212,7 @@ deployment serving a second region
 | 3 | The control-plane integration suites pass with the same key, including group attribution against a pre-existing bucket |
 | 4 | Each of the twelve control-plane operations is either exercised by that run or explicitly recorded as unproven, with the reason — `EnableService` is the one that needs saying out loud |
 | 5 | A policy write and a tag write are among the operations the run exercised, so Q2 is answered by evidence rather than by assumption |
-| 6 | The role is stated in the *Which role* section of the prerequisites page as a verified fact, and the three places that currently say the name is unknown no longer say it |
+| 6 | The role is stated in the *Which role* section of the prerequisites page as a verified fact, and none of the seven places in [Where the gap is written down today](#where-the-gap-is-written-down-today) still says the name is unknown — re-derived by the same grep, not by trusting that table |
 | 7 | ADR 0005 carries the rule and no longer carries the gap, with its `Status` amended and dated; or the new record exists, agreed in advance |
 | 8 | Gap H-1 still stands, reduced to what remains true: scope, not least privilege, is the boundary nothing in the product can see |
 
