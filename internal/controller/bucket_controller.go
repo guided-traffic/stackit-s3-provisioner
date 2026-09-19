@@ -46,7 +46,7 @@ const (
 )
 
 // adminGroupName is the display name of the operator-wide bootstrap credentials
-// group whose access key sets bucket policies (INIT-SETUP.md §4.1). It is shared
+// group whose access key sets bucket policies (ADR 0004 D1). It is shared
 // across all Bucket CRs in the project and is never torn down per-bucket.
 const adminGroupName = "operator-admin"
 
@@ -71,7 +71,7 @@ type adminCreds struct {
 // BucketReconciler reconciles a Bucket object against StackIT Object Storage.
 //
 // One Bucket CR maps to a StackIT bucket, a dedicated credentials group, an
-// access key, an isolation policy (INIT-SETUP.md §4.1) and a workload
+// access key, an isolation policy (ADR 0003) and a workload
 // credentials Secret. The reconciler is idempotent and self-healing: cloud
 // resources are found again by the bucket's own tags (ownership and, per
 // ADR 0002, the credentials group it attributes), so a crash never leaks a
@@ -304,7 +304,7 @@ func (r *BucketReconciler) reconcileDelete(ctx context.Context, b *s3v1.Bucket) 
 	if err := r.teardown(ctx, b); err != nil {
 		logger.Error(err, "teardown failed; keeping finalizer", "bucket", b.EffectiveBucketName())
 		// Keep the finalizer and surface the reason; a non-empty bucket must not
-		// be deleted (data-loss guard, INIT-SETUP.md §0).
+		// be deleted (data-loss guard, ADR 0006 D2).
 		return r.fail(ctx, b, err)
 	}
 	r.Breaker.Success()
@@ -1167,7 +1167,7 @@ func (r *BucketReconciler) resolveReadGrants(
 	return urns, granted, nil
 }
 
-// ensureBucketPolicy applies the isolation policy (INIT-SETUP.md §4.1) via the
+// ensureBucketPolicy applies the isolation policy (ADR 0003) via the
 // admin S3 key, re-writing it only when it drifts from the desired document.
 // readerURNs carries the resolved spec.grantReadAccess principals; nil keeps the
 // policy at its two original statements.
@@ -1203,7 +1203,7 @@ func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
 		return err
 	}
 
-	// Empty-only guard (INIT-SETUP.md §0), optionally preceded by a requested
+	// Empty-only guard (ADR 0006 D3), optionally preceded by a requested
 	// wipe: refuse deletion while the bucket holds data. Done first, before any
 	// credential is removed, so a blocked delete leaves the workload fully
 	// functional.

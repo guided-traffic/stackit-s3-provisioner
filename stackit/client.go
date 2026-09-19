@@ -19,7 +19,7 @@ import (
 	"github.com/stackitcloud/stackit-sdk-go/services/objectstorage"
 )
 
-// RegionEU01 is the only region used in v1 (see INIT-SETUP.md §0).
+// RegionEU01 is the only region used in v1 (ADR 0005 D2).
 const RegionEU01 = "eu01"
 
 // Account is the minimal view of a STACKIT service-account key file we need:
@@ -179,7 +179,7 @@ func (c *Client) CreateBucket(ctx context.Context, name string) error {
 }
 
 // DeleteBucket deletes a bucket from the client's own project. The bucket must
-// be empty (STACKIT lösch-semantics, INIT-SETUP.md §0).
+// be empty (STACKIT delete semantics, ADR 0006 D2).
 func (c *Client) DeleteBucket(ctx context.Context, name string) error {
 	if _, err := c.api.DeleteBucket(ctx, c.account.ProjectID, c.region, name).Execute(); err != nil {
 		return fmt.Errorf("delete bucket %q in project %s: %w", name, c.account.ProjectID, err)
@@ -269,7 +269,7 @@ func (c *Client) DeleteCredentialsGroup(ctx context.Context, groupID string) err
 }
 
 // CreateAccessKey creates an S3 access key inside the given credentials group.
-// No expiry is set (INIT-SETUP.md §0).
+// No expiry is set (ADR 0007 D3).
 func (c *Client) CreateAccessKey(ctx context.Context, groupID string) (AccessKey, error) {
 	resp, err := c.api.CreateAccessKey(ctx, c.account.ProjectID, c.region).
 		CredentialsGroup(groupID).

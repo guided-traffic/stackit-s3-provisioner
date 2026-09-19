@@ -176,7 +176,7 @@ var readerAllowedActions = []string{
 //   - s3:GetObjectAcl / GetBucketAcl — not needed; ACLs are unused here.
 
 // BuildIsolationPolicy returns the validated per-bucket S3 bucket policy (see
-// INIT-SETUP.md §4.1). It confines the bucket to a small, explicit principal set:
+// ADR 0003). It confines the bucket to a small, explicit principal set:
 //
 //   - adminURN keeps full control (lockout protection + management/cleanup),
 //   - workloadURN is restricted to object operations only,
@@ -386,8 +386,8 @@ func normalizeJSON(s string) (string, error) {
 
 // S3Admin is an S3 data-plane client authenticated with the operator's bootstrap
 // admin access key. It is the only credential that can set bucket policies
-// (PutBucketPolicy is not exposed by the control-plane SDK, see INIT-SETUP.md
-// §3/§4.1) and it is used to inspect bucket contents for the empty-only delete
+// (PutBucketPolicy is not exposed by the control-plane SDK, see ADR 0004 D2)
+// and it is used to inspect bucket contents for the empty-only delete
 // guard. The endpoint host is region-uniform, so one client serves every bucket
 // in the region.
 type S3Admin struct {
@@ -545,7 +545,7 @@ func (b BucketStats) BillableBytes() int64 { return b.Bytes + b.VersionBytes }
 
 // BucketStats measures a bucket by listing it. There is no cheaper way: the
 // Object Storage control-plane API exposes no usage or statistics endpoint
-// (verified against objectstorage SDK v1.9.1, INIT-SETUP.md 8.3), so the size is
+// (verified against objectstorage SDK v1.9.1, ADR 0014), so the size is
 // the sum over one listing pass — roughly one request per 1000 keys.
 //
 // With includeVersions the listing switches to the version listing, which
@@ -607,7 +607,7 @@ func (s *S3Admin) BucketUsage(ctx context.Context, bucket string) (int64, error)
 }
 
 // BucketEmpty reports whether the bucket holds no objects. It is used to enforce
-// the empty-only delete guard (INIT-SETUP.md §0) before any teardown, so a
+// the empty-only delete guard (ADR 0006 D2) before any teardown, so a
 // non-empty bucket never loses its credentials or data.
 func (s *S3Admin) BucketEmpty(ctx context.Context, bucket string) (bool, error) {
 	// Cancel the listing once we have our answer so minio's producer goroutine

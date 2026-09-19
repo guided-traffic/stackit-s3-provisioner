@@ -110,7 +110,7 @@ spec:
             description: |-
               BucketSpec defines the desired state of a StackIT Object Storage bucket and its
               dedicated, isolated workload credentials (one CR = one isolated workload, see
-              INIT-SETUP.md §8).
+              ADR 0003 D1).
             properties:
               bucketName:
                 description: |-
@@ -499,7 +499,7 @@ spec:
               credentialsGroupURN:
                 description: |-
                   CredentialsGroupURN is the credentials-group URN used as the bucket-policy
-                  principal for workload isolation (INIT-SETUP.md §4.1).
+                  principal for workload isolation (ADR 0003).
                 type: string
               degradedSince:
                 description: |-

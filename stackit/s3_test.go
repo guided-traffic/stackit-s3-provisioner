@@ -103,7 +103,7 @@ func TestWorkloadAllowedActions_DeniedByDesign(t *testing.T) {
 
 func TestBuildIsolationPolicy_AdminAlwaysExempt(t *testing.T) {
 	// Guardrail: the admin URN must always remain in NotPrincipal, else the policy
-	// can lock out the account (INIT-SETUP.md §5, guardrail 4).
+	// can lock out the account (ADR 0003 D5).
 	policy := BuildIsolationPolicy("b", "urn:admin", "urn:work", nil)
 	if !strings.Contains(policy, "urn:admin") {
 		t.Fatalf("admin urn absent from policy (lockout risk): %s", policy)

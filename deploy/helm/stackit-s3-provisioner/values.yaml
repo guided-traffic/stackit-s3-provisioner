@@ -1,13 +1,18 @@
 # Default values for stackit-s3-provisioner.
+#
+# Every value, with its default, is listed once in ../../../README.md. The
+# reasoning behind a setting — why it exists, what it costs, how to react when it
+# misbehaves — lives under ../../../docs/operations/ and is linked per block.
 
 # crds controls how the operator's CustomResourceDefinition (Bucket) is shipped.
-# The CRD lives in templates/, so it is applied on every install AND upgrade.
-# It carries helm.sh/resource-policy: keep, so `helm uninstall` leaves the CRD
-# and all existing Bucket resources intact (no finalizer bypass / leaked cloud
-# resources); remove it manually with `kubectl delete crd` if truly desired.
+# It is rendered from templates/, so it is applied on install AND upgrade, and it
+# carries helm.sh/resource-policy: keep so `helm uninstall` cannot remove the type
+# from under existing Bucket resources.
+# Details: ../../../docs/operations/deployment.md
 crds:
-  # install renders the CRD as part of the chart. Set to false when CRDs are
-  # managed out-of-band (e.g. GitOps / a separate cluster-admin pipeline).
+  # install renders the CRD as part of the release. false when CRDs are managed
+  # out-of-band (GitOps, a separate cluster-admin pipeline) — nothing in the
+  # release then creates or updates it.
   install: true
 
 replicaCount: 1
@@ -32,22 +37,17 @@ serviceAccount:
   name: ""
 
 # bucketRoles ships the user-facing ClusterRoles for Bucket CRs. The operator's
-# own ClusterRole (clusterrole.yaml) is unaffected by this block.
+# own ClusterRole is unaffected by this block.
 bucketRoles:
-  # create renders the <release>-view and <release>-edit ClusterRoles. Both are
-  # aggregation fragments: -view is picked up by the built-in view, edit and
-  # admin ClusterRoles, -edit by edit and admin. Read on a Bucket exposes ids,
-  # URLs, sizes and conditions, never credential material. Write on a Bucket is
-  # the same class of power the built-in edit already holds over PVCs and
-  # Secrets in the namespace (ADR 0001, ADR 0002).
+  # create renders the <release>-view and <release>-edit ClusterRoles, both
+  # aggregation fragments for the built-in view/edit/admin roles. Set to false
+  # when user RBAC is managed out-of-band.
   #
-  # There is no switch to render -edit without aggregation, on purpose: a Bucket
-  # uses Secrets of its namespace on behalf of whoever created it
-  # (spec.cloneFrom.secretRef, spec.secretRef adoption), so Bucket write access
-  # must only ever be held together with Secret access — which is exactly what
-  # edit and admin guarantee. Do not bind -edit directly to a subject that lacks
-  # Secret read/write in that namespace. Set create to false when user RBAC is
-  # managed out-of-band.
+  # There is no switch to render -edit unaggregated: write access to a Bucket must
+  # only ever be held together with Secret access in the same namespace, which is
+  # what edit and admin guarantee. Do not bind -edit directly to a subject that
+  # lacks Secret read/write in that namespace.
+  # Reasoning: ../../../docs/security/rbac-and-privilege.md
   create: true
 
 podAnnotations: {}
@@ -65,121 +65,67 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# leaderElection ensures only one operator instance reconciles at a time. Keep it
-# ON: during a rolling update the new pod starts before the old one terminates,
-# and without a single leader BOTH reconcile concurrently — an older version can
-# then re-apply a stale bucket policy after the new one wrote the correct one
-# (observed: multipart policy fix not reaching an existing bucket after upgrade).
-# Once both the outgoing and incoming pods run leader election, the incoming pod
-# waits for the lease before it reconciles, so there is no concurrent write — this
-# protects every future rollout. NOTE: the ONE rollout that first enables this
-# (false->true) still has an outgoing pod that predates leader election and keeps
-# reconciling freely, so that single upgrade can still race once; the periodic
-# driftResyncInterval below is what heals any stale policy left behind. Enabling
-# this also grants the operator the coordination.k8s.io/leases RBAC (clusterrole.yaml).
+# leaderElection guarantees that two operator VERSIONS never reconcile at once
+# during a rolling update; it is not high availability. Keep it on: without a
+# single leader the outgoing pod can re-apply a stale bucket policy over the one
+# the new pod just wrote. Enabling it also renders the coordination.k8s.io/leases
+# rule into the operator's ClusterRole.
+# Details: ../../../docs/operations/configuration.md
 leaderElection:
   enabled: true
 
-# driftResyncInterval makes the operator periodically re-reconcile every
-# provisioned Bucket so configuration drift — most importantly the per-bucket
-# isolation policy — self-heals without an event. This matters on operator
-# upgrades: the Bucket watch only fires on generation/annotation changes, so a
-# policy change shipped in a new version would otherwise not reach
-# already-provisioned buckets until their CR is touched. Must be a Go duration
-# string WITH A UNIT (e.g. "10m", "1h", "30s"); a bare number like 5 is rejected
-# and crash-loops the operator at startup. Set to "0" to disable and rely on
-# events only.
+# driftResyncInterval is how often an already-provisioned Bucket is re-reconciled
+# with no event to prompt it. It is what carries a policy change from a new
+# operator version onto buckets whose CR nobody touched. Must be a Go duration
+# string WITH A UNIT (e.g. "10m", "1h"); a bare number like 5 is rejected and
+# crash-loops the operator at startup. Set to "0" to disable it and leave the
+# operator purely event-driven.
+# Details: ../../../docs/operations/configuration.md
 driftResyncInterval: "10m"
 
-# providerDegradedGrace controls how long an already-provisioned Bucket keeps its
-# Ready state while reconciles keep failing for a reason that says nothing about
-# the bucket itself: the StackIT API unreachable, a gateway or WAF answering with
-# an error page, a Kubernetes API blip. Ready then describes the last VERIFIED
-# state of the bucket rather than the outcome of the last attempt to verify it.
+# providerDegradedGrace is how long an already-provisioned Bucket keeps its Ready
+# state while reconciles keep failing for a reason that says nothing about the
+# bucket itself: the StackIT API unreachable, a gateway or WAF answering with an
+# error page, a Kubernetes API blip. Ready then describes the last VERIFIED state
+# rather than the outcome of the last attempt to verify it.
 #
-# Why this exists: without it, a single failed control-plane call flips a healthy
-# Bucket to Failed on the spot. A two-minute provider blip therefore marked every
-# Bucket on the cluster non-ready at once, which cascaded into every Flux
-# Kustomization health-checking them and produced a cluster-wide alert storm.
-#
-# The hold is bounded, so a real outage still surfaces — only later. Once the
-# grace elapses the Bucket drops to Failed exactly as before. While it is held,
-# status.degradedSince and the ProviderReachable condition carry the degradation
-# and the Warning events are unchanged.
-#
-# Reconcile errors are NOT emitted once per retry any more: providerCircuit below
-# takes over the retry schedule during a fleet-wide outage, so
-# controller_runtime_reconcile_errors_total counts the outage rather than the
-# retries. The signal while a hold is in effect is
-# stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds and the
-# StackitS3BucketProviderDegraded alert, which fires once the hold has lasted
-# long enough that the drop to Failed is close.
-#
-# NOT held (these drop Ready immediately, whatever the grace):
-#   - A structured 400/401/403 from the provider. 401/403 is the Object Storage
-#     API refusing an authenticated request; 400 is how a REVOKED service-account
-#     key surfaces — the key flow never reaches the API at all and the token
-#     endpoint answers 400 invalid_grant (measured live 2026-08-25). A gateway
-#     error page carrying any of those codes is told apart by its body (not valid
-#     JSON) and is still held.
-#   - A workload credential the operator itself destroyed: the old access key was
-#     deleted and the replacement could not be published. That is local certainty
-#     that the Secret is dead, not an unverifiable provider state.
+# While the hold is in effect, status.degradedSince and the ProviderReachable
+# condition carry the degradation and the Warning events are unchanged; once the
+# grace elapses the Bucket drops to Failed. Two cases are never held and fall
+# immediately: a structured 400/401/403 from the provider, and a workload
+# credential the operator itself destroyed.
 #
 # Must be a Go duration string WITH A UNIT (e.g. "30m", "1h"); a bare number is
-# rejected and crash-loops the operator at startup. Set to "0" to disable the
-# hold and restore the previous behavior without deploying a different image.
+# rejected and crash-loops the operator at startup. Set to "0" to disable the hold.
+# What is held, what is not, and how to react: ../../../docs/operations/provider-outages.md
 providerDegradedGrace: "30m"
 
-# providerCircuit is the fleet-wide breaker over Bucket reconciles.
-#
-# Why this exists: a provider outage is a property of the provider, not of any
-# one Bucket. While the StackIT API answers 503, reconciling the seventeenth
-# Bucket cannot succeed, and attempting it costs API calls that make the outage
-# worse. Measured on mgmt-p on 2026-09-02: a provider-side 503 storm at 14:23
-# drove the operator into "rate limit on IP level exceeded" by 14:34 and into 51
-# rate-limited requests per minute by 14:42 — by the end, most of the load on the
-# failing endpoint was the operator's own retries. One outage that resolved on its
-# own produced 242 reconcile errors and paged twice.
-#
-# With the breaker, that outage costs a handful of API calls: after `threshold`
-# reconciles fail back to back the operator stops calling the provider entirely,
-# holds every Bucket, and probes on a doubling cooldown until one succeeds. The
-# failures are still logged, still raise Warning events and still land in
-# status.message — they just stop being counted once per retry.
-#
-# What distinguishes an outage from one broken Bucket is the ABSENCE of any
-# successful reconcile in between, not a classification of the error. A single
-# failing Bucket among healthy ones has its failures interleaved with the
-# successes of the rest of the fleet, which resets the run, so it keeps reporting
-# its own error and never holds anyone else.
-#
-# Observability while open: stackit_s3_provisioner_provider_circuit_open and
-# stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds.
+# providerCircuit is the fleet-wide breaker over Bucket reconciles: a provider
+# outage is a property of the provider, not of any one Bucket. After a run of
+# reconciles that fail with no success in between, the operator stops calling the
+# provider entirely, holds every Bucket and probes on a doubling cooldown until
+# one succeeds. The failures are still logged, still raise Warning events and
+# still land in status.message — they just stop being counted once per retry.
+# Details: ../../../docs/operations/provider-outages.md
 providerCircuit:
   # threshold is how many reconciles must fail back to back before the breaker
-  # opens. Set to 0 to disable the breaker entirely, which restores the previous
-  # behavior without deploying a different image.
+  # opens. Set to 0 to disable the breaker entirely.
   threshold: 3
   # maxCooldown caps the wait between provider probes while the circuit is open,
-  # and therefore how long recovery lags behind the provider coming back. The
-  # wait starts at 60s and doubles per failed probe up to this cap.
-  #
-  # 60s rather than less because the open state has to be OBSERVABLE, not just
-  # effective: monitoring.serviceMonitor.interval is 30s, and the
-  # StackitS3ReconcileErrors alert below suppresses itself for windows in which
-  # the circuit was open, so a trip must outlive a scrape gap to be seen.
-  # Go duration string WITH A UNIT.
+  # and therefore how long recovery lags behind the provider coming back. The wait
+  # starts at 60s and doubles per failed probe up to this cap. Go duration string
+  # WITH A UNIT; a cap below 60s is raised to 60s, a non-positive one falls back
+  # to the default.
   maxCooldown: "5m"
 
 # bucketNaming controls how the operator composes the physical StackIT bucket
 # name from a Bucket CR. The rule is applied when a bucket is first provisioned
-# and then frozen per CR (recorded in status + an annotation): changing prefix or
-# includeNamespace later only affects buckets created afterwards; existing buckets
-# keep their original name.
+# and then frozen per CR: changing prefix or includeNamespace later only affects
+# buckets created afterwards; existing buckets keep their original name.
 #
 # Example: prefix "my-cluster" + includeNamespace true turns a Bucket "my-bucket"
 # in namespace "monitoring" into the physical bucket "my-cluster-monitoring-my-bucket".
+# Details, including the 63-character budget: ../../../docs/operations/bucket-naming.md
 bucketNaming:
   # prefix is prepended to every bucket name (e.g. a cluster identifier). Empty
   # disables the prefix. Must be a lowercase DNS-1123 label (letters, digits, '-';
@@ -197,31 +143,34 @@ ownership:
   # name is the operator/fleet identity written into each bucket's "managed-by"
   # tag. The operator only adopts or deletes a pre-existing bucket whose managed-by
   # matches this value AND whose "owner" tag matches the Bucket CR's namespace/name.
+  # Allowed characters are those of an S3 tag value (letters, digits and
+  # + - = . _ : / @ and spaces); nothing in the operator enforces this.
   #
   # WARNING: this value is part of the bucket ownership key. Changing it after
   # buckets exist makes the operator treat its own buckets as foreign (Ready=Failed
-  # collision) until they are re-tagged. On a disaster-recovery restore into a new
-  # cluster, set the SAME value so the operator re-adopts its buckets.
-  #
-  # Run two operators against the same StackIT project only with DISTINCT values
-  # (otherwise they fight over the same buckets). Allowed characters follow S3 tag
-  # values: letters, digits and + - = . _ : / @ and spaces.
+  # collision) until they are re-tagged, and an empty bucket is then released
+  # without its cloud resources being deleted. On a disaster-recovery restore into
+  # a new cluster, set the SAME value. Run two operators against the same StackIT
+  # project only with DISTINCT values.
+  # Consequences in full: ../../../docs/operations/bucket-naming.md
   name: stackit-s3-provisioner
 
 # wipeOnDelete globally gates the destructive wipe feature (spec.wipeOnDelete on
 # a Bucket CR: delete ALL objects, including versions and delete markers, before
-# removing the bucket on CR deletion). When disabled, a Bucket requesting a wipe
-# is degraded to the safe default (delete only if empty) and a warning event is
-# emitted — the CR field is effectively ignored.
+# removing the bucket on CR deletion).
+# Details: ../../../docs/operations/deletion.md
 wipeOnDelete:
-  # enabled turns the feature gate on. Opt-in, default off.
+  # enabled turns the feature gate on. Opt-in, default off. While it is off, a
+  # Bucket requesting a wipe is degraded to the safe default (delete only if
+  # empty) and a warning event is emitted — the CR field is effectively ignored.
   enabled: false
 
 # clone configures the one-shot bucket-clone feature (spec.cloneFrom on a
 # Bucket CR: copy the contents of an existing S3 bucket into the freshly
-# provisioned one). The copy runs as a Kubernetes Job (rclone) in the
-# operator's namespace; the operator polls rclone's remote-control API for
-# transfer progress and surfaces it in the Bucket's status.
+# provisioned one). The copy runs as a Kubernetes Job (rclone) in the operator's
+# namespace; the operator polls rclone's remote-control API for transfer progress
+# and surfaces it in the Bucket's status.
+# Details: ../../../docs/operations/cloning.md
 clone:
   # image is the rclone image run by clone Jobs. Renovate tracks the tag.
   image:
@@ -249,15 +198,10 @@ clone:
 # they are visible in kubectl and Lens; every value is also exported as a metric
 # for alerting.
 #
-# WHAT IT COSTS. STACKIT bills Object Storage per started gigabyte per started
-# hour and its price list has NO request, operation or traffic component, so
-# measuring costs no money (verified against the STACKIT price list v1.0.43 and
-# the Object Storage Leistungsschein v1.2, see INIT-SETUP.md 8.3). It costs TIME:
-# the control-plane API exposes no usage endpoint, so the only way to obtain a
-# size is to list the bucket — roughly one request per 1000 object keys. A bucket
-# with 2 million objects is about 2000 requests per pass, every pass. That is why
-# minInterval and maxObjects exist; lower the interval only after looking at
-# status.usage.measurementDuration on a real bucket.
+# Measuring costs no money at STACKIT, but it costs TIME: the only way to obtain a
+# size is to list the bucket, roughly one request per 1000 object keys. That is
+# what minInterval and maxObjects below bound.
+# Details: ../../../docs/operations/usage-and-cost.md
 bucketUsage:
   # enabled is the HARD gate. false means the operator measures nothing at all,
   # whatever any Bucket asks for (a Bucket that asked explicitly gets a warning
@@ -275,58 +219,42 @@ bucketUsage:
   interval: "60m"
   # minInterval is the floor for spec.usage.interval: a Bucket asking to be
   # measured more often is clamped up to this and told so in status and via a
-  # warning event. It is the guard against a single CR generating continuous
-  # listing traffic for the whole project.
+  # warning event. Same duration format as above.
   minInterval: "60m"
   # maxObjects caps how many listing entries ONE measurement consumes. Beyond it
   # the pass stops and reports a LOWER BOUND: status.usage.truncated becomes
-  # true, and the size and cost columns are prefixed with ">=". This bounds the
-  # time a single pass can take on a bucket with very many objects.
-  #
-  # WARNING: a bucket that regularly exceeds this cap never reports a true size,
-  # and its cost estimate is therefore too low. Watch the warning event
-  # UsageMeasurementTruncated and raise the cap deliberately — the pass gets
-  # proportionally longer, not more expensive.
-  # Set to 0 to remove the cap entirely (unbounded listing).
+  # true, and the size and cost columns are prefixed with ">=". A bucket that
+  # regularly exceeds the cap never reports a true size and its cost estimate is
+  # too low; raising the cap makes the pass proportionally longer, not more
+  # expensive. Set to 0 to remove the cap entirely (unbounded listing).
   maxObjects: 2000000
-  # includeVersions counts non-current object versions and delete markers by
-  # default. They occupy billed storage but do not appear in a plain object
-  # listing, so on a VERSIONED bucket the default (false) understates both the
-  # size and the cost. Enabling it makes the measurement match the invoice at the
-  # price of listing every version instead of every current object. Individual
-  # Buckets can override this with spec.usage.includeVersions.
+  # includeVersions counts non-current object versions and delete markers. They
+  # occupy billed storage but do not appear in a plain object listing, so on a
+  # VERSIONED bucket the default (false) understates both the size and the cost.
+  # Individual Buckets can override this with spec.usage.includeVersions.
   includeVersions: false
   # concurrency is how many buckets are measured in parallel. Measurement runs in
-  # its own controller with its own work queue, so a slow measurement never
-  # delays provisioning — this value only bounds how much listing traffic the
-  # operator produces at once.
+  # its own controller with its own work queue, so this bounds how much listing
+  # traffic the operator produces at once and never delays provisioning.
   concurrency: 2
   # pricing turns a measured size into the monthly cost estimate shown on the CR
-  # (status.usage.estimatedMonthlyCost, column "Cost/Month") and exported as
-  # stackit_s3_provisioner_bucket_estimated_monthly_cost.
+  # and exported as a metric.
   pricing:
     # perGBHour is the price of ONE GIGABYTE for ONE HOUR in whole currency
     # units, QUOTED AS A STRING so YAML does not turn it into an exponent.
     #
-    # The default is the STACKIT list price for Object Storage Premium-EU01 from
-    # the public price list (version 1.0.43, 08/04/2026), net, excluding taxes.
-    # EU02 (Austria) was 0.00003883000 in the same list. These are LIST prices:
-    # if you have a contract, put YOUR price here — nothing verifies this number.
-    # Set to "" or "0" to switch the estimate off entirely.
+    # The default is the STACKIT list price for Object Storage Premium-EU01, net,
+    # excluding taxes. If you have a contract, put YOUR price here — nothing
+    # verifies this number. Set to "" or "0" to switch the estimate off entirely.
     perGBHour: "0.00003697772"
     # currency labels the estimate on the CR and as a metric label. Display only:
     # no conversion of any kind happens, so changing it does not change a number.
     currency: "EUR"
-    # NOTE on how the estimate is computed, because it is an ESTIMATE and not an
-    # invoice: the measured size is rounded UP to a whole decimal gigabyte (the
-    # billing metric is per STARTED gigabyte), priced for 720 hours (the 30-day
-    # month STACKIT's own price list projects with) and rounded to whole cents.
-    # It prices the size measured at ONE moment as if it were held all month, and
-    # it covers storage only.
 
 # monitoring integrates the operator with a prometheus-operator stack. Both
 # resources below use prometheus-operator CRDs (monitoring.coreos.com/v1) —
 # enable them only on clusters where those CRDs exist, or the install fails.
+# Details: ../../../docs/operations/monitoring.md
 monitoring:
   # serviceMonitor scrapes the operator's metrics endpoint (:8080). Enabling it
   # also renders the metrics Service the ServiceMonitor selects.
@@ -337,15 +265,20 @@ monitoring:
     # scrapeTimeout per scrape; empty uses the Prometheus default.
     scrapeTimeout: ""
     # labels are added to the ServiceMonitor, e.g. the `release: <name>` label
-    # many kube-prometheus-stack installs require for discovery.
+    # many kube-prometheus-stack installs require for discovery. Without the label
+    # the object is created, is valid, and is silently never read.
     labels: {}
   # prometheusRule ships the operator's alerting rules. Every alert can be
   # switched off individually; all alerts default to enabled. The resource is
   # only rendered when enabled is true AND at least one alert is enabled.
   prometheusRule:
     enabled: false
-    # labels are added to the PrometheusRule, e.g. `release: <name>`.
+    # labels are added to the PrometheusRule, e.g. `release: <name>` — the same
+    # discovery selector as above.
     labels: {}
+    # What each alert means, the `for` window it waits out, the rendered
+    # expression behind it and what to do when it fires:
+    # ../../../docs/operations/monitoring.md
     alerts:
       # bucketsWipeOnDelete fires (warning) while at least one Bucket CR
       # carries spec.wipeOnDelete=true — deleting such a CR irreversibly
@@ -379,46 +312,29 @@ monitoring:
       wipeRequestedButGateDisabled:
         enabled: true
       # reconcileErrors fires (warning) on sustained reconcile errors
-      # (controller-runtime's built-in error counter).
-      #
-      # It deliberately no longer fires on a burst. A fleet-wide provider outage
-      # trips providerCircuit after a few failures and then stops producing
-      # errors at all, so what reaches this alert is errors the breaker did not
-      # absorb — a persistent problem rather than a provider blip that resolves
-      # on its own. Before the breaker, one such blip on mgmt-p produced 242
-      # errors and paged twice for something nobody could act on.
+      # (controller-runtime's built-in error counter). A fleet-wide outage trips
+      # providerCircuit and is reported by bucketProviderDegraded instead, so what
+      # reaches this alert is errors the breaker did not absorb.
       reconcileErrors:
         enabled: true
         # threshold is the error count within a 15m window that counts as a
-        # problem. One tripped circuit costs providerCircuit.threshold errors, so
-        # keep this above that or two unrelated outages in one window will page.
+        # problem. Keep it above the cost of a single tripped circuit
+        # (providerCircuit.threshold minus one error), or two unrelated outages in
+        # one window will page.
         threshold: 6
-        # sustainedFor is how long the threshold must be exceeded continuously.
-        # Because the expression is a 15m increase, a burst decays below the
-        # threshold within 15m of stopping and never satisfies this.
+        # sustainedFor is how long the threshold must be exceeded continuously,
+        # on top of the rule's own 15m increase() window.
         sustainedFor: "15m"
         # suppressWhileCircuitOpen drops every 15m window in which the provider
         # circuit breaker was open at any point, so a StackIT outage cannot reach
-        # this alert at all: it is reported by StackitS3BucketProviderDegraded
-        # once the hold has lasted long enough to matter, which is the point at
-        # which there is something to do. What is left here is errors the breaker
-        # never recognised as a provider outage.
-        #
-        # Fail-open by construction: if the circuit metric is missing (an operator
-        # older than this chart, or providerCircuit.threshold=0 on a version that
-        # does not export it), the `unless` clause removes nothing and the alert
-        # behaves as it did before. A scrape interval coarser than 60s can also
-        # miss a single short trip, with the same fail-open result.
+        # this alert at all — it is reported by StackitS3BucketProviderDegraded.
+        # Fail-open by construction: with the circuit metric missing, nothing is
+        # dropped and the alert behaves as it did before.
         suppressWhileCircuitOpen: true
       # bucketProviderDegraded fires (warning) when a Bucket's Ready state has
       # been HELD through non-definitive reconcile failures for longer than
       # holdForSeconds. Ready still reports True, so without this alert the hold
       # is invisible until the grace elapses and the Bucket drops to Failed.
-      #
-      # It alerts on the AGE of the hold, not on its existence: a provider blip
-      # that resolves inside the window is exactly what the hold is for and is
-      # not worth waking anyone. Reaching the window means the drop to Failed is
-      # close and there is still time to act.
       bucketProviderDegraded:
         enabled: true
         # holdForSeconds must sit below providerDegradedGrace, or the alert can

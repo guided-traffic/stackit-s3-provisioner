@@ -4,7 +4,7 @@
 // over local httptest servers. It exists so the stackit client wrapper and the
 // Bucket reconciler can be exercised end-to-end in offline unit tests.
 //
-// Fidelity notes (mirrors verified real-API behavior, see INIT-SETUP.md):
+// Fidelity notes (mirrors verified real-API behavior, see docs/developer/stackit-api.md):
 //   - a foreign projectId yields 403 (Layer-1 isolation),
 //   - creating an existing bucket yields 409,
 //   - deleting a non-empty bucket yields 409,

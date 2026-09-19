@@ -493,7 +493,7 @@ type LocalBucketReference struct {
 //
 // Measuring costs no money at STACKIT — Object Storage is billed per started
 // gigabyte per started hour and the price list carries no request, operation or
-// traffic component (see INIT-SETUP.md 8.3) — but it costs TIME: the size can
+// traffic component (ADR 0014) — but it costs TIME: the size can
 // only be obtained by listing the bucket, which is one request per 1000 object
 // keys. A bucket with millions of objects therefore takes minutes per pass,
 // which is what the operator-wide interval floor and object cap bound.
@@ -565,7 +565,7 @@ func (u *UsageSpec) UsageInterval() (time.Duration, error) {
 
 // BucketSpec defines the desired state of a StackIT Object Storage bucket and its
 // dedicated, isolated workload credentials (one CR = one isolated workload, see
-// INIT-SETUP.md §8).
+// ADR 0003 D1).
 type BucketSpec struct {
 	// BucketName is the DNS-compliant name of the bucket in StackIT Object Storage.
 	// It is immutable: changing it after creation is rejected.
@@ -765,7 +765,7 @@ type BucketStatus struct {
 	CredentialsGroupID string `json:"credentialsGroupID,omitempty"`
 
 	// CredentialsGroupURN is the credentials-group URN used as the bucket-policy
-	// principal for workload isolation (INIT-SETUP.md §4.1).
+	// principal for workload isolation (ADR 0003).
 	// +optional
 	CredentialsGroupURN string `json:"credentialsGroupURN,omitempty"`
 
