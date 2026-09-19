@@ -384,6 +384,11 @@ The window is one reconcile pass wide — `ensureBucket` creates and tags the bu
 because the workload credential that could write to it is only minted afterwards. The exposure is
 therefore write-and-read access to an empty new bucket by an existing project principal, not access
 to anyone's data. A provider error between the two steps widens the window to the retry interval.
+A `Bucket` carrying `spec.allowRecreate` is the one way into this window that nobody opens
+deliberately: the operator rebuilds a vanished bucket by itself, unattended, rather than somebody
+creating a CR ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D9).
+The window has the same width and the rebuilt bucket is just as empty — a completed clone is not
+re-run into it (D11).
 
 **What an operator can do meanwhile:** nothing inside this product. The containment is Layer 1 —
 keeping the number of principals in the project small and every key in it accounted for. A key

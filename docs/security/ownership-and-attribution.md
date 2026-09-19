@@ -77,6 +77,35 @@ The untagged-and-empty case is a deliberate trade: without it, a crash in the on
 between `CreateBucket` and the tag write would leave a bucket the operator could never adopt and
 never delete. Its cost is [H-19](#h-19-an-empty-untagged-bucket-is-adopted-and-the-applier-can-choose-which-one).
 
+The first row carries a precondition the table cannot show: it is the answer for a CR that has not
+completed a provisioning round yet. Once `status.resolvedBucketName` is set — the operator's own
+record that a bucket once existed and a workload once held credentials for it — a bucket the
+provider reports as absent is reported rather than created: phase `Failed`, `Ready=False` with
+reason `BucketMissing`, a parallel `BucketPresent=False` condition and the gauge
+`stackit_s3_provisioner_bucket_provisioned_missing`, and nothing is provisioned — no bucket, no
+credentials group, no key
+([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D1, D2). The
+security property is the report, not the refusal. Re-creating an empty bucket under the frozen name
+made the fleet look healthy again, which is exactly the outcome somebody who deleted a bucket would
+want: the operator destroyed the evidence of the deletion. Deletion of a provisioned bucket
+is now detected, and `spec.allowRecreate` waives the refusal for one `Bucket` without waiving the
+report (D9, and [H-23](#h-23-a-bucket-deleted-out-of-band-orphans-a-keyed-credentials-group) for
+what the rebuild leaves behind).
+
+A guard of that kind must not become a denial of service on the operator itself: a false "absent"
+declares data loss on a working `Bucket` and pages somebody. So the distinction is structural
+rather than a rule a caller has to remember. The question is a per-bucket control-plane read
+(`BucketExists` in [stackit/client.go](../../stackit/client.go)), not a scan of the project-wide
+listing the provisioning step, the read-grant check and the teardown still use, and only the
+provider's own structured JSON 404 is read as absence (`isStructuredNotFound` in
+[stackit/errors.go](../../stackit/errors.go)). A transport error, a 5xx, an empty body and a
+gateway page carrying a 404 are returned as errors and stay a failure to reach the provider, which
+holds `Ready` on an already-provisioned `Bucket` instead of reporting loss
+([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D3, D4,
+[ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D1, D3). What an operator sees and
+does about a vanished bucket is
+[../operations/vanished-buckets.md](../operations/vanished-buckets.md).
+
 ## A credentials group is attributed through its bucket
 
 A credentials group has no owner field and its display name is not unique in a project, so the group
@@ -168,6 +197,18 @@ The same reasoning rules out the CR's annotations, the Secret's contents and `st
 sources. All of them are writable or readable by somebody who is not the operator, and
 `status.accessKeyID` combined with the rotation annotation would have been a takeover rather than a
 nuisance.
+
+The rule is about what may be treated as truth *about a cloud resource*, not about reading the
+status at all. `status.resolvedBucketName` is read for three things: it resolves the physical name
+([H-19](#h-19-an-empty-untagged-bucket-is-adopted-and-the-applier-can-choose-which-one)), it
+addresses the measured bucket
+([H-24](#h-24-size-measurement-addresses-a-bucket-without-re-checking-ownership)), and it is what
+tells the operator that a provisioning round completed, which is why a bucket that vanished is
+reported instead of re-created (see *The ownership tags, and what they prevent* above). None of the
+three deletes or attributes anything on the strength of it, and on the provisioning path every tag
+read and tag write in front of it still checks ownership, so a forged value parks its own `Bucket`
+or squats a name — exactly the reach H-19 and H-24 already describe, and it needs the same
+`buckets/status` write that the shipped ClusterRoles grant to nobody.
 
 ## Destruction is gated twice over
 
@@ -313,24 +354,45 @@ blast radius and rotation are covered in
 
 ### H-23 A bucket deleted out of band orphans a keyed credentials group
 
-**Mechanism.** Attribution hangs on the bucket. Delete the bucket in the STACKIT console and the next
-reconcile finds no bucket, creates a fresh one with no tags and no policy, and therefore creates a
-fresh credentials group. The previous group survives with a live access key, and the Secret in the
-cluster is rewritten to the new one. Before attribution moved to the bucket, the display name would
-have found the old group; now nothing does.
+**Mechanism.** Attribution hangs on the bucket, so a bucket that goes away takes the only proof of
+its group's attribution with it. The group survives with a live access key, and before attribution
+moved to the bucket the display name would have found it; now nothing does.
+
+**Narrowed, and this is where the remaining cases are.** Until
+[ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) the orphan was made
+by the operator's own repair: deleting the bucket in the console made the next reconcile create a
+fresh one with no tags and no policy, therefore a fresh credentials group, and the Secret in the
+cluster was rewritten to the new one — silently, with the CR back in `Ready`. That repair is gone
+(D1): the deletion is reported and nothing is provisioned, so the default path leaves no orphan
+behind. Three paths still produce one, and each of them is a deliberate act rather than a silent
+repair. `spec.allowRecreate` mints a fresh group and key on every unattended rebuild and leaves
+the previous group with its live key, so a `Bucket` that keeps losing its bucket accumulates one
+orphan per rebuild ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)
+D10). Deleting the CR and re-applying it — the supported way to re-create once — does the same,
+once (D8). And deleting a `Bucket` whose bucket is already absent completes rather than hanging,
+releasing nothing, because nothing attributes the group (*Destruction is gated twice over* above).
 
 **Adversary and reach.** Anyone with console or API access to the project, which is above the
-operator's boundary — but also an ordinary operational mistake. The orphaned key is not dangerous on
-operator-managed buckets, because every one of them denies all principals but its own
-([ADR 0003](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md) D3); it is a live
-credential nobody is tracking, and it would have access to any bucket in the project that is *not*
-operator-managed. Live today.
+operator's boundary — but also an ordinary operational mistake. The orphaned key is not dangerous
+on operator-managed buckets, because every one of them denies all principals but its own
+([ADR 0003](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md) D3), and it cannot
+reach the bucket that replaced its own: that is a new bucket with a new policy naming a new group.
+It is a live credential nobody is tracking, and it would have access to any bucket in the project
+that is *not* operator-managed. Live today, and the accumulation under `spec.allowRecreate` is the
+half that grows unattended.
 
-**What an operator can do.** Do not delete operator-managed buckets out of band. When it has
-happened, the orphan is findable by its display name — which is exactly what the display name is kept
-for ([ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D7) — and
+**What an operator can do.** Do not delete operator-managed buckets out of band. Each orphan is now
+announced as it is made — the Warning event `BucketRecreated` names the previous credentials group
+id, and the teardown case reports `CredentialsGroupNotAttributable` with the recorded id — so the
+cleanup is manual but no longer unnoticed; a deployment using `spec.allowRecreate` should sweep on
+that event rather than on a schedule. When it has happened, the orphan is findable by its display
+name — which is exactly what the display name is kept for
+([ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D7) — and
 [hack/e2ecleanup](../../hack/e2ecleanup) sweeps this shape of leftover for end-to-end runs,
-matching workload groups by their `s3op-<prefix>` display name.
+matching workload groups by their `s3op-<prefix>` display name. Verified on 2026-09-19 by reading
+`guardBucketPresent`, `reportAuthorizedRecreate` and `teardown` in
+[internal/controller/bucket_controller.go](../../internal/controller/bucket_controller.go); not
+verified against a live provider, where no bucket has been deleted out of band and watched.
 
 ### H-24 Size measurement addresses a bucket without re-checking ownership
 

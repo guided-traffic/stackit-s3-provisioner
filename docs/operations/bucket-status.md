@@ -138,9 +138,10 @@ that refuses to delete does not flip-flop between the two.
 
 | Type | When present | `status` values | Reasons |
 |---|---|---|---|
-| `Ready` | From the first *terminal* write — the success write, the failure write, or the skeleton-mode write. Absent for the whole first `Provisioning` phase | `True`, `False` | `Provisioned`, `Provisioning`, `Failed`, `NotImplemented` |
+| `Ready` | From the first *terminal* write — the success write, the failure write, or the skeleton-mode write. Absent for the whole first `Provisioning` phase | `True`, `False` | `Provisioned`, `Provisioning`, `Failed`, `NotImplemented`, `BucketMissing` |
 | `CloneCompleted` | Only on a `Bucket` with `spec.cloneFrom`; written as soon as the copy Job reports, so on a first provisioning it can appear before `Ready` does | `True`, `False` | `Cloning`, `Cloned`, `CloneFailed` |
 | `ProviderReachable` | From the first hold until the next successful reconcile — including after the hold has been given up | `False` | `ProviderUnreachable` |
+| `BucketPresent` | From the first report that a provisioned bucket is gone until the next successful reconcile | `False` | `BucketMissing` |
 
 An empty `READY` cell therefore does not mean "the operator has not written
 anything yet". The write that flips the phase to `Provisioning` sets only
@@ -162,6 +163,15 @@ Bucket: a Bucket that never degraded and one that recovered look identical, and
 an operator upgrade writes nothing to Buckets that are simply healthy
 ([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D4).
 
+The same rule holds for `BucketPresent`, for the same reason: it is only ever
+`False`, and a successful reconcile *removes* it instead of setting it to `True`,
+so a Bucket whose bucket came back and one that never lost it are
+indistinguishable
+([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D5).
+Reading the two together is what separates the two failures: `ProviderReachable`
+missing with `BucketPresent=False` means the provider answered, and answered that
+the bucket is gone — see [vanished-buckets.md](vanished-buckets.md).
+
 | Reason | On | Meaning |
 |---|---|---|
 | `Provisioned` | `Ready=True` | Everything verified in the last completed pass |
@@ -172,6 +182,7 @@ an operator upgrade writes nothing to Buckets that are simply healthy
 | `Cloned` | `CloneCompleted=True` | Terminal — the clone never runs again for this Bucket ([ADR 0011](../adr/0011-a-clone-runs-once-as-a-job-in-the-operator-namespace.md) D5) |
 | `CloneFailed` | `CloneCompleted=False` | The Job failed; it is deleted and retried with backoff, and rclone resumes |
 | `ProviderUnreachable` | `ProviderReachable=False` | `Ready` is being held through failures that say nothing about this Bucket |
+| `BucketMissing` | `Ready=False`, `BucketPresent=False` | The bucket this Bucket was provisioned with is gone at the provider, and the operator refuses to re-create it over the workload ([vanished-buckets.md](vanished-buckets.md)) |
 
 ### `Ready=True` does not mean the last attempt succeeded
 
@@ -189,12 +200,15 @@ check — must read `ProviderReachable` or the degraded metrics, never `Ready`.
 The whole mechanism, what to tune and what it looks like during an outage, is in
 [provider-outages.md](provider-outages.md).
 
-Six cases skip the hold and drop `Ready` immediately, whatever the grace says:
+Seven cases skip the hold and drop `Ready` immediately, whatever the grace says:
 the configuration faults below, a structured `400`/`401`/`403` from the
 provider, a workload credential the operator itself destroyed and could not
 replace, a Bucket being deleted, a Bucket whose spec has not been observed yet,
-and a Bucket that has never been `Ready`
-([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D6).
+a Bucket that has never been `Ready`, and a provisioned Bucket whose bucket the
+provider answers for as gone
+([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D6, whose
+seventh case was added by
+[ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)).
 
 ## Configuration faults park the CR
 
@@ -256,7 +270,7 @@ only applies after a successful reconcile
 | `degradedSince` | When the current run of non-definitive failures began | [provider-outages.md](provider-outages.md) |
 | `operatorVersion` | The operator version that last wrote this status | this page |
 | `usage` | Measured size, object counts, cost estimate, and how old the measurement is | [usage-and-cost.md](usage-and-cost.md) |
-| `conditions` | `Ready`, `CloneCompleted`, `ProviderReachable` | [Conditions](#conditions) |
+| `conditions` | `Ready`, `CloneCompleted`, `ProviderReachable`, `BucketPresent` | [Conditions](#conditions) |
 
 Three of these need a warning about what they are *not*:
 
@@ -304,7 +318,9 @@ shows up — a skipped read grant, a refused wipe, a clamped measurement interva
 | Reason | Type | Emitted when |
 |---|---|---|
 | `Provisioned` | Normal | A pass completed: bucket, credentials and policy are in place |
-| `Failed` | Warning | Any failed pass — including one whose `Ready` is being held, so a hold is as visible in the event stream as a hard failure |
+| `Failed` | Warning | Any failed pass — including one whose `Ready` is being held, so a hold is as visible in the event stream as a hard failure. The one failure that carries a different reason is the vanished bucket below |
+| `BucketMissing` | Warning | A bucket that was provisioned is gone at the provider and the operator refuses to re-create it. The event carries the same text as `status.message`, and the same reason as the `Ready` and `BucketPresent` conditions ([vanished-buckets.md](vanished-buckets.md)) |
+| `BucketRecreated` | Warning | A vanished bucket was rebuilt automatically because `spec.allowRecreate` is set: the contents are still lost, and the workload Secret is replaced later in the same pass. This reason exists **only** in the event stream — no condition ever carries it, and the CR is simply `Ready` again ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D9, D13) |
 | `CredentialsRotated` | Normal | An annotation-triggered rotation completed |
 | `CredentialsGroupAttributed` | Normal | A pre-tag bucket's group was recovered from its own isolation policy and written into the bucket tags |
 | `CredentialsGroupNotAttributable` | Warning | Teardown left a credentials group standing because the bucket does not attribute it |
@@ -353,21 +369,18 @@ which the drift-resync timer makes happen without an event
 correction is silent — expect the change to disappear, not a status field to
 report it.
 
-**The bucket was deleted behind the operator's back.** This one is a real gap
-and the status will not tell you. Existence is decided from the provider's own
-answer about the project's buckets, and a successful answer that the name is
-absent is indistinguishable from a bucket that was never created: the operator
-creates it again — empty — stamps ownership tags, attributes a new credentials
-group and publishes a fresh access key into the workload Secret. The reconcile
-*succeeds*, so `degradedSince` is never written, `ProviderReachable` is never
-set and `Ready` never moves. The data is gone and nothing on the object says so.
-This is recorded as an accepted residual risk of
-[ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md); reporting the
-absence instead of re-provisioning over it would have to be built into the
-provisioning step, and no rule about readiness catches it. Until then, a
-credentials rotation nobody asked for — `status.lastRotationTime` unchanged but
-a new `status.accessKeyID` — is the closest thing to a signal, and it is not a
-reliable one.
+**The bucket was deleted behind the operator's back.** The status says so, and
+nothing is repaired over it. A `Bucket` that completed a provisioning round and
+whose bucket the provider answers for as absent goes to phase `Failed` with
+`Ready=False` reason `BucketMissing` and a `BucketPresent=False` condition beside
+it; the operator refuses to re-create the bucket, so the credentials group and
+the workload Secret stay exactly as they were
+([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)
+D1). Only the provider's own structured answer about that one bucket counts — a
+gateway page, a `5xx` or a dropped connection takes the degraded path above
+instead. What to check, how to get a working `Bucket` back, and the standing
+`spec.allowRecreate` opt-in that waives the refusal are in
+[vanished-buckets.md](vanished-buckets.md).
 
 ## Where to go next
 
@@ -378,6 +391,7 @@ reliable one.
 | A delete that will not finish | [deletion.md](deletion.md) |
 | Rotating a workload key, or the admin Secret | [credentials.md](credentials.md) |
 | What a held `Ready` means on call | [provider-outages.md](provider-outages.md) |
+| A bucket that is gone at the provider | [vanished-buckets.md](vanished-buckets.md) |
 | Metrics and alerts behind these fields | [monitoring.md](monitoring.md) |
 | The clone status block in full | [cloning.md](cloning.md) |
 | The measurement behind `status.usage` | [usage-and-cost.md](usage-and-cost.md) |

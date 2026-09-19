@@ -190,7 +190,7 @@ D12). Reading the Secret needs Secret read, which `view` does not carry.
 | `grantedReadTo` | Which sibling Buckets currently hold a read grant, without reading the policy from S3 |
 | `usage` | Size, object count and the derived monthly cost estimate, when measurement is on |
 | `clone` | Clone phase, total bytes and a human progress string, including the source that was named |
-| `phase`, `message`, `conditions`, `degradedSince` | Health, and whether the provider was reachable at the last verified state ([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md)) |
+| `phase`, `message`, `conditions`, `degradedSince` | Health: whether the provider was reachable at the last verified state ([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md)), and whether the bucket itself is still there — `BucketPresent=False` says this `Bucket`'s data is gone ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D5) |
 | `lastRotationTrigger`, `lastRotationTime`, `observedGeneration`, `operatorVersion` | Reconcile bookkeeping |
 
 Two spec fields disclose something beyond the bucket's own shape, and both disclose the
@@ -221,6 +221,7 @@ PVC.
 | `spec.cloneFrom.secretRef` | The operator reads that Secret and uses it as S3 credentials against an endpoint the CR chooses |
 | `patch` the rotation annotation | `stackit-bucket.gtrfc.com/rotate-credentials-at` with a new value kills the live access key immediately; the workload must re-read the Secret ([ADR 0007](../adr/0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md) D8, D9) |
 | `spec.grantReadAccess` | Sibling Buckets of the same namespace get read-only access to this bucket's objects ([ADR 0008](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) D2) |
+| `spec.allowRecreate` | A bucket that vanished is rebuilt unattended under the same frozen name, with a fresh credentials group and access key, and the workload Secret is overwritten — a standing waiver of the refusal to rebuild, not of the report and not a wider reach: it is a spec write on a `Bucket` in its own namespace, the same access that can already delete the CR outright, and every rebuild is still reported ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D9, D10) |
 | `spec.wipeOnDelete` plus a delete | All objects, including versions and delete markers, are destroyed before the bucket is removed — **only** while the operator runs with `wipeOnDelete.enabled` (# default `false`) and the ownership tags prove the bucket is this operator's ([ADR 0006](../adr/0006-a-bucket-is-deleted-only-when-it-is-empty.md) D4–D6) |
 | `delete` a `Bucket` | Teardown; a non-empty bucket blocks it rather than losing data ([ADR 0006](../adr/0006-a-bucket-is-deleted-only-when-it-is-empty.md) D2) |
 

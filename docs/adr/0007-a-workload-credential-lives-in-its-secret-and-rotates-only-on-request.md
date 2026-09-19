@@ -109,7 +109,7 @@ left in the project.
 **D7 — A failure after the clear is treated as local certainty that the published
 credential is dead.** It is not a provider state the operator merely failed to verify, so
 the `Bucket` drops `Ready` at once instead of holding it through the degraded grace window
-— one of the closed exceptions in [ADR 0012](0012-ready-describes-the-last-verified-state.md).
+— one of the enumerated exceptions in [ADR 0012](0012-ready-describes-the-last-verified-state.md) D6.
 
 **D8 — A rotation is requested by the annotation `stackit-bucket.gtrfc.com/rotate-credentials-at`,
 and the trigger is level-based.** Its value is opaque (an RFC3339 timestamp by convention);

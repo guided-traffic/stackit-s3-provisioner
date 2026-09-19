@@ -217,6 +217,33 @@ func (c *Client) HasBucket(ctx context.Context, projectID, name string) (bool, e
 	return false, nil
 }
 
+// BucketExists reports whether the bucket exists in this client's own project,
+// asking the per-bucket control-plane read rather than scanning a project-wide
+// listing.
+//
+// Only the API's own structured JSON 404 counts as "no". Every other failure —
+// a transport error, a 5xx, a gateway or WAF page, a 404 with an empty body — is
+// returned as an error and therefore stays a failure to reach the provider,
+// never a statement about the bucket. The classification lives here rather than
+// at the call site so that conflating the two is structurally impossible: a
+// caller that acts on absence can only ever have been handed the provider's own
+// answer.
+//
+// This is deliberately not HasBucket. A listing scan answers "not in the list I
+// got", which is a weaker statement: ListBuckets takes no pagination parameters
+// in the SDK, and the listing is known to lag a create (see WaitBucketVisible).
+// That is good enough to decide whether to create a bucket; it is not good
+// enough to declare a bucket the operator provisioned to be gone.
+func (c *Client) BucketExists(ctx context.Context, name string) (bool, error) {
+	if _, err := c.api.GetBucket(ctx, c.account.ProjectID, c.region, name).Execute(); err != nil {
+		if isStructuredNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get bucket %q in project %s: %w", name, c.account.ProjectID, err)
+	}
+	return true, nil
+}
+
 // WaitBucketVisible polls until name appears in the client's own project listing
 // or the timeout elapses (bucket creation may be eventually consistent).
 func (c *Client) WaitBucketVisible(ctx context.Context, name string, timeout time.Duration) error {

@@ -1,6 +1,6 @@
 # Operations
 
-Thirteen pages for whoever runs this operator or integrates with it: what has to exist in the
+Fourteen pages for whoever runs this operator or integrates with it: what has to exist in the
 STACKIT account before the first install, how to install and upgrade it, how to read a `Bucket`,
 and what to do when the provider is unreachable at three in the morning.
 
@@ -29,7 +29,8 @@ is deliberate.
 | [read-grants.md](read-grants.md) | A second workload in the same namespace needs read access to a bucket it does not own, or you are revoking such access. |
 | [usage-and-cost.md](usage-and-cost.md) | You want size and a monthly cost estimate on the `Bucket`, or you have those numbers and need to know what they are not. |
 | [provider-outages.md](provider-outages.md) | You are on call and the STACKIT API is unreachable: readiness held past the point you expected, deletions that appear stuck, an error counter that moved once and then stopped. |
-| [monitoring.md](monitoring.md) | You are wiring up scraping, reading one of the exported series, or tuning, suppressing or silencing one of the eleven shipped alerts. |
+| [vanished-buckets.md](vanished-buckets.md) | A bucket the operator provisioned is gone from the provider: why the `Bucket` reports that instead of re-creating it, how to tell it apart from an outage, and the two ways back to a working bucket. |
+| [monitoring.md](monitoring.md) | You are wiring up scraping, reading one of the exported series, or tuning, suppressing or silencing one of the thirteen shipped alerts. |
 
 ---
 
@@ -81,10 +82,10 @@ way to tell which one is lying. Which values block is explained on which page is
 ### The seam this makes visible: monitoring
 
 Monitoring is where the split looks like a bug and is not. The README carries the value block —
-`monitoring.serviceMonitor.*`, `monitoring.prometheusRule.enabled`, and the eleven
+`monitoring.serviceMonitor.*`, `monitoring.prometheusRule.enabled`, and the thirteen
 `monitoring.prometheusRule.alerts.<name>.enabled` toggles with a one-line trigger per alert.
 [monitoring.md](monitoring.md) carries everything you need to decide what to do about an alert that
-fires: what each of the 22 exported series actually counts, that an absent series is not a zero one
+fires: what each of the 24 exported series actually counts, that an absent series is not a zero one
 and which alert expressions depend on that, why the reconcile-error alert excludes windows in which
 the circuit breaker was open, and why the degraded alert fires on the *age* of a hold rather than
 its existence.
@@ -93,10 +94,13 @@ The boundary is: **the README answers "what is the key and what is its default",
 answers "what happens if I change it".** A trigger line in the README tells you which alert you are
 looking at; it is not the explanation.
 
-One value is deliberately stated in both places:
+Three values are deliberately stated in both places, and the clearest is
 `monitoring.prometheusRule.alerts.bucketProviderDegraded.holdForSeconds`. The README lists it with
 its default, because it is part of the surface. [monitoring.md](monitoring.md) states the constraint
 that it must stay below `providerDegradedGrace` — otherwise the `Bucket` falls to `Failed` and the
 series the alert watches disappears before the alert can fire. That is a relation between two keys,
 not a second copy of a key: it is the kind of statement a reference table cannot hold, and the kind
-this directory exists for.
+this directory exists for. The other two are the `bucketRecreated` keys, repeated for the same
+reason: `window` is the whole visibility of an incident that is already over by the time the alert
+fires, and `enabled` is the one alert that ships off, switched on with the first `Bucket` that sets
+`spec.allowRecreate`.

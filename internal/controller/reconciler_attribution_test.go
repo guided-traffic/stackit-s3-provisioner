@@ -594,15 +594,20 @@ func TestGroupAttributionRecreatesWhenRecordedGroupGone(t *testing.T) {
 	}
 }
 
-// TestGroupAttributionFreshBucketSkipsGuard: a bucket deleted out of band is
-// re-created by the operator; the recorded group still exists but belongs to
-// the previous incarnation, so a fresh group is created and the old one is
-// left behind (documented in ADR 0002).
+// TestGroupAttributionFreshBucketSkipsGuard: a bucket deleted out of band and
+// re-created by the operator gets a fresh group, because the recorded one still
+// exists but belongs to the previous incarnation; the old group is left behind
+// (documented in ADR 0002).
+//
+// Re-creating a vanished bucket at all takes spec.allowRecreate — without it the
+// Bucket is parked in BucketMissing and never reaches this code path.
 func TestGroupAttributionFreshBucketSkipsGuard(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()
 
-	b := e.provision(t, newBucketCR("team-a", "app-data"))
+	cr := newBucketCR("team-a", "app-data")
+	cr.Spec.AllowRecreate = true
+	b := e.provision(t, cr)
 	old := b.Status.CredentialsGroupID
 	if err := e.r.Stackit.DeleteBucket(ctx, "app-data"); err != nil {
 		t.Fatal(err)

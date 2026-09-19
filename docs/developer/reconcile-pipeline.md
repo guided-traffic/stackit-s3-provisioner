@@ -38,7 +38,8 @@ states the rule, this is the mechanical consequence.
 
 `reconcileNormal` and its helper `provisionCredentialsAndClone` are one sequence; the split exists
 only to keep each function readable. Every step is idempotent, and every step that can fail is
-routed through `fail` or `failNoRequeue` (see [Guards](#guards-and-their-outcome-class)).
+routed through `fail`, through `failNoRequeue`, or — for the vanished-bucket guard alone — through a
+third path that marks the failure itself (see [Guards](#guards-and-their-outcome-class)).
 
 | # | Step | Function | What it enforces |
 |---|---|---|---|
@@ -49,24 +50,25 @@ routed through `fail` or `failNoRequeue` (see [Guards](#guards-and-their-outcome
 | 5 | Mark the coarse phase | `markProvisioning` | Best-effort progress hint, skipped once the generation has settled on `Ready`/`Failed` |
 | 6 | Ensure the admin credential | `ensureAdmin` | One S3 admin credential per project, cached in-process, bootstrapped only when the Secret is absent or incomplete ([ADR 0004](../adr/0004-the-operator-bootstraps-its-own-s3-admin-credential.md) D5/D9) |
 | 7 | Ensure the Object Storage service | `stackit.Client.EnsureService` | A structured 404 is the only answer that leads to `EnableService`; the result is cached per process |
-| 8 | Ensure the bucket, stamp ownership tags | `ensureBucket` → `adoptOrCollide` | Adopt only on matching tags; an untagged bucket is claimed only when empty ([ADR 0001](../adr/0001-a-bucket-only-affects-its-own-namespace.md) D2) |
-| 9 | Derive connection info | `stackit.Client.BucketConnInfo` | Endpoint host and path-style bucket URL, both published in the Secret |
-| 10 | Resolve the workload credentials group | `resolveWorkloadGroup` | Bucket tag → own policy (migration) → create; never by display name ([ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D1–D3, D8) |
-| 11 | Publish the group identity in status | inline in `provisionCredentialsAndClone` | Written immediately after resolution, not on the terminal write — see [the grantee watch](#the-grantee-watch) |
-| 12 | Resolve read grants | `resolveReadGrants` | Reader principals come from the grantee's bucket, never from anything a namespace user writes ([ADR 0008](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) D3) |
-| 13 | Write the isolation policy | `ensureBucketPolicy` → `stackit.BuildIsolationPolicy` | Rewritten only on drift (`PoliciesEquivalent`); readers are held out while a clone runs ([ADR 0003](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md) D8, [ADR 0008](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) D10) |
-| 14 | Refuse a self-clone | `validateCloneSource` | Same endpoint host and same bucket name ([ADR 0011](../adr/0011-a-clone-runs-once-as-a-job-in-the-operator-namespace.md) D6) |
-| 15 | Run the clone, if requested | `ensureClone` | Returns `done=false` while the copy runs; the pass ends there and polls ([ADR 0011](../adr/0011-a-clone-runs-once-as-a-job-in-the-operator-namespace.md)) |
-| 16 | Re-write the policy with readers | `applyPolicy` closure | Only reached in the pass in which the copy finishes, so grants land without waiting a cycle |
-| 17 | Publish the access key and the Secret | `ensureAccessKeyAndSecret` | Secret is the source of truth; clear-before-create ([ADR 0007](../adr/0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md) D1/D5) |
-| 18 | Record a handled rotation trigger | `recordPendingRotation` | Turns the annotation back into a level-triggered no-op ([ADR 0010](../adr/0010-the-operator-never-writes-to-a-bucket-spec.md) D6) |
-| 19 | Terminal status write, `Ready=True`, `clearDegraded`, `Breaker.Success()` | inline in `reconcileNormal` | The provider answered for every step of this pass |
-| 20 | `RequeueAfter: DriftResyncInterval` | inline | See [Drift resync](#drift-resync) |
+| 8 | Refuse to re-create a vanished bucket | `guardBucketPresent` → `stackit.Client.BucketExists` | A `Bucket` that already carries `status.resolvedBucketName` and whose bucket the provider answers for as absent is reported, never re-created. With `spec.allowRecreate` set the pass continues to step 9 instead, and `reportAuthorizedRecreate` reports the rebuild ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D1/D3/D9) |
+| 9 | Ensure the bucket, stamp ownership tags | `ensureBucket` → `adoptOrCollide` | Adopt only on matching tags; an untagged bucket is claimed only when empty ([ADR 0001](../adr/0001-a-bucket-only-affects-its-own-namespace.md) D2) |
+| 10 | Derive connection info | `stackit.Client.BucketConnInfo` | Endpoint host and path-style bucket URL, both published in the Secret |
+| 11 | Resolve the workload credentials group | `resolveWorkloadGroup` | Bucket tag → own policy (migration) → create; never by display name ([ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D1–D3, D8) |
+| 12 | Publish the group identity in status | inline in `provisionCredentialsAndClone` | Written immediately after resolution, not on the terminal write — see [the grantee watch](#the-grantee-watch) |
+| 13 | Resolve read grants | `resolveReadGrants` | Reader principals come from the grantee's bucket, never from anything a namespace user writes ([ADR 0008](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) D3) |
+| 14 | Write the isolation policy | `ensureBucketPolicy` → `stackit.BuildIsolationPolicy` | Rewritten only on drift (`PoliciesEquivalent`); readers are held out while a clone runs ([ADR 0003](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md) D8, [ADR 0008](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) D10) |
+| 15 | Refuse a self-clone | `validateCloneSource` | Same endpoint host and same bucket name ([ADR 0011](../adr/0011-a-clone-runs-once-as-a-job-in-the-operator-namespace.md) D6) |
+| 16 | Run the clone, if requested | `ensureClone` | Returns `done=false` while the copy runs; the pass ends there and polls ([ADR 0011](../adr/0011-a-clone-runs-once-as-a-job-in-the-operator-namespace.md)) |
+| 17 | Re-write the policy with readers | `applyPolicy` closure | Only reached in the pass in which the copy finishes, so grants land without waiting a cycle |
+| 18 | Publish the access key and the Secret | `ensureAccessKeyAndSecret` | Secret is the source of truth; clear-before-create ([ADR 0007](../adr/0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md) D1/D5) |
+| 19 | Record a handled rotation trigger | `recordPendingRotation` | Turns the annotation back into a level-triggered no-op ([ADR 0010](../adr/0010-the-operator-never-writes-to-a-bucket-spec.md) D6) |
+| 20 | Terminal status write, `Ready=True`, `clearDegraded`, `BucketPresent` removed, `Breaker.Success()` | inline in `reconcileNormal` | The provider answered for every step of this pass, and the bucket was verified present (or re-created) in it |
+| 21 | `RequeueAfter: DriftResyncInterval` | inline | See [Drift resync](#drift-resync) |
 
-Two orderings in that list are load-bearing and easy to break by accident.
+Three orderings in that list are load-bearing and easy to break by accident.
 
-**The policy is written before any workload credential exists** (step 13 before step 17), and
-before a clone starts (step 13 before step 15). A bucket is therefore never open to the rest of the
+**The policy is written before any workload credential exists** (step 14 before step 18), and
+before a clone starts (step 14 before step 16). A bucket is therefore never open to the rest of the
 project while it is being filled. The admin group stays exempt, which is exactly what the clone
 Job's destination side authenticates with
 ([ADR 0011](../adr/0011-a-clone-runs-once-as-a-job-in-the-operator-namespace.md) D3).
@@ -76,21 +78,49 @@ held out of its Secret by `holdSecretUntilCloned` (`true` # default). The two me
 interchangeable: `holdSecretUntilCloned` protects only the bucket's own workload, because a granted
 reader already holds working credentials of its own and only the policy can hold it back
 ([ADR 0008](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) D10). With
-`holdSecretUntilCloned: false` the key and Secret are published at step 15 instead, and
+`holdSecretUntilCloned: false` the key and Secret are published at step 16 instead, and
 `recordPendingRotation` runs there too — otherwise a pending rotation trigger would re-rotate on
-every 15-second clone poll, since the terminal status write of step 19 is never reached while the
+every 15-second clone poll, since the terminal status write of step 20 is never reached while the
 copy runs.
 
-### Bucket existence is a listing, not a read
+**The vanished-bucket guard sits between the service check and `ensureBucket`** (step 8, after step
+7 and before step 9). After, because it is a provider call like any other and belongs behind the
+same preconditions as the rest: the breaker gate of the entry router, and Object Storage ensured for
+the project. Before, because `ensureBucket` is the step that *would* create it — one statement later
+the bucket exists again, empty, under the frozen name, and the evidence that anything was lost is
+gone. Between the two there is nothing to reorder it past. **Not verified, and this is the gap:**
+what a per-bucket read answers for a project whose Object Storage is *not* enabled. If that is the
+same structured `404` the service check reads as "not enabled", moving the guard in front of step 7
+would report every provisioned `Bucket` as missing.
 
-Step 8 decides existence with `stackit.Client.HasBucket`, which calls `ListBucketNames` and looks
+### Two existence questions, and only one of them is a listing
+
+Step 9 decides existence with `stackit.Client.HasBucket`, which calls `ListBucketNames` and looks
 for the name ([`stackit/client.go`](../../stackit/client.go)). A listing that succeeds and does not
 contain the name returns "absent" with no error, and the next statement creates the bucket, waits
 for it to become visible (`WaitBucketVisible`, bounded by `bucketVisibleTimeout`, 60s) and stamps
-the ownership tags. There is no per-bucket existence read, so **"deleted behind our back" and
-"never created" are the same input** to the pass. The degradation path of
+the ownership tags. To that step **"deleted behind our back" and "never created" are still the same
+input**, and the degradation path of
 [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) is reached only when the listing
 call itself fails.
+
+Step 8 is what stops the first of those from being served as the second. `guardBucketPresent` asks
+`stackit.Client.BucketExists` — a per-bucket control-plane read (`GetBucket`), not a scan — and it
+asks only for a `Bucket` that already carries `status.resolvedBucketName`, which is written on the
+success path alone and is therefore the operator's own record that a pass once completed and a
+workload once received credentials. The resolved-name annotation deliberately does not count: it is
+stamped before any cloud resource exists, so keying the guard on it would block first provisioning
+outright ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D2).
+`BucketExists` returns `false` only for the API's own structured JSON 404 and hands everything else
+back as an error
+([provider-errors.md](provider-errors.md#absence-is-the-second-question-a-structured-404-answers)),
+so a gateway page, a `5xx` or a dropped connection takes the ordinary degraded path instead of
+declaring data loss.
+
+Both questions are therefore asked about the same bucket in the same pass, which costs one extra
+control-plane read per reconcile of an already-provisioned `Bucket`. The duplication is deliberate
+for now ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md), residual
+risks).
 
 ### Read-grant resolution: three sentinels, and what each does
 
@@ -173,20 +203,22 @@ what keeps a second teardown pass after a finalizer-removal conflict from re-rai
 
 ## Guards and their outcome class
 
-Every failure in the pass goes through exactly one of two functions, and the choice is made by
+Almost every failure in the pass goes through one of two functions, and the choice is made by
 **origin**, not by parsing the error
-([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D2).
+([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D2). A vanished bucket is the one
+fault that fits neither and takes a third path of its own.
 
-| | `failNoRequeue` | `fail` |
-|---|---|---|
-| Meaning | Definitive: a statement the operator established locally about *this* Bucket | Non-definitive: something went wrong while talking to another system |
-| `Ready` | Drops to `False` immediately | Held while `degrade` applies, then dropped |
-| Returns | `ctrl.Result{}, nil` — no requeue | The error — retried on `bucketRateLimiter`'s backoff |
-| Breaker | Untouched | `Breaker.Failure()`; while the breaker is open the error is logged and swallowed, and the result carries the breaker's cooldown instead |
+| | `failNoRequeue` | `fail` | `guardBucketPresent` on a missing bucket |
+|---|---|---|---|
+| Meaning | Definitive: a statement the operator established locally about *this* Bucket | Non-definitive: something went wrong while talking to another system | Definitive, and established by the provider about *this* bucket |
+| `Ready` | Drops to `False` immediately | Held while `degrade` applies, then dropped | Drops to `False` immediately, with reason `BucketMissing` |
+| Returns | `ctrl.Result{}, nil` — no requeue | The error — retried on `bucketRateLimiter`'s backoff | The error — retried on `bucketRateLimiter`'s backoff |
+| Breaker | Untouched | `Breaker.Failure()`; while the breaker is open the error is logged and swallowed, and the result carries the breaker's cooldown instead | Untouched, in either direction |
 
 There are exactly four `failNoRequeue` call sites in
 [`internal/controller/bucket_controller.go`](../../internal/controller/bucket_controller.go), and
-they are the closed definitive list:
+they are the faults the operator establishes locally about *this* Bucket, rather than by
+classifying an error the provider returned:
 
 | Call site | Faults it covers |
 |---|---|
@@ -201,14 +233,37 @@ write, a timed-out `WaitBucketVisible` — is returned as a retryable failure an
 hold. That is the intended default, because an unrecognised error is non-definitive by construction
 ([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D3).
 
-Two failures are definitive but established mid-pass rather than up front, and `holdsReadyThrough`
-excludes them explicitly:
+Three failures are definitive but established mid-pass rather than up front. Two of them reach
+`degrade`, and `holdsReadyThrough` excludes them explicitly:
 
 - `stackit.ProviderRefused(err)` — a **structured** 400/401/403. The discriminator is the shape of
   the response body, never the status code alone; see [stackit-api.md](stackit-api.md) and
   [provider-errors.md](provider-errors.md).
 - `errCredentialDestroyed` — the workload's live key was deleted in this pass and the replacement
   could not be published. Local certainty that the Secret's credential is dead.
+
+The third never reaches `degrade` at all, because `guardBucketPresent` marks the failure itself:
+
+- **A bucket this `Bucket` was provisioned with, which the provider reports as gone** —
+  `Client.BucketExists` answering `false`, which it does only for the API's own structured JSON 404.
+  The guard calls `clearDegraded` first, so the object never claims an outage for an answer the
+  provider gave; sets `BucketPresent=False` with reason `BucketMissing`; and routes `Ready=False`
+  through `markFailedReason`, which is `markFailed` with the reason spelled out instead of the
+  blanket `Failed`, so the incident is greppable in the conditions and in the event stream without
+  parsing `status.message`.
+
+It then returns the bare error, and both halves of that are load-bearing
+([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D7). `fail` would
+call `Breaker.Failure()`, and after a restart against the wrong project *every* provisioned `Bucket`
+reads as absent — three consecutive ones (`--provider-circuit-threshold`, `3` `# default`) would open
+the circuit fleet-wide and stop every provider call, teardowns included, over an answer the provider
+gave definitively
+([ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) D3 exempts every definitive fault
+for exactly that reason). `failNoRequeue` would never retry, and a restored bucket — or the operator
+being pointed back at the right project — has to recover with no human action. Returning the error
+delivers both: no breaker movement in either direction, and a requeue on `bucketRateLimiter` (1s →
+15m cap). The recovery pass removes `BucketPresent` rather than setting it to `True`, like
+`clearDegraded` does for `ProviderReachable`.
 
 `holdForProvider` writes status only when the record would actually change: the first visit under
 an open breaker, and the moment the degradation grace elapses (`providerHoldNeedsWrite`). A Bucket
@@ -270,6 +325,10 @@ argued away by changing the object. Independently of all of this, a managed Secr
 event or a grantee event can enqueue a parked Bucket at any time — those watches carry no generation
 filter.
 
+A `Bucket` reporting `BucketMissing` belongs in none of those rows: the guard returns its error
+instead of parking, so the Bucket keeps a timer of its own and recovers on the rate limiter without
+any event at all.
+
 `bucketsForSecret` and `bucketsGrantingTo` both list only the event object's **own namespace**, so a
 Secret event never reaches a Bucket elsewhere and a same-named Bucket in another namespace is never
 woken ([ADR 0001](../adr/0001-a-bucket-only-affects-its-own-namespace.md) D1/D3). Both filter in Go
@@ -306,7 +365,7 @@ Buckets granting to each other would wake one another on every status write, for
 | Update where `status.credentialsGroupURN` changed | yes | The reader principal's identity changed |
 | Generic, and every other update | no | Ordinary status churn |
 
-The counterpart in the provisioning pass is step 11: the grantee publishes
+The counterpart in the provisioning pass is step 12: the grantee publishes
 `status.credentialsGroupURN` as soon as its group exists, not on the terminal `Ready` write. A
 grantee that is itself still cloning never reaches that terminal write, so publishing late would
 mean its grantors are never woken and wait for the drift resync instead
@@ -411,10 +470,17 @@ behind. Every rollout after that is fully serialised.
 
 ## What is wrong today
 
-- **Bucket existence is a project listing, not a per-bucket read.** A bucket deleted out of band is
-  indistinguishable from one that was never created, so the pass re-creates it and stamps fresh
-  ownership tags rather than reporting that a provisioned bucket vanished. The consequences and the
-  alternative belong to [bucket-identity.md](bucket-identity.md).
+- **Only the guard asks per bucket; every other existence question is still a project listing.**
+  `ensureBucket` (step 9), the grantee lookup in `resolveReadGrants` and the teardown all decide
+  existence with `HasBucket` over `ListBucketNames`, whose completeness for a large project is
+  **not verified** — the call takes no pagination parameters. The teardown is the sharp case: a
+  listing that answered incompletely makes it skip both the emptiness check and the bucket delete
+  and then drop the finalizer, orphaning a live bucket. Converting the remaining callers is its own
+  decision, because one of them — `WaitBucketVisible`, the wait for a freshly created bucket to
+  become visible — has timing nobody has measured against a per-bucket read
+  ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md), residual risks).
+  Name composition and the ownership tags themselves stay
+  [bucket-identity.md](bucket-identity.md).
 - **The admin credential is cached for the life of the process and never probed** (`r.admin`,
   guarded by `adminMu`). An admin S3 key deleted out of band is not noticed until the operator
   restarts; `ensureAdmin` re-bootstraps only when the Secret is absent or incomplete, never when the

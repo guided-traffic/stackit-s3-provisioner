@@ -80,11 +80,12 @@ beyond localhost.
 | [reconciler_errors_test.go](../../internal/controller/reconciler_errors_test.go) | One injected failure per cloud call on both the provisioning and the teardown path, plus the two rollbacks that delete a key whose Secret write failed |
 | [reconciler_attribution_test.go](../../internal/controller/reconciler_attribution_test.go) | Group attribution: name collision, migration from the bucket's own policy, restore without status, a deleted group, listing lag, and the teardown cases that must leave a group standing |
 | [reconciler_grants_test.go](../../internal/controller/reconciler_grants_test.go) | Read grants: applied, revoked, namespace-scoped, self-reference ignored, admin never granted, stable document, the grantee watch predicate, the clone hold |
-| [reconciler_degraded_test.go](../../internal/controller/reconciler_degraded_test.go) | Sticky readiness: held through transient failures, recovery, grace expiry, and every case in the closed exception list |
+| [reconciler_degraded_test.go](../../internal/controller/reconciler_degraded_test.go) | Sticky readiness: held through transient failures, recovery, grace expiry, and every case in the exception list except the vanished bucket, which is the row below |
+| [reconciler_missing_bucket_test.go](../../internal/controller/reconciler_missing_bucket_test.go) | The vanished-bucket guard: reported rather than re-created, the refusal holding over five further passes, recovery when the bucket comes back, a never-provisioned Bucket still provisioning, the `spec.allowRecreate` rebuild and its report, a completed clone not re-run by one, the five unreachable-provider shapes that must *not* trip it, the breaker staying shut, a teardown that completes without the bucket, and the three rollout cases — an upgrade touching nothing on healthy Buckets, a Bucket provisioned before `status.resolvedBucketName` existed being adopted rather than re-created, and a naming policy changed between operator versions still being checked under the frozen name |
 | [reconciler_circuit_test.go](../../internal/controller/reconciler_circuit_test.go) | The breaker inside a reconcile: trip, hold without churn, grace still expiring, recovery, an isolated broken bucket not tripping it, deferred teardown |
 | [reconciler_clone_test.go](../../internal/controller/reconciler_clone_test.go) | The clone Job, the staging Secret, rc progress, failure retry, the guards, teardown of the artifacts, and the Job-name label budget |
 | [reconciler_usage_test.go](../../internal/controller/reconciler_usage_test.go) | Measurement: the two switches, the interval floor, the object cap, versions, the failure path, and every skip condition |
-| [stackit/client_fake_test.go](../../stackit/client_fake_test.go) | The control-plane wrapper against the fake: service enablement, bucket lifecycle, groups and keys |
+| [stackit/client_fake_test.go](../../stackit/client_fake_test.go) | The control-plane wrapper against the fake: service enablement, bucket lifecycle, groups and keys, and `TestBucketExistsOnlyTrustsAStructuredAnswer` — the table-driven proof that `BucketExists` says "no" only for the API's own structured JSON `404` |
 | [stackit/s3_fake_test.go](../../stackit/s3_fake_test.go) | The data-plane wrapper: policy and tag round-trips, emptiness, `WipeBucket` |
 
 </details>
@@ -120,6 +121,7 @@ What only a real API server can prove, and therefore what belongs here:
 | `TestBucket_RejectsInvalidSecretKey` | The generated CRD pattern rejects an illegal Secret data key at admission |
 | [grant_read_access_test.go](../../test/integration/grant_read_access_test.go) | The CEL rule compiles and rejects a self-grant, and the `listMapKey` constraint rejects a duplicate entry — a CEL expression that fails to compile makes the whole CRD uninstallable |
 | [bucket_usage_test.go](../../test/integration/bucket_usage_test.go) | The `spec.usage` block round-trips, an omitted block stays nil, and an invalid interval is refused by the pattern |
+| [allow_recreate_test.go](../../test/integration/allow_recreate_test.go) | `spec.allowRecreate` round-trips through the generated schema, reads back as `false` when omitted, and stays mutable after creation — unlike `spec.bucketName` |
 
 The shared client is the manager's **cached** client, so every read after a write
 polls with `require.Eventually` rather than racing the informer. The measurement
@@ -219,7 +221,8 @@ home.
 | Helper | Use |
 |---|---|
 | `FailNext(op, status)` | One JSON-enveloped API failure for the next call of `op` |
-| `FailNextRaw(op, status, contentType, body)` | An intermediary's verbatim answer — the nginx HTML `403` page of the 2026-08-25 incident — which the SDK surfaces as an ordinary API error carrying that page's status code |
+| `FailNextRaw(op, status, contentType, body)` | An intermediary's verbatim answer — the nginx HTML `403` page of the 2026-08-25 incident — which the SDK surfaces as an ordinary API error carrying that page's status code. The body is arbitrary, which is what lets the existence tests serve an HTML page, an **empty** body and a **truncated** JSON body at `404` and prove that none of the three is an answer |
+| `Close()` | Shuts both `httptest` servers down mid-test, so the next call fails at the transport instead of answering — the only way offline to produce a failure that carries no HTTP answer. `httptest.Server.Close` is idempotent, so the `t.Cleanup(fake.Close)` each environment registers still runs afterwards |
 | `Calls(op)` | How many times the fake served `op`; the counter lives in `failFor`, which every named operation consults exactly once, so it cannot drift from the set `FailNext` knows |
 | `OmitFromNextListing(id)` | Leaves a group out of exactly one `ListGroups` answer, modelling a project listing that lags a create while the group's own endpoints already answer |
 | `SeedBucket` / `SeedObject` / `SeedObjectVersion` / `SetTags` / `SetPolicy` | State placed directly, bypassing the API: a pre-existing foreign bucket, a bucket provisioned before a tag existed, non-current versions with sizes |
@@ -480,9 +483,10 @@ Not exhaustive — the rules where the choice of layer is itself the point.
 | [ADR 0007 D5, D6](../adr/0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md) — clear before create, roll back on a failed Secret write | Offline: `TestSecretWriteFailureRollsBackAccessKey`, `TestAdminSecretWriteFailureRollsBackAdminKey` |
 | [ADR 0008 D2](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) — a self-reference is refused by the schema and ignored by the reconciler | envtest: `TestGrantReadAccess_SelfReferenceRejected` (the schema half). Offline: `TestReadGrantSelfReferenceIgnored` (the reconciler half) |
 | [ADR 0009 D1, D3, D5](../adr/0009-the-physical-bucket-name-is-composed-and-then-frozen.md) — composed, frozen, and a fault when invalid | Offline: `TestComposeBucketName`, `TestPersistResolvedName`, `TestReconcileGuards/composed name too long` |
-| [ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md) — the closed exception list | Offline: one test per exception in [reconciler_degraded_test.go](../../internal/controller/reconciler_degraded_test.go), including the nginx `403` page that must still be *held* |
+| [ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md) — the exception list | Offline: one test per exception in [reconciler_degraded_test.go](../../internal/controller/reconciler_degraded_test.go), including the nginx `403` page that must still be *held*; the seventh case, the vanished bucket, is in [reconciler_missing_bucket_test.go](../../internal/controller/reconciler_missing_bucket_test.go) instead |
 | [ADR 0013 D2, D4](../adr/0013-a-provider-outage-is-held-fleet-wide.md) — trip on absence of success, no provider call while open | Offline: `TestProviderCircuitStopsHammeringTheProvider`, `TestProviderCircuitIgnoresAnIsolatedBrokenBucket` |
 | [ADR 0014 D3](../adr/0014-bucket-size-is-measured-by-a-separate-controller.md) — a failed measurement never surfaces as a reconcile error | Offline: the `measure` helper fails the test if `Reconcile` returns any error at all |
+| [ADR 0015 D3, D4](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) — only the provider's own structured `404` may be read as "the bucket is gone" | Offline, once per level: `TestBucketExistsOnlyTrustsAStructuredAnswer` pins the client wrapper, and `TestUnreachableProviderNeverTripsTheGuard` pins that the reconciler holds instead of reporting when the same kinds of failure arrive. Nothing real-API covers either |
 
 ## What CI runs
 
@@ -557,6 +561,12 @@ mechanism covered only by them reads as uncovered.
   passes `-timeout=40m` (`# default`, line 102). The header values are suggestions
   in a comment that a person retypes, not a default the tooling applies — which is
   exactly why they drifted.
+- **The vanished-bucket guard has never met the real API.** The structured `404`,
+  the gateway page carrying one, the empty and truncated bodies, the transport
+  failure and the recovery are all reproduced offline against the fake, whose
+  shapes come from the 2026-08-25 capture. Deleting a real bucket in a real
+  project and watching the guard, the gauge and the recovery has not been done,
+  and no cloud suite covers it.
 - **Not verified in this pass, and this is the gap:** no suite was executed while
   writing this page. Everything above is read off the test sources, the Makefile
   and the workflow files; the runtimes of the cloud run and the content of its

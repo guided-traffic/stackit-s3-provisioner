@@ -3,10 +3,11 @@
 **Status:** Draft — scope decided in review on 2026-09-19 (split out of the vanished-bucket guard),
 design proposal, open questions listed. Not approved for implementation.
 **Scope:** this repo (`stackit-s3-provisioner`).
-**Relates to:** [a provisioned bucket that vanished is reported, never silently re-created](005-a-provisioned-bucket-that-vanished-is-reported.md)
-— that ticket introduces `Client.BucketExists` and uses it for the guard only. This one converts the
-remaining callers. The two are independent: the guard does not wait for this, and this improves paths
-that exist today regardless of the guard.
+**Relates to:** [ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)
+— the vanished-bucket guard, which landed on 2026-09-19. It introduced `Client.BucketExists` and uses
+it for that guard only; this ticket converts the remaining callers. The two are independent: the guard
+did not wait for this, and this improves paths that exist today regardless of the guard. That record's
+residual risks name the teardown case below as still open.
 **Date:** 2026-09-19
 
 ## Problem

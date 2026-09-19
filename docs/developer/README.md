@@ -5,7 +5,7 @@ two that cut across all of them — how the project is built, checked in CI and 
 ordered checklists for the changes people actually make. They cover what the code cannot state on
 its own: the order a pass runs in, the invariant a format rests on, why a boundary sits where it
 does, and the hard-won detail behind a line that looks arbitrary. They do not carry decisions —
-those are the fourteen records in [../adr/](../adr/README.md), and a page here cites a rule as
+those are the fifteen records in [../adr/](../adr/README.md), and a page here cites a rule as
 `ADR 0002 D4` rather than restating it. They do not carry operator instructions either; those are
 [../operations/](../operations/README.md).
 
@@ -29,7 +29,7 @@ first if you are here because something is behaving oddly.
 | [clone.md](clone.md) | You are changing the machinery behind `spec.cloneFrom`: the Job, the staging Secret, progress polling, the ordering that makes a crash mid-clone safe, and the locked-down control port |
 | [usage-measurement.md](usage-measurement.md) | You are changing the second controller: how a measurement pass is scheduled, how it stays out of the provisioning controller's way, what the listing costs, and how the cost figure is computed |
 | [circuit-breaker.md](circuit-breaker.md) | You are changing anything that runs while the provider is down: the fleet-wide breaker, the workqueue rate limiter, the two transport changes, and the two circuit metrics |
-| [provider-errors.md](provider-errors.md) | You are changing an error path: where a status code comes from, why the discriminator is the body shape rather than the code, what a revoked service-account key actually looks like, and how a classified error becomes a readiness decision |
+| [provider-errors.md](provider-errors.md) | You are changing an error path: where a status code comes from, why the discriminator is the body shape rather than the code, what a revoked service-account key actually looks like, which answers may be read as "this does not exist", and how a classified error becomes a readiness decision |
 | [stackit-api.md](stackit-api.md) | You are calling the provider: the two planes, the resource model, how the process authenticates, and the SDK pitfalls that cost time |
 | [testing.md](testing.md) | You need to know which suite proves what, what each costs to run, and the conventions that stop a run from leaving real cloud resources behind |
 | [build-and-release.md](build-and-release.md) | You are pushing, cutting a release or bumping a pinned version: the build and lint targets, what the two workflows do, how semantic-release derives the version, the generated-code release gate, and which file carries which pin |

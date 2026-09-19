@@ -1,16 +1,26 @@
 # Ticket: a provisioned bucket that vanished is reported, never silently re-created
 
-**Status:** Draft — behavior decided in review on 2026-09-19, design proposal, open questions listed.
-Not approved for implementation. Q8 and Q9 answered in a second review on 2026-09-19, which also
-corrected the failure routing in [D3](#d3--the-failure-state); no question is open. Sequencing
-confirmed there: this ticket lands before the hot-reload ticket.
+**Status:** Implemented 2026-09-19 (`feat: report a provisioned bucket that vanished instead of
+re-creating it`). The decision it produced is
+[ADR 0015](../../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md), which is the
+current authority; everything below is the origin story and is history.
+Behavior was decided in review on 2026-09-19; Q8 and Q9 were answered in a second review the same
+day, which also corrected the failure routing in [D3](#d3--the-failure-state). Sequencing confirmed
+there: this ticket lands before the hot-reload ticket.
+
+One deviation from the plan, found while implementing it: the test-plan line "teardown of a CR whose
+bucket is absent completes and still removes group and Secret" contradicts the Problem section and
+[D6](#d6--an-authorized-re-create-mints-a-fresh-workload-identity) of this same ticket, which state
+that the credentials group is deliberately **left behind** because nothing can attribute it without
+its bucket. The verified behaviour was implemented and tested: teardown completes, the Secret is
+removed, the group stays and is reported as `CredentialsGroupNotAttributable`.
 **Scope:** this repo (`stackit-s3-provisioner`).
-**Blocks:** [hot-reload the StackIT service-account key](007-hot-reload-the-stackit-service-account-key.md) —
+**Blocks:** [hot-reload the StackIT service-account key](../007-hot-reload-the-stackit-service-account-key.md) —
 that ticket's Q12 concluded that this guard, not a project-identity check, is what makes a foreign key
 safe. This one stands on its own merit and should land first.
 **ADR:** written as part of implementing this ticket, as its own ADR — decided in review on
 2026-09-19: every ticket carries its own ADR, produced with the implementation, not signed off in
-advance ([CLAUDE.md](../../CLAUDE.md) §2).
+advance ([CLAUDE.md](../../../CLAUDE.md) §2).
 **Date:** 2026-09-19
 
 ## Problem
@@ -24,13 +34,13 @@ it again. Reading the flow — **derived from the code, not yet reproduced**; an
 against `stackitfake` is the first acceptance test of this ticket:
 
 1. `ensureBucket` asks `HasBucket`, gets `false`, and calls `CreateBucket`
-   ([bucket_controller.go:569-585](../../internal/controller/bucket_controller.go#L569-L585)). The new,
+   ([bucket_controller.go:569-585](../../../internal/controller/bucket_controller.go#L569-L585)). The new,
    empty bucket is stamped with this operator's ownership tags. `freshBucket` is now `true`.
 2. `resolveWorkloadGroup` finds neither a `credentials-group-id` tag nor a policy on the fresh bucket,
    so it falls through to creating a new credentials group. The ADR 0002 D8 guard that would normally
    stop that — "do not create a second group while the group recorded in status still exists" — does
    not apply, because `guardGroupCreate` returns `nil` immediately when `freshBucket` is set
-   ([bucket_controller.go:914-918](../../internal/controller/bucket_controller.go#L914-L918)).
+   ([bucket_controller.go:914-918](../../../internal/controller/bucket_controller.go#L914-L918)).
 3. The new group has no access keys, so `ensureAccessKeyAndSecret` mints one and **overwrites the
    workload Secret**.
 4. The reconcile completes: `Ready=True`, an empty bucket under the original name, fresh credentials
@@ -44,11 +54,11 @@ repairs instead of reporting.
 ### Second consequence: the credentials group is left behind
 
 `teardown` already gates every provider step behind `bucketExists`
-([bucket_controller.go:1201-1231](../../internal/controller/bucket_controller.go#L1201-L1231)), so
+([bucket_controller.go:1201-1231](../../../internal/controller/bucket_controller.go#L1201-L1231)), so
 deleting a CR whose bucket is gone completes rather than hanging: the empty-check and the bucket delete
 are skipped. What it does **not** do is release the workload credentials group — without the bucket
 nothing can attribute it, so the operator reports `CredentialsGroupNotAttributable` and leaves it
-standing. That is [ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D4
+standing. That is [ADR 0002](../../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D4
 working as designed, and it is the right call, but it means every third-party deletion leaves a
 credentials group holding a live access key behind. The key cannot reach the replacement bucket (new
 bucket, new policy, new group), so this is orphaned garbage rather than live exposure — but it
@@ -82,20 +92,20 @@ accumulates and its cleanup is manual.
 ### D1 — What counts as "provisioned"
 
 `status.resolvedBucketName != ""`. It is written only on the success path, together with
-`credentialsGroupID` and `accessKeyID` ([bucket_controller.go:375](../../internal/controller/bucket_controller.go#L375)).
+`credentialsGroupID` and `accessKeyID` ([bucket_controller.go:375](../../../internal/controller/bucket_controller.go#L375)).
 
 The `stackit-bucket.gtrfc.com/resolved-bucket-name` annotation must **not** be used for this: it is
-stamped *before* any cloud resource exists ([bucket_controller.go:1951-1960](../../internal/controller/bucket_controller.go#L1951-L1960)),
+stamped *before* any cloud resource exists ([bucket_controller.go:1951-1960](../../../internal/controller/bucket_controller.go#L1951-L1960)),
 so it proves an intent, not a completed provisioning round.
 
 ### D2 — What counts as "absent", and why the current check is the wrong one
 
 This is where SC7 is won or lost. `HasBucket` today is a **project-wide listing plus a linear scan**
-([client.go:207-218](../../stackit/client.go#L207-L218) over `ListBucketNames`). Three problems for a
+([client.go:207-218](../../../stackit/client.go#L207-L218) over `ListBucketNames`). Three problems for a
 guard that flips a healthy Bucket to `Failed`:
 
 * The listing is known to lag. `WaitBucketVisible` exists precisely because a freshly created bucket
-  is not immediately visible in it ([client.go:222-239](../../stackit/client.go#L222-L239)).
+  is not immediately visible in it ([client.go:222-239](../../../stackit/client.go#L222-L239)).
 * `ListBuckets(projectId, region)` takes no pagination parameters at all in the SDK
   (`objectstorage@v1.9.1`), so whether a large project returns every bucket is **unverified**. A capped
   page would make a present bucket read as absent — and, with this guard in place, alarm on it.
@@ -105,17 +115,17 @@ guard that flips a healthy Bucket to `Failed`:
 answer from the API, never a status code on its own.** A provider that is unreachable, a gateway or WAF
 serving an HTML error page, a 5xx, a dropped connection: none of those may reach the guard. They are
 the failure mode the transient-error work already covers
-([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md)) and they must keep taking the degraded path — sticky `Ready`,
+([ADR 0012](../../adr/0012-ready-describes-the-last-verified-state.md)) and they must keep taking the degraded path — sticky `Ready`,
 `status.degradedSince`, `ProviderReachable=False`, grace window — not the vanished-bucket path.
 
 The discriminator already exists and is exactly the right one: `apiAnswer` in
-[stackit/errors.go](../../stackit/errors.go) requires a `*oapierror.GenericOpenAPIError` **whose body is
+[stackit/errors.go](../../../stackit/errors.go) requires a `*oapierror.GenericOpenAPIError` **whose body is
 valid JSON** before it will report a status code, precisely because an intermediary produces the same
 error type with the same status and an HTML body. `isServiceNotEnabled` is the structured-404 case of
 it already.
 
 So the guard asks `GetBucket` — the per-bucket control-plane read already used by `BucketConnInfo`
-([client.go:394-406](../../stackit/client.go#L394-L406)) — and the classification lives **inside the
+([client.go:394-406](../../../stackit/client.go#L394-L406)) — and the classification lives **inside the
 client**, not in the controller:
 
 ```go
@@ -138,11 +148,11 @@ through minio and have their own error shapes; the guard reads the control plane
 
 `Phase=Failed`, `Ready=False` with a new `ReasonBucketMissing = "BucketMissing"`, and `status.message`
 naming the bucket. No new phase: the phase enum is CRD-validated
-([bucket_types.go](../../api/v1/bucket_types.go)) and adding one costs a CRD roll for no gain.
+([bucket_types.go](../../../api/v1/bucket_types.go)) and adding one costs a CRD roll for no gain.
 
 **Plus a dedicated condition, decided in review on 2026-09-19:**
 `ConditionBucketPresent = "BucketPresent"`, set to `False` with the same reason, alongside the existing
-`ConditionReady` and `ConditionProviderReachable` ([bucket_types.go:16-33](../../api/v1/bucket_types.go#L16-L33)).
+`ConditionReady` and `ConditionProviderReachable` ([bucket_types.go:16-33](../../../api/v1/bucket_types.go#L16-L33)).
 The three then answer three different questions without anyone parsing a reason string: `Ready` says
 usable, `ProviderReachable` says the provider answered, `BucketPresent` says the bucket is there. A
 reader can tell a provider outage from a vanished bucket directly from the conditions.
@@ -150,25 +160,25 @@ reader can tell a provider outage from a vanished bucket directly from the condi
 Like `ProviderReachable`, the condition is **removed** rather than set to `True` on recovery, so a
 Bucket that never lost its bucket and one that recovered look identical and an operator upgrade writes
 nothing to healthy Buckets (`clearDegraded` sets the precedent,
-[bucket_controller.go:1665-1670](../../internal/controller/bucket_controller.go#L1665-L1670)).
+[bucket_controller.go:1665-1670](../../../internal/controller/bucket_controller.go#L1665-L1670)).
 
 Alarm surface stays the gauge: `stackit_s3_provisioner_bucket_provisioned_missing{namespace,name}`,
 following the existing `..._buckets_provider_degraded` / `..._bucket_degraded_since_timestamp_seconds`
-pattern in [metrics.go](../../internal/controller/metrics.go), plus a `PrometheusRule` entry. Conditions
+pattern in [metrics.go](../../../internal/controller/metrics.go), plus a `PrometheusRule` entry. Conditions
 are not queryable in Prometheus; the gauge is what an alert fires on.
 
 **This deliberately breaks kstatus health checks and will mark dependent Flux Kustomizations
 not-ready.** That is correct here and must not be "fixed" later: the transient-error work
-([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md)) holds `Ready` for failures that carry no information about the bucket. A structured
+([ADR 0012](../../adr/0012-ready-describes-the-last-verified-state.md)) holds `Ready` for failures that carry no information about the bucket. A structured
 404 for a bucket we provisioned is the opposite — it is information about the bucket, and it is the
 worst news the operator can deliver.
 
 ~~Requeue with `fail`, not `failNoRequeue`~~ — **corrected in review on 2026-09-19: neither.** `fail`
 calls `Breaker.Failure()` on every error it handles
-([bucket_controller.go:1559](../../internal/controller/bucket_controller.go#L1559)). After a restart
+([bucket_controller.go:1559](../../../internal/controller/bucket_controller.go#L1559)). After a restart
 with a foreign key *every* provisioned Bucket reads as absent, so three of them through `fail` would
 open the circuit fleet-wide and stop every provider call, teardowns included — for an answer the
-provider gave definitively. [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) D3 says a
+provider gave definitively. [ADR 0013](../../adr/0013-a-provider-outage-is-held-fleet-wide.md) D3 says a
 definitive fault neither trips nor resets the breaker. `failNoRequeue` is wrong for the other reason:
 it never retries, and SC4 needs the retry.
 
@@ -195,15 +205,15 @@ Two consequences to document rather than hide:
   bucket that no longer exists.
 * `status.resolvedBucketName` and the `resolved-bucket-name` annotation die with the CR, so the new
   bucket's name is composed from the operator's *current* naming policy
-  ([`decideBucketName`](../../internal/controller/bucket_controller.go#L1932)). If the prefix or the
+  ([`decideBucketName`](../../../internal/controller/bucket_controller.go#L1932)). If the prefix or the
   namespace-inclusion setting changed since the original provisioning, the replacement bucket gets a
   different name. Harmless here — the old name is free — but it is a real difference from an in-place
   re-create, and it is why freezing the name in status exists in the first place.
 * The old credentials group stays behind, as described in the Problem section.
 * The **credentials Secret is deleted with the CR** — verified: `teardown` calls `deleteSecret`
-  unconditionally as its last step ([bucket_controller.go:1232-1239](../../internal/controller/bucket_controller.go#L1232-L1239),
+  unconditionally as its last step ([bucket_controller.go:1232-1239](../../../internal/controller/bucket_controller.go#L1232-L1239),
   the only exception being the operator's own admin Secret), and `upsertSecret` additionally sets a
-  controller owner reference ([bucket_controller.go:1505](../../internal/controller/bucket_controller.go#L1505))
+  controller owner reference ([bucket_controller.go:1505](../../../internal/controller/bucket_controller.go#L1505))
   so Kubernetes garbage collection would remove it even if teardown never ran. Operationally this means
   a gap: between deleting the CR and re-applying it the workload has no Secret. Pods that consumed it
   via `envFrom` keep their environment until they restart; anything reading it live fails. Plan the
@@ -232,7 +242,7 @@ exists to remove — the CR would go `Ready` again with no trace that the data i
 
 Privilege: setting it needs write access to the Bucket CR in its own namespace — the same access that
 can delete the CR outright, so no new privilege is introduced. Per
-[ADR 0001](../adr/0001-a-bucket-only-affects-its-own-namespace.md) the namespace is the trust boundary
+[ADR 0001](../../adr/0001-a-bucket-only-affects-its-own-namespace.md) the namespace is the trust boundary
 and this stays inside it.
 
 ### D6 — An authorized re-create mints a fresh workload identity
@@ -251,7 +261,7 @@ Two consequences that must be documented, not discovered:
   the workload.
 * **The previous credentials group is left standing**, holding a live access key that can no longer
   reach anything. `status.credentialsGroupID` names it, but per
-  [ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D4 the status is not a
+  [ADR 0002](../../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D4 the status is not a
   deletion source, so the operator must not remove it. Cleanup is manual, same as for the
   delete-and-re-apply path.
 
@@ -263,7 +273,7 @@ existence question to `GetBucket` ([Q6](#q6--answered-converted-everywhere-but-i
 ### D7 — Interactions
 
 * **Usage measurement** gates on `ResolvedBucketName != "" && bucketIsReady(b)`
-  ([bucket_usage_controller.go:183](../../internal/controller/bucket_usage_controller.go#L183)), so a
+  ([bucket_usage_controller.go:183](../../../internal/controller/bucket_usage_controller.go#L183)), so a
   missing bucket stops being measured automatically. Nothing to do.
 * **Read grants:** a grantor whose own bucket is missing never reaches the policy step. A *grantee*
   that is missing already degrades to `ReadGrantPending`, which is unchanged.
@@ -325,7 +335,7 @@ would block first provisioning outright.
 ### Q3 — ANSWERED: one definitive answer, and definitive means structured
 **Decision (2026-09-19): a single structured-JSON 404 from `GetBucket` trips the guard** — no second
 opinion, no confirmation pass. With the explicit condition that an unreachable or misbehaving API must
-stay distinguishable from a real absence and must keep taking the degraded path of [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md).
+stay distinguishable from a real absence and must keep taking the degraded path of [ADR 0012](../../adr/0012-ready-describes-the-last-verified-state.md).
 [D2](#d2--what-counts-as-absent-and-why-the-current-check-is-the-wrong-one) implements that by putting
 the `apiAnswer` discriminator inside `Client.BucketExists`, so a gateway page or a 5xx can never arrive
 at the guard as "absent".
@@ -346,7 +356,7 @@ feature gate (see D5).
 ### Q6 — ANSWERED: converted everywhere, but in its own ticket
 **Decision (2026-09-19): this ticket adds `Client.BucketExists` and uses it for the guard only.**
 Converting `ensureBucket`, the read-grant check and `teardown` off the project listing is
-[decide bucket existence with `GetBucket`, not a project-wide listing](008-decide-bucket-existence-with-a-per-bucket-read.md),
+[decide bucket existence with `GetBucket`, not a project-wide listing](../008-decide-bucket-existence-with-a-per-bucket-read.md),
 which also carries the unverified `ListBuckets` pagination question and the one risky conversion
 (`WaitBucketVisible`, whose timing against `GetBucket` nobody has measured).
 
@@ -360,7 +370,7 @@ The two tickets are independent; neither blocks the other.
 For this one: "a provisioned bucket is never re-created implicitly", stating the guard, the standing
 `spec.allowRecreate` opt-in, delete-and-re-apply as the way to re-create once, the structured-404 rule
 from [D2](#d2--what-counts-as-absent-and-why-the-current-check-is-the-wrong-one), and explicitly that
-this failure is **not** covered by the degraded-Ready hold of [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md).
+this failure is **not** covered by the degraded-Ready hold of [ADR 0012](../../adr/0012-ready-describes-the-last-verified-state.md).
 
 ### Q8 — ANSWERED: ADR 0012 D6 is extended, ADR 0013 stays as it is
 **Decision (2026-09-19): approved.** ADR 0012 D3/D6 enumerate the definitive faults and say the set
@@ -388,11 +398,11 @@ an unattended re-creation the only durable evidence is the Warning event while i
 
 ## References
 
-* [hot-reload the StackIT service-account key](007-hot-reload-the-stackit-service-account-key.md) — the ticket
+* [hot-reload the StackIT service-account key](../007-hot-reload-the-stackit-service-account-key.md) — the ticket
   whose Q12 produced this one
-* [internal/controller/bucket_controller.go](../../internal/controller/bucket_controller.go) — `ensureBucket`, `resolveWorkloadGroup`, `guardGroupCreate`, `assertBucketEmpty`, `deleteBucketIfOwned`
-* [stackit/client.go](../../stackit/client.go) — `HasBucket`, `WaitBucketVisible`, `BucketConnInfo`
-* [stackit/s3.go](../../stackit/s3.go) — `BucketEmpty`
-* [api/v1/bucket_types.go](../../api/v1/bucket_types.go) — status fields and the rotation-annotation precedent
-* [docs/adr/0001](../adr/0001-a-bucket-only-affects-its-own-namespace.md), [docs/adr/0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md)
-* [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) — the transient-error classification this failure is deliberately outside of
+* [internal/controller/bucket_controller.go](../../../internal/controller/bucket_controller.go) — `ensureBucket`, `resolveWorkloadGroup`, `guardGroupCreate`, `assertBucketEmpty`, `deleteBucketIfOwned`
+* [stackit/client.go](../../../stackit/client.go) — `HasBucket`, `WaitBucketVisible`, `BucketConnInfo`
+* [stackit/s3.go](../../../stackit/s3.go) — `BucketEmpty`
+* [api/v1/bucket_types.go](../../../api/v1/bucket_types.go) — status fields and the rotation-annotation precedent
+* [docs/adr/0001](../../adr/0001-a-bucket-only-affects-its-own-namespace.md), [docs/adr/0002](../../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md)
+* [ADR 0012](../../adr/0012-ready-describes-the-last-verified-state.md) — the transient-error classification this failure is deliberately outside of

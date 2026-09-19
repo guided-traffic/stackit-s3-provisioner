@@ -2,17 +2,18 @@
 
 ## Status
 
-Accepted. Date: 2026-08-25. Amended 2026-09-02 by [ADR 0013](0013-a-provider-outage-is-held-fleet-wide.md).
+Accepted. Date: 2026-08-25. Amended 2026-09-02 by [ADR 0013](0013-a-provider-outage-is-held-fleet-wide.md)
+and 2026-09-19 by [ADR 0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md).
 
 Implemented: a provisioned `Bucket` holds `Ready=True` through a non-definitive reconcile failure,
 records the degradation in `status.degradedSince` and the `ProviderReachable` condition, and drops
 to phase `Failed` once `providerDegradedGrace` elapses. This record deliberately left the reconcile
 returning its error, so a provider outage still counted once per retry per Bucket in
 `controller_runtime_reconcile_errors_total`; that hole was the actual alert driver and is closed by
-ADR 0013, which stops the calls instead of the errors. Still open: a provisioned bucket that has
-vanished at the provider is not covered by this record at all - the provider answers the existence
-question successfully, so nothing is held, the bucket is re-created empty and the `Bucket` keeps
-reporting `Ready`; reporting that absence instead of silently re-provisioning it is outstanding work.
+ADR 0013, which stops the calls instead of the errors. The gap this record left open - a provisioned
+bucket that has vanished at the provider, where the provider answers the existence question
+successfully and nothing here applies - is closed by ADR 0015, which reports the absence instead of
+re-provisioning over it and adds the seventh case to the D6 table below.
 
 ## Context
 
@@ -102,7 +103,9 @@ disables the hold entirely and restores the previous behaviour without a differe
 is not per-Bucket: no Bucket can ask for a longer or a shorter hold than the operator's.
 
 **D6 - The exceptions are the cases enumerated below, and each one drops `Ready` immediately
-whatever the grace says.**
+whatever the grace says.** Per D3 the enumeration is the whole definition of "definitive", so it
+grows only by amending this record; the last row was added on 2026-09-19 by
+[ADR 0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md).
 
 | Case | Why it is definitive |
 | --- | --- |
@@ -112,6 +115,7 @@ whatever the grace says.**
 | A Bucket being deleted | Holding `Ready` through a teardown would hide a deletion blocked by the non-empty guard of [ADR 0006](0006-a-bucket-is-deleted-only-when-it-is-empty.md). |
 | A Bucket whose spec has not been observed (`status.observedGeneration` differs from `metadata.generation`) | The user asked for something new and it was not achieved; there is no verified state matching the current spec. |
 | A Bucket that has never been `Ready` | There is nothing verified to defend. Failures during initial provisioning surface at once. |
+| A provisioned Bucket whose bucket the provider reports as absent (`status.resolvedBucketName` is set and a per-bucket read answers with a structured `404`) | Information about the bucket, not a failure to obtain it, and the worst news the operator can deliver: the data is gone. It carries its own `BucketPresent` condition and reason `BucketMissing`, and it is the one case where re-creating would be the damage - see [ADR 0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md). A `404` carried by an error page has a non-structured body and *is* held. |
 
 ## Consequences
 
@@ -126,9 +130,10 @@ that want "the last attempt succeeded" must read `ProviderReachable` or the degr
 
 A bucket deleted behind the operator's back is *not* an instance of that cost, and it is worth
 saying so because the two are easily confused. There the provider answers, and answers that the
-bucket is absent; the reconcile succeeds, the bucket is provisioned again from scratch and nothing is
-held, so no rule of this record applies to it. That gap belongs to the provisioning step, not to the
-readiness semantics - see Residual risks.
+bucket is absent - so nothing is held, and the rules above never applied to it. That case belongs to
+the provisioning step rather than to the readiness semantics, and it is decided there by
+[ADR 0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md): the absence is reported and
+the bucket is not re-created.
 
 `status.degradedSince` survives into phase `Failed` so the record of when the trouble started is not
 lost, but the two degraded metrics deliberately stop at that moment, because the hold has been given
@@ -156,7 +161,8 @@ needs no reasoning about origin and can be written as a list of strings and stat
 lost anyway, because the list is provider-controlled and open-ended. It can never be complete, and
 every error not on it lands on the *wrong* default: a new phrasing from the provider's edge would
 have reproduced the 2026-08-25 incident exactly. The list of definitive cases in D6 is the same idea
-inverted: it is closed, it is about the operator's own certainty, and it belongs to us.
+inverted: it is about the operator's own certainty, it belongs to us, and it grows only by a
+deliberate amendment to this record - never by a phrasing the provider changed.
 
 **Keeping the drop and fixing the consumers.** Rejected. Relaxing the Flux health checks, or their
 timeouts, would have quietened the alert storm without touching the operator. It treats the symptom
@@ -180,15 +186,12 @@ signal bounded by the grace, dropping one wrongly marks the entire fleet sick on
 a future failure mode makes a wrongly-held `Ready` expensive - a bucket that is gone and being
 written to - the judgement has to be revisited rather than patched around.
 
-A vanished provisioned bucket would be the concrete instance of that, and today it is not reached by
-this record at all. Provisioning decides existence from the provider's own answer about the project's
-buckets, and a successful answer that the name is absent is indistinguishable from a bucket that was
-never created: the operator creates it again, empty, stamps its ownership tags, attributes a new
-credentials group to it and publishes a fresh access key into the workload Secret. The reconcile
-succeeds, so `status.degradedSince` is never written, `ProviderReachable` is never set and `Ready`
-never moves - the data is gone and nothing on the object says so. Reporting the absence instead of
-re-provisioning over it is outstanding work, and it has to be built in the provisioning step; no
-change to the rules above would catch it.
+That condition was met on 2026-09-19, and the judgement was revisited rather than patched around: a
+vanished provisioned bucket was the concrete instance, and
+[ADR 0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md) settles it in the
+provisioning step, where it belongs. The asymmetry itself is unchanged - that record does not loosen
+what counts as definitive, it adds one case that is definitive for the same reason the others are:
+the provider answered.
 
 **Not verified.** The behaviour was verified offline against a simulated provider only: the hold, the
 expiry of the grace, the immediate drop on a structured refusal and the teardown exception all have
