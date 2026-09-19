@@ -3,6 +3,8 @@
 ## Status
 
 Accepted. Date: 2026-09-02. Amends [ADR 0012](0012-ready-describes-the-last-verified-state.md).
+Amended on 2026-09-19 by [ADR 0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md):
+D4 gains its single exception, the validation call of a candidate service-account key.
 
 Implemented: the fleet-wide breaker, the doubling probe cooldown, the fleet-wide workqueue pacing,
 the removal of transport-level retries for rate-limited responses, the two circuit metrics, and the
@@ -100,6 +102,17 @@ circuit metrics carry the difference. A delete therefore appears stuck for the d
 outage. This is the same direction of caution as the emptiness guard in
 [ADR 0006](0006-a-bucket-is-deleted-only-when-it-is-empty.md): never destroy on the strength of an
 unanswered call.
+
+**Amended on 2026-09-19 by [ADR 0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)
+D6: D4 has exactly one exception, the single validation call of a candidate service-account key.**
+It is not a general licence for "validation calls". The scenario that forces it is the old key being
+revoked before the replacement arrives: the breaker is then open *because of the dead key*, so
+obeying it would delay the one repair that can close the outage by up to
+`--provider-circuit-max-cooldown` while reconciles keep probing with the dead key and doubling the
+cooldown. The exception is bounded by the reload's own schedule — at most one call per distinct key
+file content, backing off to one call per ten minutes — which cannot drive a provider blip into the
+rate limit this record exists to prevent. Its success calls `Success()`; its failure never calls
+`Failure()`, because the candidate is on trial and the provider is not.
 
 **D5 — A held reconcile returns a delayed retry and no error.** The failure is still logged, and the
 reason is recorded on the object — a `Warning` event with reason `Failed`, and `status.message` —

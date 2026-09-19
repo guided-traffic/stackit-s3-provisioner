@@ -486,23 +486,49 @@ selects one ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-regio
 **Adversary:** none required — like [H-1](#h-1-an-organisation-level-role-dissolves-layer-1-and-nothing-here-can-see-it)
 this is a misconfiguration, and it is the mirror image of it. In H-1 the boundary dissolves; here the
 boundary holds perfectly, around the wrong project.
-**Live today:** yes, and undetected. There is no setting to declare the expected project id and no
-check that the mounted key matches it
-([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md), *Residual risks*).
+**Live today:** yes, and undetected at the moment the mistake is made. There is no setting to
+declare the expected project id and no check at startup that the mounted key matches it
+([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md), *Residual risks*). One
+check does run later, against candidate keys only; it is described below and it does not close this.
 
 Mounting the wrong key moves an entire cluster's provisioning into a different project, and no
 configuration looks wrong while it happens: the chart references a Secret by name, the key inside it
 is opaque, and every `Bucket` reconciles to `Ready` in the project the key names. The buckets are
 correctly isolated from each other and from that project's other tenants — they are simply in a
-project that cluster was never meant to touch, alongside whoever else is a tenant of it. The binding
-is also fixed for the process lifetime, so the mistake persists until someone restarts the operator
-with a corrected key ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D8).
+project that cluster was never meant to touch, alongside whoever else is a tenant of it. The project
+binding is also fixed for the process lifetime, so the mistake persists until someone restarts the
+operator with a corrected key
+([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D8).
+
+**The runtime check, and exactly what it buys.** The operator re-reads its key file while it runs,
+and a candidate key whose `projectId` differs from the one the *running process* loaded at start is
+refused: nothing is swapped, the running key stays in use, and
+`stackit_s3_provisioner_sa_key_reload_failing` goes to `1`
+([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D4). So a
+live operator cannot be re-pointed at another project by a write to its Secret — and that is the
+whole of it. The reference point is the previous process's own memory, so a restart erases it: a pod
+that comes up with a foreign key mounted has nothing to compare against and adopts whatever the file
+says. That is the path a botched Secret update leads to rather than an exotic one, because a refused
+rotation invites exactly that restart: the operator will not take the new key, and restarting it is
+the obvious way to make it. The check is one string comparison with no state and no configuration,
+and it is kept on those terms, not because it protects anything.
+
+**What bounds the damage is
+[ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md), not that check.** A
+`Bucket` whose provisioned bucket the operator can no longer find reports it as missing; nothing is
+re-created and nothing is overwritten in the project the wrong key names. That guard never asks
+which project the operator is pointed at, only whether the bucket it provisioned is still there, so
+unlike the `projectId` comparison it survives every restart. It does not help a `Bucket` created
+*while* a foreign key is in use: that one has no history to contradict and is provisioned in
+whatever project the key names.
 
 **What an operator can do meanwhile:** read the `projectId` out of the key before installing it and
-compare it against the project this cluster is meant to serve, then repeat that comparison after
-every key replacement — a replacement is the moment the two can drift apart, and it is also a
-restart, so there is no cheaper point to check. Running one project per cluster keeps the damage of
-a swap to the two projects involved.
+compare it against the project this cluster is meant to serve, then repeat that comparison on every
+key replacement. A replacement is the moment the two can drift apart, and it is no longer also a
+restart somebody watches — a proven key is picked up on its own — so the comparison has to be a step
+in the rotation procedure ([../operations/credentials.md](../operations/credentials.md)) rather than
+a side effect of a pod coming back. Running one project per cluster keeps the damage of a swap to
+the two projects involved.
 
 ## What this does not cover
 

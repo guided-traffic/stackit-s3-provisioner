@@ -30,7 +30,7 @@ is deliberate.
 | [usage-and-cost.md](usage-and-cost.md) | You want size and a monthly cost estimate on the `Bucket`, or you have those numbers and need to know what they are not. |
 | [provider-outages.md](provider-outages.md) | You are on call and the STACKIT API is unreachable: readiness held past the point you expected, deletions that appear stuck, an error counter that moved once and then stopped. |
 | [vanished-buckets.md](vanished-buckets.md) | A bucket the operator provisioned is gone from the provider: why the `Bucket` reports that instead of re-creating it, how to tell it apart from an outage, and the two ways back to a working bucket. |
-| [monitoring.md](monitoring.md) | You are wiring up scraping, reading one of the exported series, or tuning, suppressing or silencing one of the thirteen shipped alerts. |
+| [monitoring.md](monitoring.md) | You are wiring up scraping, reading one of the exported series, or tuning, suppressing or silencing one of the sixteen shipped alerts. |
 
 ---
 
@@ -82,10 +82,10 @@ way to tell which one is lying. Which values block is explained on which page is
 ### The seam this makes visible: monitoring
 
 Monitoring is where the split looks like a bug and is not. The README carries the value block —
-`monitoring.serviceMonitor.*`, `monitoring.prometheusRule.enabled`, and the thirteen
+`monitoring.serviceMonitor.*`, `monitoring.prometheusRule.enabled`, and the sixteen
 `monitoring.prometheusRule.alerts.<name>.enabled` toggles with a one-line trigger per alert.
 [monitoring.md](monitoring.md) carries everything you need to decide what to do about an alert that
-fires: what each of the 24 exported series actually counts, that an absent series is not a zero one
+fires: what each of the 28 exported series actually counts, that an absent series is not a zero one
 and which alert expressions depend on that, why the reconcile-error alert excludes windows in which
 the circuit breaker was open, and why the degraded alert fires on the *age* of a hold rather than
 its existence.

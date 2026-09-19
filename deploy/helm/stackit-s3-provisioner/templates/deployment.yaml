@@ -49,6 +49,7 @@ spec:
             - --stackit-region={{ .Values.stackit.region }}
             {{- if .Values.stackit.serviceAccountKey.secretName }}
             - --stackit-sa-key-path=/etc/stackit/{{ .Values.stackit.serviceAccountKey.secretKey }}
+            - --stackit-sa-key-reload-interval={{ .Values.stackit.serviceAccountKey.reloadInterval }}
             {{- end }}
             {{- if .Values.bucketNaming.prefix }}
             - --bucket-name-prefix={{ .Values.bucketNaming.prefix }}

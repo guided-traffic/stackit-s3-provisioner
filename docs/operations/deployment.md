@@ -16,10 +16,15 @@ sync of an installed release is a no-op, [gitops.md](gitops.md).
 
 One operator deployment serves exactly **one StackIT project in exactly one region**. The project
 comes from the service-account key, the region from `stackit.region`, and both are resolved once at
-process start — replacing the key or changing the region takes effect on the next restart, not
-before ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D1, D2, D8). A
-second project or a second region means a second release with its own key, its own namespace and its
-own bootstrap admin credential; two operators must never share a project, because they would contend
+process start — changing either takes effect on the next restart, not before
+([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D1, D2, D8). The key
+*material* is the one exception: the operator re-reads the mounted file while it runs and swaps to a
+replacement once it has proven that replacement works, so rotating the credential needs no restart
+([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)). That
+cannot move the release, because a candidate naming a different project is refused for as long as
+the process lives — a guardrail for one process lifetime and not a boundary, as that record's D4
+says. A second project or a second region means a second release with its own key, its own namespace
+and its own bootstrap admin credential; two operators must never share a project, because they would contend
 for the same project-wide admin identity ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D9).
 
 The chart ([`deploy/helm/stackit-s3-provisioner/`](../../deploy/helm/stackit-s3-provisioner/))
@@ -218,7 +223,7 @@ At rest in the cluster it is a plain Secret, so it is protected by whatever the 
 encryption and namespace RBAC provide and by nothing else — see
 [credentials-and-secrets.md](../security/credentials-and-secrets.md).
 
-Two Flux-specific notes:
+Three Flux-specific notes:
 
 - **Ordering.** If the Secret arrives after the `HelmRelease`, the pod does not start at all. The
   chart mounts the key as a **non-optional** Secret volume
@@ -234,6 +239,16 @@ Two Flux-specific notes:
   re-applied on every upgrade. Set it to `false` only when a separate cluster-admin pipeline applies
   [`config/crd/bases/`](../../config/crd/bases/) itself — and then that pipeline owns keeping the CRD
   in step with the chart version.
+- **Rotating the key is not a release change.** Writing a new value into the key Secret — through
+  SOPS, SealedSecrets or an ExternalSecret — leaves the `HelmRelease` untouched, and the chart adds
+  no `checksum/secret` pod annotation
+  ([`templates/deployment.yaml`](../../deploy/helm/stackit-s3-provisioner/templates/deployment.yaml)),
+  so nothing rolls the Deployment. Nothing needs to: the running operator re-reads the mounted file
+  and swaps to the new key once it has proven it
+  ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)). How to
+  tell a rotation that landed from one the operator is refusing is
+  [credentials.md](credentials.md), and the series that reports it is
+  [monitoring.md](monitoring.md).
 
 A Flux sync of an already-installed release changes nothing, by design; the reasoning is in
 [gitops.md](gitops.md).
@@ -385,7 +400,7 @@ Two consequences:
 
 ### Rolling back
 
-`helm rollback` returns to the previous chart version, and with it the previous image. Three
+`helm rollback` returns to the previous chart version, and with it the previous image. Four
 behaviours can also be turned off through values alone, without deploying a different image, when a
 new mechanism is the suspect:
 
@@ -394,9 +409,10 @@ new mechanism is the suspect:
 | `providerCircuit.threshold` | `0` | no fleet-wide breaker ([ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) D8) |
 | `providerDegradedGrace` | `"0"` | a failing reconcile drops `Ready` immediately, as before the hold ([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D5) |
 | `bucketUsage.enabled` | `false` | no size measurement traffic at all, whatever a CR asks for |
+| `stackit.serviceAccountKey.reloadInterval` | `"0"` | the key file is read only at process start again, so replacing the key needs a restart; none of the `sa_key` series is exported ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D2) |
 
-What those three mechanisms do is [provider-outages.md](provider-outages.md) and
-[usage-and-cost.md](usage-and-cost.md).
+What those mechanisms do is [provider-outages.md](provider-outages.md),
+[usage-and-cost.md](usage-and-cost.md) and [credentials.md](credentials.md).
 
 ---
 
@@ -413,7 +429,7 @@ message in its log rather than running half-configured. A pod that never reaches
 | `CrashLoopBackOff` | `invalid bucket naming configuration` | `bucketNaming.prefix` is not a lowercase DNS-1123 label ([ADR 0009](../adr/0009-the-physical-bucket-name-is-composed-and-then-frozen.md) D7). |
 | `CrashLoopBackOff` | `invalid bucket usage price` | `bucketUsage.pricing.perGBHour` is not a non-negative decimal. Quote it so YAML does not turn it into an exponent. |
 | Pod stuck in `ContainerCreating`, **no** container log | Event `FailedMount`: `MountVolume.SetUp failed for volume "stackit-sa-key": secret "…" not found` | The key Secret does not exist in the release namespace. The chart mounts it non-optionally, so no container ever starts. Create the Secret — the kubelet picks it up without a Deployment restart. |
-| `CrashLoopBackOff` | `unable to load StackIT service-account key` with `read key file`, `parse key file` or `key file … has no projectId field` | The Secret exists but is wrong: `stackit.serviceAccountKey.secretKey` does not match its data key (`read key file`), the JSON is unparseable (`parse key file`), or it is not a key-flow key (`has no projectId field`) — `LoadAccount` in [`stackit/client.go`](../../stackit/client.go). This is never skeleton mode ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D7). |
+| `CrashLoopBackOff` | `unable to configure the StackIT client`, wrapping `read key file`, `key file … is empty`, `parse key file` or `key file … has no projectId field` | The Secret exists but is wrong: `stackit.serviceAccountKey.secretKey` does not match its data key (`read key file`), the data key resolved to an empty value (`is empty`), the JSON is unparseable (`parse key file`), or it is not a key-flow key (`has no projectId field`) — `LoadAccount` in [`stackit/client.go`](../../stackit/client.go). This is never skeleton mode ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D7). |
 | `CrashLoopBackOff` | `operator namespace unknown; set POD_NAMESPACE (or --operator-namespace) when a StackIT key is configured` | The `POD_NAMESPACE` downward-API env var is missing — only possible when the Deployment was not rendered by this chart ([ADR 0004](../adr/0004-the-operator-bootstraps-its-own-s3-admin-credential.md) D4). |
 | `helm install` fails | `no matches for kind "ServiceMonitor"` / `"PrometheusRule"` | `monitoring.*.enabled` without the `monitoring.coreos.com` CRDs in the cluster. Install prometheus-operator, or leave both `false`. |
 | `helm upgrade` fails, Flux rolls back | `… exists and cannot be imported into the current release` | Trap 1 above. |

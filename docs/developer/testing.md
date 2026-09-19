@@ -35,7 +35,8 @@ the `integration` tag and are otherwise unrelated — see
 
 Functions with no I/O: name composition, the Secret data contract, policy
 construction and comparison, error classification, the retry transport, the cost
-formula, the breaker state machine, the generated DeepCopy code.
+formula, the breaker state machine, the key-reload observer's four series, the
+generated DeepCopy code.
 
 <details>
 <summary>File-by-file, as of 2026-09-19</summary>
@@ -45,7 +46,7 @@ formula, the breaker state machine, the generated DeepCopy code.
 | [api/v1/bucket_types_test.go](../../api/v1/bucket_types_test.go) | Name composition and validation, `EffectiveBucketName`, the Secret data map and its key overrides, the key-collision refusal, the rotation trigger, the `cloneFrom` accessors |
 | [api/v1/bucket_usage_test.go](../../api/v1/bucket_usage_test.go) | The three-state `spec.usage` accessors (`Enabled`, `IncludeVersions`, `Interval`) against a cluster default |
 | [api/v1/deepcopy_test.go](../../api/v1/deepcopy_test.go) | The generated DeepCopy over a fully populated object, so an added field without `make generate-all` is caught |
-| [cmd/main_test.go](../../cmd/main_test.go) | The environment-variable fallbacks for the flags |
+| [cmd/main_test.go](../../cmd/main_test.go) | The environment-variable fallbacks for the flags, including that `"0"` survives `envDurationOrDefault` rather than reading as unset — for the key reload it is the documented off switch — and that `setupSAKeyReload` adds nothing to the manager in skeleton mode or at an interval of `0` (it is handed a **nil** manager, which is the cheapest possible proof that neither case reaches one) |
 | [stackit/client_test.go](../../stackit/client_test.go) | Service-account key parsing, and that the two key files name two different projects |
 | [stackit/newclient_test.go](../../stackit/newclient_test.go) | Client construction against a throwaway generated RSA key — parsing and JWT-signer setup only, never a call |
 | [stackit/errors_test.go](../../stackit/errors_test.go) | `ProviderRefused` and `isServiceNotEnabled`, against error bodies captured verbatim from the live API on 2026-08-25, plus the proof that `oapierror.Model` is not a usable discriminator |
@@ -56,6 +57,7 @@ formula, the breaker state machine, the generated DeepCopy code.
 | [internal/controller/ownership_test.go](../../internal/controller/ownership_test.go) | The ownership tag values, their stability across a CR UID change, and the collision error |
 | [internal/controller/usage_config_test.go](../../internal/controller/usage_config_test.go) | The cost estimate against the real EU01 list price, formatting, the effective-config resolution, and the measurement skew |
 | [internal/controller/metrics_test.go](../../internal/controller/metrics_test.go) | The metric collector output, including the two circuit metrics |
+| [internal/controller/sakey_reload_test.go](../../internal/controller/sakey_reload_test.go) | `SAKeyReloadObserver` with no I/O at all: that all three `result` label values exist from the first scrape, that the failing gauge goes to `1` on a rejection and back to `0` both on a successful swap and on the file reverting to the key already in use, that the expiry gauge is **absent** rather than zero for a key with no `validUntil` — and goes away again when a key with one is replaced by a key without — that the loaded-at gauge is seeded at startup rather than only at the first rotation, and that a validated swap resets the breaker while a rejection never touches it |
 | [internal/controller/bucket_controller_test.go](../../internal/controller/bucket_controller_test.go) | Reconciler helpers without a reconcile: name decision and freezing, group naming, `bucketsForSecret`, the managed/admin Secret predicates |
 | [internal/stackitfake/fake_test.go](../../internal/stackitfake/fake_test.go) | The fake's own routing and inspection helpers — the fake is test infrastructure and is itself tested |
 
@@ -87,6 +89,7 @@ beyond localhost.
 | [reconciler_usage_test.go](../../internal/controller/reconciler_usage_test.go) | Measurement: the two switches, the interval floor, the object cap, versions, the failure path, and every skip condition |
 | [stackit/client_fake_test.go](../../stackit/client_fake_test.go) | The control-plane wrapper against the fake: service enablement, bucket lifecycle, groups and keys, and `TestBucketExistsOnlyTrustsAStructuredAnswer` — the table-driven proof that `BucketExists` says "no" only for the API's own structured JSON `404` |
 | [stackit/s3_fake_test.go](../../stackit/s3_fake_test.go) | The data-plane wrapper: policy and tag round-trips, emptiness, `WipeBucket` |
+| [stackit/keyreload_test.go](../../stackit/keyreload_test.go) | The whole service-account key reload contract: the unchanged-hash short-circuit costing no call, a proven candidate becoming live, all eleven ways a candidate can be wrong — empty file, unparsable JSON, no `projectId`, a foreign `projectId`, unusable RSA material, a structured `400` from the token endpoint, a `5xx` from it, a gateway page in front of it, a `403` on the probe itself, an unreachable API, a deleted file — leaving the running key's hash and the project it names exactly as they were, which of those are classified definitive, the two retry schedules and the reset when the file content changes, the `Repeated` flag behind logging a rejection once rather than once per poll, and the poll loop itself starting, applying and stopping on context cancel. See [the offline seam](#the-offline-seam-the-key-reload-suite-uses) below |
 
 </details>
 
@@ -101,6 +104,43 @@ Two test-infrastructure notes that are easy to trip over:
   [reconciler_circuit_test.go](../../internal/controller/reconciler_circuit_test.go)
   seeds `fakeClock` at wall-clock `now` so cooldowns can be skipped without the
   status timestamps drifting away from real time.
+
+#### The offline seam the key-reload suite uses
+
+Everything else offline stops at the edge of authentication — the fake answers any caller and
+proves nothing about a credential ([What it deliberately does not model](#what-it-deliberately-does-not-model)).
+The reload suite has to go one step further, because the property under test is precisely *can this
+key mint a token*, and it does it with two seams that are worth knowing before you add a case.
+
+**The key flow runs for real, against a local token endpoint.** `buildSAKey` in
+[keyreload_test.go](../../stackit/keyreload_test.go) generates a throwaway RSA key and renders a
+structurally valid service-account key document, and `withTokenEndpoint` writes the URL of an
+`httptest` server into `credentials.tokenEndpoint`. The SDK reads that field whenever no explicit
+token URL is configured, so the whole flow — signing the assertion with the generated key,
+exchanging it, parsing the access token — really executes, offline. That is what lets one server
+method stand for each provider answer that matters: `grant` for a key the provider accepts,
+`refuse` for the structured `400 invalid_grant` of a revoked one, and `gatewayPage` for an
+intermediary's HTML, which must *not* condemn the key
+([provider-errors.md](provider-errors.md#a-revoked-service-account-key-is-a-token-endpoint-400)).
+The token itself is a JWT the SDK only ever parses unverified for its expiry, so `fakeAccessToken`
+does not sign it — signing would prove nothing and pull a JWT library into the package.
+
+**The control plane is still the ordinary in-memory fake, and a candidate reaches it because the
+endpoint now lives on the `Client`.** `newReloadEnv` builds with `NewClientWithEndpoint`, which
+remembers the endpoint; `newKeyFlowAPIClient` applies it to every client it builds, including the
+candidate of a reload, so a validated swap ends up talking to the same `stackitfake` server the
+initial client did. That field exists for this and nothing else. One asymmetry follows from it and
+is easy to trip over: the client `NewClientWithEndpoint` returns installs **no** retrying transport
+(deliberately, so a `FailNext` injection is not consumed by a retry), while a candidate built by a
+reload does get one — `newKeyFlowAPIClient` always makes a fresh `retryTransport`. So a `FailNext`
+arming a `5xx` on a read, armed *after* a swap, would be retried away before it reached the caller,
+where the same injection before the swap reaches it. Inferred from reading both constructors and
+`retryableResult`; no test exercises the combination, and none needs to today.
+
+Tests drive `KeyReloader.tick` directly rather than waiting on the ticker, so the backoff is
+asserted in polls rather than slept through; the two that do exercise `Start`
+(`TestKeyReloaderStartAppliesAChangedKey`, `TestKeyReloaderStartStopsOnContextCancel`) use a short
+interval and a channel.
 
 ### Layer 3 — envtest against a real API server
 
@@ -122,10 +162,23 @@ What only a real API server can prove, and therefore what belongs here:
 | [grant_read_access_test.go](../../test/integration/grant_read_access_test.go) | The CEL rule compiles and rejects a self-grant, and the `listMapKey` constraint rejects a duplicate entry — a CEL expression that fails to compile makes the whole CRD uninstallable |
 | [bucket_usage_test.go](../../test/integration/bucket_usage_test.go) | The `spec.usage` block round-trips, an omitted block stays nil, and an invalid interval is refused by the pattern |
 | [allow_recreate_test.go](../../test/integration/allow_recreate_test.go) | `spec.allowRecreate` round-trips through the generated schema, reads back as `false` when omitted, and stays mutable after creation — unlike `spec.bucketName` |
+| [sa_key_reload_test.go](../../test/integration/sa_key_reload_test.go) `TestSAKeyReloaderRunsOnAStandbyReplica` | That the key poller runs on a replica that is **not** the leader ([ADR 0016 D13](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)) — only a real API server can hold a real Lease |
 
 The shared client is the manager's **cached** client, so every read after a write
 polls with `require.Eventually` rather than racing the informer. The measurement
 controller is not registered here; measurement has no envtest coverage.
+
+The standby-replica case is the one test in this package that starts a **second**
+manager, with leader election on, against the same control plane —
+`suite_test.go` exports `testCfg` for exactly that. What makes it prove
+something is the setup rather than the assertion: a Lease of the same name is
+created first, held by the identity `another-replica` for an hour, so the
+manager under test cannot win it. Without that the manager would become leader
+and every runnable would start regardless, and the test would pass while
+proving nothing — so it also asserts, after the poll has been observed, that
+`mgr.Elected()` has not fired. The key path deliberately points at a file that
+does not exist: what is under test is that the poll happens at all, not what it
+concludes.
 
 ### Layers 4 and 5 — the real provider API
 
@@ -155,10 +208,23 @@ See [The cloud end-to-end run](#the-cloud-end-to-end-run).
 ### Layer 8 — chart render assertions
 
 [test/helm/render_test.go](../../test/helm/render_test.go) shells out to
-`helm template` and asserts on the rendered user-facing ClusterRoles. It exists
-because the Kind install only ever exercises the default values: the
-non-default combination (`bucketRoles.create=false`) and the exact rule shape
-are visible to nothing else. It is the only suite whose *test code* shells out to
+`helm template` and asserts on the rendered user-facing ClusterRoles and on the
+manager container's arguments. It exists because the Kind install only ever
+exercises the default values: the non-default combination
+(`bucketRoles.create=false`) and the exact rule shape are visible to nothing
+else.
+
+`TestServiceAccountKeyArgsRenderTogether` is the same argument applied to the
+service-account key branch, which the CI Kind run never renders because it
+installs in skeleton mode. It pins that `--stackit-sa-key-path` and
+`--stackit-sa-key-reload-interval` appear together once
+`stackit.serviceAccountKey.secretName` is set, that the shipped default reaches
+the operator as `30s` rather than being dropped, and that skeleton mode renders
+**neither** — a reload interval without a key is meaningless. Without it the
+whole branch, including the interval a rotation depends on, would ship
+untested.
+
+It is the only suite whose *test code* shells out to
 a binary it expects to already be on `PATH` — `exec.Command("helm", …)` in
 [render_test.go](../../test/helm/render_test.go). The envtest binaries of layer 3
 are fetched by the make target, and the Kind, Helm and Docker of layers 6 and 7
@@ -487,6 +553,11 @@ Not exhaustive — the rules where the choice of layer is itself the point.
 | [ADR 0013 D2, D4](../adr/0013-a-provider-outage-is-held-fleet-wide.md) — trip on absence of success, no provider call while open | Offline: `TestProviderCircuitStopsHammeringTheProvider`, `TestProviderCircuitIgnoresAnIsolatedBrokenBucket` |
 | [ADR 0014 D3](../adr/0014-bucket-size-is-measured-by-a-separate-controller.md) — a failed measurement never surfaces as a reconcile error | Offline: the `measure` helper fails the test if `Reconcile` returns any error at all |
 | [ADR 0015 D3, D4](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) — only the provider's own structured `404` may be read as "the bucket is gone" | Offline, once per level: `TestBucketExistsOnlyTrustsAStructuredAnswer` pins the client wrapper, and `TestUnreachableProviderNeverTripsTheGuard` pins that the reconciler holds instead of reporting when the same kinds of failure arrive. Nothing real-API covers either |
+| [ADR 0016 D2, D3](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) — change is a content hash, and nothing is swapped before one live authenticated call succeeds | Offline: `TestReloadUnchangedContentIsANoOp` (an unchanged file costs no API call) and the whole `TestReloadRejectsWithoutDisplacingTheRunningKey` table, where each row corrupts one step and asserts the running key is still in place |
+| [ADR 0016 D6, D7](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) — the breaker reset, and the two retry schedules | Offline, split across the two packages: `TestSAKeyReloadResetsTheBreaker` / `TestSAKeyRejectionNeverTouchesTheBreaker` for the breaker half, `TestReloadBacksOffOnARepeatedDefinitiveRejection` and `TestReloadRecoversAfterTheKeyIsFixed` for the schedules. That the validation call ignores `Allow()` is structural — the reload path holds no breaker reference — and is pinned by nothing |
+| [ADR 0016 D10](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) — the expiry gauge is absent, not zero, when the key carries no `validUntil` | Offline: `TestSAKeyValidUntilGaugeIsAbsentWithoutAnExpiry`, which is also the only place the *present* case is reached at all — verified on 2026-09-19, neither `account-1.json` nor `account-2.json` carries a `validUntil`, so every other run is on the absent path whether it means to be or not |
+| [ADR 0016 D12](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) — skeleton mode does not poll and exports none of the series | Offline: `TestSetupSAKeyReloadStaysOff` for the wiring, and `TestServiceAccountKeyArgsRenderTogether` (layer 8) for the chart half, which asserts skeleton mode renders neither argument |
+| [ADR 0016 D13](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) — the reload runs on every replica, not only the leader | envtest: `TestSAKeyReloaderRunsOnAStandbyReplica`, with the Lease held by another identity. `TestKeyReloaderNeedsNoLeaderElection` only pins the method's return value; nothing short of a real manager proves the manager honours it |
 
 ## What CI runs
 
@@ -561,6 +632,28 @@ mechanism covered only by them reads as uncovered.
   passes `-timeout=40m` (`# default`, line 102). The header values are suggestions
   in a comment that a person retypes, not a default the tooling applies — which is
   exactly why they drifted.
+- **Nothing in this repository runs the tests with `-race`, and the key-reload
+  suite is where that costs most.** Verified on 2026-09-19: `-race` occurs in no
+  make target and in no workflow. `TestReloadSwapIsAtomicUnderConcurrentReaders`
+  spawns readers against a client while it is swapped, which is a structural
+  check and a smoke test in CI and nothing more — the detector that would
+  actually prove the swap is never switched on. It was run by hand with
+  `go test -race ./stackit/... ./internal/controller/...` on 2026-09-19 and
+  passed; nothing repeats that, and the test's own comment says so.
+- **The live rotation of a real key has not been done, and the repository holds
+  no material for it.** Every case of the reload is exercised offline against
+  the fake and a local token endpoint. Rotating a key of the *working* project
+  needs a **second** key for project 1, issued by hand: `account-2.json` is
+  deliberately a different project — `TestLoadAccount` asserts exactly that, and
+  the assertion is load-bearing for the cross-project tests — so it cannot stand
+  in for a rotation. Until that run happens, ADR 0016's own "not verified"
+  entries stand.
+- **No end-to-end suite reads the operator's metrics endpoint.** Verified on
+  2026-09-19 by grepping [test/e2e/](../../test/e2e/): nothing there scrapes
+  `/metrics` or the metrics port at all. None of the four `sa_key` series is
+  therefore covered by the Kind suites, and neither is their *absence* in
+  skeleton mode — the chart-render case pins that no argument is rendered, not
+  that no series is exported.
 - **The vanished-bucket guard has never met the real API.** The structured `404`,
   the gateway page carrying one, the empty and truncated bodies, the transport
   failure and the recovery are all reproduced offline against the fake, whose

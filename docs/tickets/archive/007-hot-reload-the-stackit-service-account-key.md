@@ -1,6 +1,17 @@
 # Ticket: hot-reload the StackIT service-account key
 
-**Status:** Draft — design decided, waiting on its precondition. Not approved for implementation.
+**Status:** CLOSED on 2026-09-19. Implemented and archived; the decision now lives in
+[ADR 0016](../../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) and the
+mechanism in [docs/developer/service-account-key-reload.md](../../developer/service-account-key-reload.md).
+This file is history and is never the source of a current rule — two of its own findings were wrong
+and were corrected during implementation: the `CloseIdleConnections()` of A3 is a silent no-op as
+written (the retired `http.Client`'s transport is the SDK's key flow by then, which does not
+implement the method), and A2.1's "empty → reject" is load-bearing rather than belt-and-braces,
+because an empty candidate does not fail cleanly in the SDK but falls through to its ambient
+credential search. The live rotation of Q2 was **not** done and is carried in that ADR's residual
+risks. Everything below is the design as it stood before implementation.
+
+**Original status:** Draft — design decided, waiting on its precondition. Not approved for implementation.
 Q1, Q2, Q3 and Q12 answered in review on 2026-09-19. Q12 replaced the project-binding idea with a
 vanished-bucket guard that is proposed as its own ticket and precondition. Q13–Q17 answered in a
 second review on 2026-09-19; no question is open. Sequencing confirmed there: the vanished-bucket
@@ -21,20 +32,20 @@ Verified in this tree on 2026-09-19:
 
 | # | Finding | Evidence |
 |---|---|---|
-| 1 | Key path is consumed once in `main()` | [cmd/main.go:263-268](../../cmd/main.go#L263-L268) — `stackit.LoadAccount` then `stackit.NewClient`, both outside any loop |
-| 2 | `LoadAccount` reads the file only for `projectId` | [stackit/client.go:36-61](../../stackit/client.go#L36-L61) |
+| 1 | Key path is consumed once in `main()` | [cmd/main.go:263-268](../../../cmd/main.go#L263-L268) — `stackit.LoadAccount` then `stackit.NewClient`, both outside any loop |
+| 2 | `LoadAccount` reads the file only for `projectId` | [stackit/client.go:36-61](../../../stackit/client.go#L36-L61) |
 | 3 | The SDK snapshots the key material at client construction | core v0.26.0 `auth/auth.go:377` (`os.ReadFile` into `cfg.ServiceAccountKey`), `auth/auth.go:176-231` (`KeyAuth` unmarshals, then `KeyFlow.Init`), `clients/key_flow.go:134-170` + `validate()` (PEM parsed into `c.privateKey`) |
 | 4 | Token refresh signs with the in-memory key; the file is never re-read | `clients/key_flow.go` `GetAccessToken` → `recreateAccessToken` → `createAccessToken` → `generateSelfSignedJWT` |
-| 5 | No file watching anywhere in the operator | `grep -rn fsnotify --include='*.go' .` → 0 hits; `fsnotify` is only an indirect dependency ([go.mod](../../go.mod)) |
-| 6 | The Helm mount itself is fine | [deployment.yaml:113-127](../../deploy/helm/stackit-s3-provisioner/templates/deployment.yaml#L113-L127) — whole-Secret volume, no `subPath`, so kubelet **does** refresh the file inside the container. The staleness is purely in the process. |
+| 5 | No file watching anywhere in the operator | `grep -rn fsnotify --include='*.go' .` → 0 hits; `fsnotify` is only an indirect dependency ([go.mod](../../../go.mod)) |
+| 6 | The Helm mount itself is fine | [deployment.yaml:113-127](../../../deploy/helm/stackit-s3-provisioner/templates/deployment.yaml#L113-L127) — whole-Secret volume, no `subPath`, so kubelet **does** refresh the file inside the container. The staleness is purely in the process. |
 | 7 | `helm upgrade` with a changed key Secret does not roll the pods | no `checksum/...` pod annotation in the Deployment template |
-| 8 | The admin S3 credentials are cached in-process too | [bucket_controller.go:1435-1441](../../internal/controller/bucket_controller.go#L1435-L1441) — `r.admin` is memoized after the first read of the operator Secret |
+| 8 | The admin S3 credentials are cached in-process too | [bucket_controller.go:1435-1441](../../../internal/controller/bucket_controller.go#L1435-L1441) — `r.admin` is memoized after the first read of the operator Secret |
 
 ### What this costs today
 
 A revoked key surfaces as `400 invalid_grant` from the token endpoint, which
-[`stackit.ProviderRefused`](../../stackit/errors.go#L60) classifies as a **definitive** refusal.
-`holdsReadyThrough` therefore refuses to hold Ready ([bucket_controller.go:1646](../../internal/controller/bucket_controller.go#L1646)):
+[`stackit.ProviderRefused`](../../../stackit/errors.go#L60) classifies as a **definitive** refusal.
+`holdsReadyThrough` therefore refuses to hold Ready ([bucket_controller.go:1646](../../../internal/controller/bucket_controller.go#L1646)):
 every Bucket in the cluster drops to `Failed` at once, with no degraded grace. After
 `--provider-circuit-threshold` (default 3) consecutive failures the circuit opens and the operator
 probes with up to a 5-minute cooldown.
@@ -42,7 +53,7 @@ probes with up to a 5-minute cooldown.
 None of that heals, whatever the file on disk says, until somebody runs `kubectl rollout restart`.
 
 One piece of good news for the design: once a *valid* key is loaded, the fleet recovers on its own.
-Failed reconciles requeue through [`bucketRateLimiter`](../../internal/controller/bucket_controller.go#L1798)
+Failed reconciles requeue through [`bucketRateLimiter`](../../../internal/controller/bucket_controller.go#L1798)
 (1s → 15min cap) and the drift resync runs every 10 minutes, so no extra re-enqueue machinery is
 strictly required — see [Q5](#q5--answered-the-existing-requeue-mechanics-are-the-recovery-path).
 
@@ -64,7 +75,7 @@ strictly required — see [Q5](#q5--answered-the-existing-requeue-mechanics-are-
 | Option | What it is | Cost | Availability impact |
 |---|---|---|---|
 | **A — in-process swap** (recommended) | Watch the file, validate a candidate key, atomically replace the client inside `stackit.Client` | ~200 LOC + tests, new concurrency in a hot path | none; reconciles keep running |
-| **B — validated self-restart** | Watch the file, validate a candidate key, then cancel the manager context and exit 0 so the kubelet restarts the container | ~50 LOC | seconds of downtime per rotation; leader lease is released on cancel already (`LeaderElectionReleaseOnCancel: true`, [cmd/main.go](../../cmd/main.go)) |
+| **B — validated self-restart** | Watch the file, validate a candidate key, then cancel the manager context and exit 0 so the kubelet restarts the container | ~50 LOC | seconds of downtime per rotation; leader lease is released on cancel already (`LeaderElectionReleaseOnCancel: true`, [cmd/main.go](../../../cmd/main.go)) |
 | ~~**C — Helm `checksum/secret` annotation**~~ (dropped, [Q10](#q10--answered-no-checksum-annotation)) | Pod annotation over the key Secret so `helm upgrade` rolls the Deployment | 2 lines | one rolling update; **not** hot reload, and does nothing when the Secret is managed outside the chart (ESO, SOPS, manual) |
 
 B is strictly simpler and is provably consistent — every process-scoped cache (`r.admin`,
@@ -138,13 +149,13 @@ and a failed one simply requeues. `region` stays immutable (it is a flag, not pa
 Two details worth writing down:
 
 * The retired `*http.Client` keeps idle keep-alive connections for `idleConnTimeout` (30s,
-  [stackit/retry.go](../../stackit/retry.go)). Calling `CloseIdleConnections()` on the retired state
+  [stackit/retry.go](../../../stackit/retry.go)). Calling `CloseIdleConnections()` on the retired state
   is tidy and costs one line — hence `http` in `clientState`.
 * `config.BackgroundTokenRefreshContext` is **not** set by this operator, so `KeyFlow.Init` starts no
   background goroutine (`clients/key_flow.go:160`). If that ever changes, every swap would leak a
   refresher goroutine. Keep it unset, or cancel it on retire.
 
-`NewClientWithEndpoint` (the stackitfake path, [stackit/client.go:109](../../stackit/client.go#L109))
+`NewClientWithEndpoint` (the stackitfake path, [stackit/client.go:109](../../../stackit/client.go#L109))
 must keep working unchanged.
 
 ### A4 — Caches on reload
@@ -179,13 +190,13 @@ Log the `projectId` and the SA issuer on a successful reload. Never the file con
 
 ### A7 — Documentation touched in the same change
 
-[README.md](../../README.md) (the new flag and the chart value, in the reference table that is their
-only home), [docs/operations/configuration.md](../operations/configuration.md) (what the setting does
+[README.md](../../../README.md) (the new flag and the chart value, in the reference table that is their
+only home), [docs/operations/configuration.md](../../operations/configuration.md) (what the setting does
 and that it is the first thing here that is hot-reloaded),
-[docs/operations/credentials.md](../operations/credentials.md) (the rotation procedure an operator
-follows), [docs/security/credentials-and-secrets.md](../security/credentials-and-secrets.md) (what a
+[docs/operations/credentials.md](../../operations/credentials.md) (the rotation procedure an operator
+follows), [docs/security/credentials-and-secrets.md](../../security/credentials-and-secrets.md) (what a
 write to the key Secret now does, per the security considerations below),
-[docs/developer/stackit-api.md](../developer/stackit-api.md) (the SDK finding that the key is
+[docs/developer/stackit-api.md](../../developer/stackit-api.md) (the SDK finding that the key is
 snapshotted at client construction) and the Helm values. The decision itself goes into this ticket's
 own ADR, written with the implementation.
 
@@ -246,7 +257,7 @@ What the restart path actually does today, with a foreign key in place:
    belong to a credentials group in the **old** project.
 2. `ensureBucket` asks `HasBucket(ctx, ProjectID(), name)` against the **new** project → `false` →
    `CreateBucket`. Whether that succeeds depends on whether bucket names are per-project or
-   per-region, which is open question Q4 in [CLAUDE.md](../../CLAUDE.md) and still unanswered.
+   per-region, which is open question Q4 in [CLAUDE.md](../../../CLAUDE.md) and still unanswered.
 3. If it succeeds, the operator has created an empty bucket in a foreign project, tagged it as its
    own, and will then fail on the data plane, because the old admin key has no rights there.
 
@@ -284,7 +295,7 @@ sit out up to `--provider-circuit-max-cooldown` (5 min) after the fix, despite t
 fresh proof that the API answers.
 
 Accepted cost: the breaker gains a second writer outside the reconcile loop. `Success()` is already the
-idempotent "a call worked" signal ([breaker.go:172](../../internal/controller/breaker.go#L172)), so the
+idempotent "a call worked" signal ([breaker.go:172](../../../internal/controller/breaker.go#L172)), so the
 reload uses the existing contract rather than reaching into breaker state.
 
 ### Q5 — ANSWERED: the existing requeue mechanics are the recovery path
@@ -296,14 +307,14 @@ resync, not by the rate-limiter cap.
 
 Rejected: a `source.Channel` that enqueues every Bucket on reload. It buys minutes at the price of new
 wiring in `SetupWithManager` and a thundering herd against an API that has just come back — the exact
-pattern the circuit breaker and the workqueue rate limiter were built to prevent ([ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md)).
+pattern the circuit breaker and the workqueue rate limiter were built to prevent ([ADR 0013](../../adr/0013-a-provider-outage-is-held-fleet-wide.md)).
 
 SC4 is therefore satisfied by existing machinery, and the documented worst case is one drift-resync
 interval.
 
 ### Q8 — ANSWERED: own ticket, different problem
 **Decision (2026-09-19): out of scope here.**
-[recover from an admin S3 key that was deleted out of band](006-recover-from-a-deleted-admin-s3-key.md)
+[recover from an admin S3 key that was deleted out of band](../006-recover-from-a-deleted-admin-s3-key.md)
 carries it. The two look alike and are not: the SA key is rotated from outside and lives in a file, so
 watching the file is the fix; the admin S3 key is minted by the operator and only breaks when somebody
 deletes it in the cloud, which no file watch can see.
@@ -324,7 +335,7 @@ deployment configuration**, because an external rotation mechanism writes it. Ev
 or a Helm value, and changing one already rolls the pod.
 
 Worth restating in the ADR even though it follows: `--ownership-name` is part of the bucket ownership
-key ([cmd/main.go](../../cmd/main.go) documents the warning), so reloading it at runtime would make the
+key ([cmd/main.go](../../../cmd/main.go) documents the warning), so reloading it at runtime would make the
 operator treat its own buckets as foreign. It is not merely "not reloadable" — it is the example of why
 the contract is narrow.
 
@@ -364,9 +375,9 @@ This needs no remembered identity, no new configuration, and no new state: the e
 field the operator already writes. It also survives restarts for free, because the CR does.
 
 `status.resolvedBucketName` is the right predicate and the annotation is not:
-[bucket_controller.go:375](../../internal/controller/bucket_controller.go#L375) writes the status field
+[bucket_controller.go:375](../../../internal/controller/bucket_controller.go#L375) writes the status field
 only on the success path, together with `credentialsGroupID` and `accessKeyID`, while
-`persistResolvedName` ([bucket_controller.go:1951-1960](../../internal/controller/bucket_controller.go#L1951-L1960))
+`persistResolvedName` ([bucket_controller.go:1951-1960](../../../internal/controller/bucket_controller.go#L1951-L1960))
 stamps the `stackit-bucket.gtrfc.com/resolved-bucket-name` annotation *before* any cloud resource
 exists. Only the status field proves a completed provisioning round.
 
@@ -376,11 +387,11 @@ The same code path is reachable today without any key rotation: delete a bucket 
 StackIT console. Reading the flow (**derived from the code, not yet reproduced** — an offline
 reproduction against `stackitfake` is the first acceptance test):
 
-1. `ensureBucket` → `HasBucket` false → `CreateBucket` ([bucket_controller.go:569-585](../../internal/controller/bucket_controller.go#L569-L585)),
+1. `ensureBucket` → `HasBucket` false → `CreateBucket` ([bucket_controller.go:569-585](../../../internal/controller/bucket_controller.go#L569-L585)),
    and the new bucket is stamped with this operator's ownership tags. `freshBucket` is now `true`.
 2. `resolveWorkloadGroup` finds no group tag and no policy on the fresh bucket, so it falls through to
    creating one — and `guardGroupCreate` returns `nil` immediately when `freshBucket` is set
-   ([bucket_controller.go:914-918](../../internal/controller/bucket_controller.go#L914-L918)), so the
+   ([bucket_controller.go:914-918](../../../internal/controller/bucket_controller.go#L914-L918)), so the
    ADR 0002 D8 guard ("do not create a second group while the group in status still exists") does not
    apply here.
 3. The new group has no keys, so `ensureAccessKeyAndSecret` mints one and **overwrites the workload
@@ -409,7 +420,7 @@ Confirmed in review on 2026-09-19: a bucket deleted by a third party puts the CR
 so the incident is visible, and an explicit annotation overrides that to authorize a re-creation.
 
 Carried out of this ticket into its own work, which **landed on 2026-09-19** as
-[ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md):
+[ADR 0015](../../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md):
 the guard, the standing `spec.allowRecreate` opt-in and delete-and-re-apply as the way to re-create
 once. It was a **precondition** of hot reload, not a dependent of it: it stood on the
 out-of-band-deletion bug alone, and it is what lets this ticket's ADR describe the project check
@@ -435,7 +446,7 @@ record.
 
 ### Q14 — ANSWERED: the vanished-bucket guard lands first
 **Decision (2026-09-19): confirmed — the vanished-bucket guard is implemented before this ticket.**
-It has since landed, as [ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md).
+It has since landed, as [ADR 0015](../../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md).
 Put to the user again because the dependency is one of
 documentation honesty, not of code: the restart-with-a-foreign-key path exists today and hot reload
 does not widen it (the in-process project check rejects a foreign key where today's restart adopts
@@ -449,7 +460,7 @@ the exception "except the single validation call of a candidate service-account 
 the user in this review. Reason: the one scenario where it matters is an old key revoked before the
 new one arrived — the circuit is then open, tripped by `400 invalid_grant` (verified: a structured
 refusal runs through `fail()` and therefore `Breaker.Failure()`,
-[bucket_controller.go:1559](../../internal/controller/bucket_controller.go#L1559)). Obeying `Allow()`
+[bucket_controller.go:1559](../../../internal/controller/bucket_controller.go#L1559)). Obeying `Allow()`
 would delay the reload by up to `--provider-circuit-max-cooldown` while reconcile probes with the dead
 key keep doubling the cooldown. The probe is one call per distinct file hash on the schedule of
 [Q16](#q16--answered-a-rejected-candidate-is-retried-with-a-backoff), which cannot drive a provider
@@ -480,7 +491,7 @@ could have healed); retrying every tick regardless (the rate-limit exposure of A
 
 ### Q17 — ANSWERED: the key's `validUntil` is exported as a timestamp gauge
 **Decision (2026-09-19): in scope.** `LoadAccount` reads `validUntil` (parsed by the SDK today,
-read by nothing — [docs/developer/stackit-api.md](../developer/stackit-api.md)) and the operator
+read by nothing — [docs/developer/stackit-api.md](../../developer/stackit-api.md)) and the operator
 exports it as `stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds`, an absolute Unix time,
 present only when the file carries the field, re-set on every swap. Two `PrometheusRule` entries
 compute the remaining lifetime in the rule — `<gauge> - time() < 14 * 86400` (warning),
@@ -500,11 +511,11 @@ key was checked.
 
 ## References
 
-* [cmd/main.go](../../cmd/main.go) — startup wiring, skeleton mode, metrics registration
-* [stackit/client.go](../../stackit/client.go) — `LoadAccount`, `NewClient`, `serviceReady`
-* [stackit/retry.go](../../stackit/retry.go) — the transport that must be carried across a swap
-* [stackit/errors.go](../../stackit/errors.go) — `ProviderRefused`, the classification that makes a revoked key fatal
-* [internal/controller/bucket_controller.go](../../internal/controller/bucket_controller.go) — `ensureAdmin`, `holdsReadyThrough`, `bucketRateLimiter`, `SetupWithManager`
-* [internal/controller/breaker.go](../../internal/controller/breaker.go) — `Allow` / `Failure` / `Success`
-* [deploy/helm/stackit-s3-provisioner/templates/deployment.yaml](../../deploy/helm/stackit-s3-provisioner/templates/deployment.yaml) — the key mount
-* [docs/adr/README.md](../adr/README.md) — ADR format and the obligation
+* [cmd/main.go](../../../cmd/main.go) — startup wiring, skeleton mode, metrics registration
+* [stackit/client.go](../../../stackit/client.go) — `LoadAccount`, `NewClient`, `serviceReady`
+* [stackit/retry.go](../../../stackit/retry.go) — the transport that must be carried across a swap
+* [stackit/errors.go](../../../stackit/errors.go) — `ProviderRefused`, the classification that makes a revoked key fatal
+* [internal/controller/bucket_controller.go](../../../internal/controller/bucket_controller.go) — `ensureAdmin`, `holdsReadyThrough`, `bucketRateLimiter`, `SetupWithManager`
+* [internal/controller/breaker.go](../../../internal/controller/breaker.go) — `Allow` / `Failure` / `Success`
+* [deploy/helm/stackit-s3-provisioner/templates/deployment.yaml](../../../deploy/helm/stackit-s3-provisioner/templates/deployment.yaml) — the key mount
+* [docs/adr/README.md](../../adr/README.md) — ADR format and the obligation

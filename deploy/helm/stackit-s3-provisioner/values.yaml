@@ -380,6 +380,36 @@ monitoring:
       # which is exactly the state in which a size-based alert under-reports.
       usageMeasurementTruncated:
         enabled: true
+      # saKeyReloadFailing fires (warning) while the operator keeps REJECTING the
+      # service-account key on disk: it does not parse, it names a different
+      # StackIT project, or the provider will not mint a token with it. Nothing
+      # is broken yet — the operator carries on with the key it already holds —
+      # and that is precisely the danger: a rotation that silently failed is
+      # indistinguishable from a healthy operator until the old key expires.
+      saKeyReloadFailing:
+        enabled: true
+      # saKeyExpiring fires (warning) when the key in use runs out within
+      # leadTimeDays. The remaining lifetime is computed in the rule from the
+      # key's own validUntil, which STACKIT sets 90 days after issue.
+      #
+      # The series is ABSENT for a key file that carries no validUntil, so this
+      # alert then never fires at all rather than failing loudly. If your keys
+      # have no expiry stamped into them, this alert gives you nothing and the
+      # rotation deadline has to be tracked elsewhere.
+      saKeyExpiring:
+        enabled: true
+        # leadTimeDays is how far ahead of expiry the warning starts. It has to
+        # outlast the slowest rotation path you actually have, issuing the new
+        # key included. Must stay an integer.
+        leadTimeDays: 14
+      # saKeyExpiringCritical is the same measurement at a shorter lead time and
+      # critical severity: at this point the rotation has to happen now, or every
+      # Bucket in the cluster drops to Failed the moment the key dies.
+      saKeyExpiringCritical:
+        enabled: true
+        # leadTimeDays as above, and well below saKeyExpiring.leadTimeDays. Both
+        # alerts fire below this threshold; route them apart by severity.
+        leadTimeDays: 3
 
 # stackit configures the operator's binding to a StackIT project.
 stackit:
@@ -391,3 +421,25 @@ stackit:
   serviceAccountKey:
     secretName: ""
     secretKey: sa-key.json
+    # reloadInterval is how often the operator re-reads the mounted key file and,
+    # when the content has changed, proves the new key before putting it to work.
+    #
+    # This is the ONLY input the operator picks up without a pod restart, because
+    # it is the only one an external rotation changes without touching this chart.
+    # The full window is longer than the interval: kubelet itself needs up to
+    # about 90 seconds to refresh a Secret volume inside the container, and after
+    # a successful swap the fleet recovers within one driftResyncInterval.
+    #
+    # A candidate that does not parse, names a different StackIT project, or
+    # cannot mint a token is REJECTED and the running key is kept — which is what
+    # stops a truncated write or an already-revoked key from taking down a healthy
+    # operator. A rotation that is being rejected looks exactly like a healthy
+    # operator until the old key expires, so watch the saKeyReloadFailing and
+    # saKeyExpiring alerts below.
+    #
+    # Must be a Go duration string WITH A UNIT (e.g. "30s", "2m"); a bare number
+    # like 30 is rejected and crash-loops the operator at startup. Set to "0" to
+    # switch the reload off and restore the restart-only behaviour exactly; none
+    # of the sa_key metrics is then exported.
+    # Details: ../../../docs/operations/credentials.md
+    reloadInterval: "30s"

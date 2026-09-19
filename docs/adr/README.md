@@ -74,7 +74,7 @@ The **State** column is a coarse reading aid, last trued up on 2026-09-19. Each 
 |---|---|---|
 | [0001](0001-a-bucket-only-affects-its-own-namespace.md) | A Bucket only affects its own namespace — its Secret, its grants and its RBAC never reach across one | Implemented |
 | [0003](0003-workloads-are-isolated-by-an-explicit-deny-policy.md) | Workloads are isolated from each other by an explicit deny policy, because the provider's default is open | Implemented |
-| [0005](0005-the-operator-serves-one-project-in-one-region.md) | One operator deployment serves one project in one region, bound by the mounted service-account key | Implemented, except that replacing the key needs a restart, nothing checks which project a deployment is bound to, and the minimal role is still unnamed |
+| [0005](0005-the-operator-serves-one-project-in-one-region.md) | One operator deployment serves one project in one region, bound by the mounted service-account key | Implemented; D8 amended by [0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) so the credential is re-read at runtime while project and region stay fixed. Open: nothing checks which project a deployment is bound to, and the minimal role is still unnamed |
 | [0008](0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) | A read grant is declared by the Bucket that owns the data, never claimed by the reader | Implemented |
 
 ### Credentials and identity
@@ -99,8 +99,9 @@ The **State** column is a coarse reading aid, last trued up on 2026-09-19. Each 
 | ADR | Decision (one line) | State |
 |---|---|---|
 | [0012](0012-ready-describes-the-last-verified-state.md) | `Ready` describes the last verified state of a bucket, not the last verification attempt | Implemented |
-| [0013](0013-a-provider-outage-is-held-fleet-wide.md) | A provider outage is held fleet-wide, and the trip condition is the absence of success rather than a parsed error | Implemented, except that the size-measurement queue is not held by the breaker |
+| [0013](0013-a-provider-outage-is-held-fleet-wide.md) | A provider outage is held fleet-wide, and the trip condition is the absence of success rather than a parsed error | Implemented; D4 amended by [0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) to exempt the validation call of a candidate key. Open: the size-measurement queue is not held by the breaker |
 | [0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md) | A provisioned bucket that has vanished is reported, never re-created implicitly, unless `spec.allowRecreate` authorises it | Implemented, except that only this guard asks per bucket — provisioning, read grants and teardown still decide existence from a project-wide listing |
+| [0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) | The service-account key is re-read at runtime and swapped only after it is proven, and it is the only runtime-mutable input | Implemented, except that the live rotation against the real API has not been run |
 
 ### Measurement
 

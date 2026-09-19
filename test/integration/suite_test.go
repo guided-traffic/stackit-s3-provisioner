@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -27,6 +28,10 @@ var (
 	testCancel context.CancelFunc
 	k8sClient  client.Client
 	testEnv    *envtest.Environment
+	// testCfg is the control plane's rest config, so a test that needs a
+	// manager of its own — one with leader election on, say — can start one
+	// without a second envtest.
+	testCfg *rest.Config
 )
 
 // TestMain sets up a shared envtest environment, registers schemes, starts the
@@ -50,6 +55,8 @@ func TestMain(m *testing.M) {
 	if err := corev1.AddToScheme(scheme.Scheme); err != nil {
 		panic("failed to register corev1 scheme: " + err.Error())
 	}
+
+	testCfg = cfg
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{Scheme: scheme.Scheme})
 	if err != nil {

@@ -22,7 +22,7 @@ buckets, errors or HTTP — it counts reconcile outcomes and hands back a wait.
 | --- | --- | --- |
 | `Allow() (wait, allowed)` | `Reconcile`, `reconcileDelete` | Reports whether a reconcile may touch the provider now, and if not, how long until the next probe is due |
 | `Failure() (wait, open)` | `fail` | Records one non-definitive failure and reports the state afterwards |
-| `Success()` | `reconcileNormal` (terminal Ready write), `reconcileDelete` (completed teardown) | Resets everything — run counter, cooldown, open window, opened-at |
+| `Success()` | `reconcileNormal` (terminal Ready write), `reconcileDelete` (completed teardown), `SAKeyReloadObserver.Observe` (a validated key swap) | Resets everything — run counter, cooldown, open window, opened-at |
 | `OpenedAt() (time, bool)` | the metrics collector | When the current open episode began |
 
 Its state is four fields:
@@ -121,9 +121,12 @@ The gate sits at the top of the pass, not around individual provider calls. `Rec
 5. `r.Breaker.Allow()`; if not allowed → `holdForProvider`.
 6. `reconcileNormal`.
 
-Everything that talks to the provider lives behind step 5 or inside `reconcileDelete`, so one gate
-per pass is sufficient and nothing downstream re-checks. Two consequences of that ordering are easy
-to miss:
+Everything a *reconcile* does against the provider lives behind step 5 or inside `reconcileDelete`,
+so one gate per pass is sufficient and nothing downstream re-checks. There is exactly one provider
+call in the process that does not pass a gate at all — the service-account key validation, on the
+reload goroutine — and it is
+[the deliberate exception below](#the-one-provider-call-that-ignores-allow). Two consequences of
+the ordering above are easy to miss:
 
 - **A `Bucket` created during an outage still gets its finalizer**, because step 3 precedes the gate
   and only touches the Kubernetes API.
@@ -178,20 +181,71 @@ answers is proof the provider is up, exactly like a provisioning pass.
 `TestProviderCircuitDefersTeardown` asserts zero `DeleteBucket` calls while open, a retained
 finalizer, and completion on the first probe after recovery.
 
-### The two `Success()` call sites
+### The three `Success()` call sites
 
-There are exactly two, and both sit on a path where the provider answered every call of the pass:
-the terminal status write in `reconcileNormal` (right after `clearDegraded` and the `Ready`
-condition) and the completed teardown in `reconcileDelete`. One early return bypasses both: a clone
-still running makes `provisionCredentialsAndClone` return `done=false`, and `reconcileNormal` hands
-that result straight back without reaching the terminal write. It calls neither `Success()` nor
-`Failure()`, so it is neutral — the run is neither advanced nor reset.
+Two of them sit on a path where the provider answered every call of a reconcile pass: the terminal
+status write in `reconcileNormal` (right after `clearDegraded` and the `Ready` condition) and the
+completed teardown in `reconcileDelete`. One early return bypasses both: a clone still running makes
+`provisionCredentialsAndClone` return `done=false`, and `reconcileNormal` hands that result straight
+back without reaching the terminal write. It calls neither `Success()` nor `Failure()`, so it is
+neutral — the run is neither advanced nor reset.
+
+The third sits **outside the reconcile loop entirely**, on the key-reload goroutine:
+`SAKeyReloadObserver.Observe` in
+[`sakey_reload.go`](../../internal/controller/sakey_reload.go) calls `Breaker.Success()` on a
+`ReloadApplied` outcome. That is sound for the same reason the other two are, and for nothing to do
+with keys: a candidate key only ever reaches `ReloadApplied` after `(*Client).reload` has made one
+live authenticated `GetServiceStatus` call with the candidate client and got an answer
+([`stackit/keyreload.go`](../../stackit/keyreload.go)). A successful authenticated call is the exact
+evidence `Success()` waits for — the breaker's discriminator is the presence of a success, not who
+produced it or on whose behalf ([ADR 0013 D2](../adr/0013-a-provider-outage-is-held-fleet-wide.md),
+[ADR 0016 D6](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)). So the
+reset assumes nothing it has not just measured, and it is what makes the fleet recover on the
+reload rather than on the next cooldown probe.
+
+The asymmetry is deliberate: a **failed** validation never calls `Failure()`. The candidate is on
+trial, the provider is not, and counting a rejected key toward a provider outage would trip the
+breaker on a truncated file. `TestSAKeyReloadResetsTheBreaker` and
+`TestSAKeyRejectionNeverTouchesTheBreaker` in
+[`sakey_reload_test.go`](../../internal/controller/sakey_reload_test.go) pin both halves; the
+observer is nil-safe, so a reconciler built with `Breaker: nil` needs no guard here either.
 
 An unresolvable read grant is **not** such an early return, and the difference matters if you are
 reasoning about what closes the breaker. `resolveReadGrants` `continue`s past a grantee it cannot
 resolve — absent, being deleted, without a bucket or a group yet — emits `ReadGrantPending` and lets
 the pass run to the terminal write, which does call `Success()`. That is the right outcome: the
 provider answered every call of that pass, so it is up, and the grant is simply not yet grantable.
+
+### The one provider call that ignores `Allow()`
+
+The key validation does not consult the breaker at all. It is not routed through `Reconcile`, it
+holds no reference to the breaker on the way in — `(*Client).reload` is in package `stackit`, which
+imports nothing above it — and `KeyReloader.tick` runs on its own ticker whatever the circuit is
+doing. That is an exception to
+[ADR 0013 D4](../adr/0013-a-provider-outage-is-held-fleet-wide.md) ("while the breaker is open the
+operator makes no provider call at all"), written into the record by
+[ADR 0016 D6](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md).
+
+Obeying `Allow()` here would be wrong, not merely inconvenient. The scenario the whole reload exists
+for is a revoked key: the breaker is then open **because** the dead key is producing
+`400 invalid_grant` on every reconcile, so a validation that waits for the breaker waits for a
+recovery that cannot happen until the validation succeeds. The cost is up to
+`--provider-circuit-max-cooldown` (`5m` `# default`) of extra outage, spent while reconciles keep
+probing with the key that is known dead and doubling the cooldown further.
+
+The exception is bounded by the shape of the caller rather than by a gate:
+
+| Bound | Where it comes from |
+| --- | --- |
+| At most one validation call per **distinct file content** | `tick` compares the file's SHA-256 against the hash of the loaded key and short-circuits on a match, so an unchanged file costs a `read(2)` and nothing else |
+| At most one per poll interval | the single `time.Ticker` in `KeyReloader.Start`, `--stackit-sa-key-reload-interval` (`30s` `# default`) |
+| A definitively rejected candidate is retried on a doubling schedule, capped at `10m` | `reloadRejectBackoffMax` and the `waitIntervals`/`ticksLeft` bookkeeping in `rejected` ([ADR 0016 D7](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)) |
+| The call cannot wedge the loop, and cannot hold shutdown | `reloadProbeTimeout` (`90s`) wraps the probe context, and `reload` selects on the caller's context so cancellation returns at once. The budget is above the SDK's own one-minute auth timeout on purpose: the key flow's token POST carries no context at all, so a shorter one would expire inside the token fetch and fail a good key ([service-account-key-reload.md](service-account-key-reload.md)) |
+
+The worst case is therefore one token request every ten minutes for a key the provider will never
+accept, which is nothing like the traffic the breaker exists to suppress — and it happens in a state
+that is already alarming through `StackitS3SaKeyReloadFailing`. The mechanism itself is
+[service-account-key-reload.md](service-account-key-reload.md).
 
 ## The fleet-wide workqueue rate limiter
 
@@ -220,10 +274,13 @@ controller-runtime default — see [What is wrong today](#what-is-wrong-today).
 
 ## Transport changes
 
-Both live in [`stackit/retry.go`](../../stackit/retry.go), installed by `NewClient` in
-[`stackit/client.go`](../../stackit/client.go) via `config.WithHTTPClient(retryingHTTPClient())`.
-The SDK takes that client as its *inner* transport, under its own auth round-tripper, so the changes
-cover both API requests and the key-flow token fetch.
+Both live in [`stackit/retry.go`](../../stackit/retry.go), installed by `newKeyFlowAPIClient` in
+[`stackit/client.go`](../../stackit/client.go) — the constructor `NewClient` and every key reload
+share — via `config.WithHTTPClient(&http.Client{Transport: newRetryTransport(…)})`. A **fresh**
+transport per client is deliberate: `objectstorage.NewAPIClient` mutates the `http.Client` it is
+handed, so sharing one would rewire a live client out from under the reconciler. The SDK takes that
+client as its *inner* transport, under its own auth round-tripper, so the changes cover both API
+requests and the key-flow token fetch.
 
 **A rate-limited response is never retried.** `retryableResult` returns true for any transport error
 and for `>= 500` only. Every 4xx is an answer, and `429` is the one answer where repeating the
@@ -240,6 +297,13 @@ dropped, surfacing as `read: connection reset by peer`. Closing first turns thos
 `TestNewRetryTransportDefaults` asserts both the clone and the constant. The source comment is
 explicit that the edge's own idle timeout was never measured: 30s was chosen to sit *below* any
 plausible value, not to match a known one.
+
+The same pool is drained on demand by `retryTransport.CloseIdleConnections`, which a key reload
+calls on the client it retires and on a candidate whose probe failed. It exists because the obvious
+call does nothing: once `objectstorage.NewAPIClient` has replaced the `http.Client`'s `Transport`
+with the key flow's round tripper, `http.Client.CloseIdleConnections` forwards to a transport that
+does not implement the method, and the retired pool would sit idle for the full `idleConnTimeout`
+while the code pretended otherwise.
 
 The retry behaviour itself — 3 attempts, 200ms backoff tripling, GET/HEAD and bodyless requests only —
 is [provider-errors.md](provider-errors.md)'s subject, not this page's.
@@ -326,6 +390,9 @@ disappears and `StackitS3BucketFailed` takes over — which is why `holdForSecon
 | `TestProviderCircuitDefersTeardown` | [`reconciler_circuit_test.go`](../../internal/controller/reconciler_circuit_test.go) | Finalizer retained, no provider call, delete completes on the next probe |
 | `TestRetryTransportDoesNotRetryDefiniteAnswers` | [`stackit/retry_test.go`](../../stackit/retry_test.go) | `429` and every other 4xx are answers, not retries |
 | `TestNewRetryTransportDefaults` | [`stackit/retry_test.go`](../../stackit/retry_test.go) | The 30s idle timeout reaches a *clone* of `http.DefaultTransport` |
+| `TestSAKeyReloadResetsTheBreaker` | [`sakey_reload_test.go`](../../internal/controller/sakey_reload_test.go) | The third `Success()` call site: a validated key swap closes the breaker |
+| `TestSAKeyRejectionNeverTouchesTheBreaker` | [`sakey_reload_test.go`](../../internal/controller/sakey_reload_test.go) | A rejected candidate is neither a success nor a failure — the run is left exactly as it was |
+| `TestSAKeyObserverIsSafeWithoutABreaker` | [`sakey_reload_test.go`](../../internal/controller/sakey_reload_test.go) | The observer's nil-breaker path, so a test reconciler needs no breaker |
 
 `withCircuit` builds the test reconciler at the shipped threshold (`3`) and drives
 `ProviderBreaker.now` from a fake clock, so cooldowns are skipped rather than slept through. Keep
@@ -372,8 +439,13 @@ not zero. Accepted in [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wid
 
 **The breaker is process-local and does not survive a restart.** A crash-looping operator re-learns
 the outage from scratch each time and can, in the limit, reproduce the traffic the breaker exists to
-suppress. Two replicas would each hold a private breaker; leader election means only one reconciles,
-so that is latent rather than live — inferred from the design, not observed.
+suppress. Two replicas would each hold a private breaker; leader election means only one
+*reconciles*, so that is latent rather than live — inferred from the design, not observed. The key
+poller is the one runnable that is not covered by that argument: it reports
+`NeedLeaderElection() false` and therefore polls on every replica
+([ADR 0016 D13](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)), so a
+standby makes a provider call of its own whenever the key file's content changes, gated by nothing.
+Bounded by the same limits as on the leader, multiplied by the replica count.
 
 **A probe is a full reconcile, not a health check.** The first pass admitted after a cooldown runs
 the whole provisioning pipeline for whichever bucket the queue hands over. If that bucket has a

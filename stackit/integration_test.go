@@ -148,12 +148,15 @@ func assertCannotSee(t *testing.T, ctx context.Context, probe *Client, foreignPr
 func assertCannotModify(t *testing.T, ctx context.Context, probe, owner *Client, victim string) {
 	t.Helper()
 	foreign := owner.ProjectID()
+	// The swapped client state carries the API client; load it once so the
+	// whole probe runs against one credential.
+	st := probe.state.Load()
 
 	// CREATE into the foreign project must be denied.
 	attempt := bucketName(foreign)
-	if _, err := probe.api.CreateBucket(ctx, foreign, probe.region, attempt).Execute(); err == nil {
+	if _, err := st.api.CreateBucket(ctx, foreign, probe.region, attempt).Execute(); err == nil {
 		// We wrongly created it — remove it so we don't leak, then fail.
-		_, _ = probe.api.DeleteBucket(ctx, foreign, probe.region, attempt).Execute()
+		_, _ = st.api.DeleteBucket(ctx, foreign, probe.region, attempt).Execute()
 		t.Fatalf("ISOLATION BREACH: project %s created bucket %q in foreign project %s", probe.ProjectID(), attempt, foreign)
 	} else if !isDenied(err) {
 		t.Fatalf("cross-project create %s->%s: unexpected error (status %d): %v", probe.ProjectID(), foreign, StatusCode(err), err)
@@ -162,7 +165,7 @@ func assertCannotModify(t *testing.T, ctx context.Context, probe, owner *Client,
 	}
 
 	// DELETE of the owner's real bucket must be denied.
-	if _, err := probe.api.DeleteBucket(ctx, foreign, probe.region, victim).Execute(); err == nil {
+	if _, err := st.api.DeleteBucket(ctx, foreign, probe.region, victim).Execute(); err == nil {
 		t.Fatalf("ISOLATION BREACH: project %s deleted bucket %q in foreign project %s", probe.ProjectID(), victim, foreign)
 	} else if !isDenied(err) {
 		t.Fatalf("cross-project delete %s->%s: unexpected error (status %d): %v", probe.ProjectID(), foreign, StatusCode(err), err)

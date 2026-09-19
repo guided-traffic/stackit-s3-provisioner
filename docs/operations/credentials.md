@@ -1,19 +1,24 @@
 # Credentials at runtime
 
-Two credentials matter to whoever runs this operator. The **workload credential**
+Three credentials matter to whoever runs this operator. The **workload credential**
 is the S3 access key a `Bucket` hands to its application through a Kubernetes
 Secret; it is per-`Bucket`, lives in that `Bucket`'s namespace and is rotated on
 request. The **admin credential** is the operator's own S3 identity, one per
 StackIT project, kept in a Secret in the operator's namespace and used for every
-data-plane call the operator makes on the fleet.
+data-plane call the operator makes on the fleet. The **service-account key** is
+what the operator authenticates to STACKIT's control plane with; it is issued in
+the STACKIT console, replaced from outside the cluster, and it is the only one of
+the three the operator does not create itself.
 
-This page is about handling both at runtime: consuming a workload Secret,
-rotating a key, what a rotation costs, and living with the admin Secret. The
-rules behind the behaviour are
+This page is about handling all three at runtime: consuming a workload Secret,
+rotating a key, what a rotation costs, living with the admin Secret, and rotating
+the service-account key without a restart. The rules behind the behaviour are
 [ADR 0007](../adr/0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md)
-(workload credential) and
+(workload credential),
 [ADR 0004](../adr/0004-the-operator-bootstraps-its-own-s3-admin-credential.md)
-(admin credential). The complete `Bucket` and chart reference — every field, every
+(admin credential) and
+[ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)
+(the service-account key at runtime). The complete `Bucket` and chart reference — every field, every
 value, every default — is in the [README](../../README.md) and only there; this
 page names the handful of keys it is about and explains them.
 
@@ -24,6 +29,8 @@ page names the handful of keys it is about and explains them.
 | Who can read a credential, what holding it is worth, and the open gaps | [docs/security/credentials-and-secrets.md](../security/credentials-and-secrets.md) |
 | Reading the rotation fields on a `Bucket` alongside the rest of its status | [bucket-status.md](bucket-status.md) |
 | The rotation metric and the alerts around it | [monitoring.md](monitoring.md) |
+| Issuing a service-account key in the first place, and the role it needs | [prerequisites.md](prerequisites.md) |
+| How the key poll, the validation and the atomic swap are built | [docs/developer/service-account-key-reload.md](../developer/service-account-key-reload.md) |
 
 ---
 
@@ -416,6 +423,116 @@ outgoing process still holds one has not been analysed.
 
 ---
 
+## Rotating the StackIT service-account key
+
+The service-account key is the operator's credential for STACKIT's control plane: every bucket
+create, every credentials group, every policy read goes through a token minted from it. STACKIT
+stamps `validUntil` into the key when it issues one — 90 days after `createdAt` on the keys checked
+on 2026-09-19 — so this rotation is a scheduled event with a deadline printed on the credential,
+not a possibility to plan for.
+
+Unlike the other two credentials on this page, the operator does not create this one and cannot
+rotate it for you. What it does is notice that you have.
+
+### Procedure
+
+The operator re-reads the mounted key file every
+`stackit.serviceAccountKey.reloadInterval` (`"30s"` # default) and, when the content has changed,
+proves the new key before using it
+([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)). So the
+rotation is: write the new key into the Secret, then watch.
+
+1. **Issue a new key** for the *same* STACKIT project, in the STACKIT console or through whatever
+   issues them for you. A key for a different project is refused by the running process — see
+   [the project guard](#the-project-guard-is-not-a-boundary).
+2. **Write it into the Secret** the chart's `stackit.serviceAccountKey.secretName` names, under the
+   data key `stackit.serviceAccountKey.secretKey` names (`sa-key.json` # default). Whatever writes
+   it is yours: an external secret operator, SOPS, or by hand.
+
+   ```bash
+   NS=stackit-s3-provisioner-system      # example; the release namespace
+   kubectl -n $NS create secret generic stackit-sa-key \
+     --from-file=sa-key.json=./new-key.json \
+     --dry-run=client -o yaml | kubectl apply -f -
+   ```
+
+3. **Wait out the window.** The kubelet needs up to about 90 seconds to refresh the file inside the
+   container — that part is Kubernetes', not this operator's — and then up to one
+   `reloadInterval` for the operator to notice.
+4. **Confirm it landed.** One log line per successful swap, naming the project and the service
+   account and never the key:
+
+   ```bash
+   kubectl -n $NS logs deploy/stackit-s3-provisioner \
+     | grep 'loaded a new StackIT service-account key'
+   # expected: project=<the project id>  issuer=<the new service account>  validUntil=<the new expiry>
+   ```
+
+   The same fact is a metric: `stackit_s3_provisioner_sa_key_loaded_timestamp_seconds` moves to the
+   moment of the swap, and `stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds` to the new
+   key's expiry — absent if the new key carries none.
+5. **Only then revoke the old key.** Nothing forces this order, and getting it wrong is the one way
+   to turn a routine rotation into an outage: between revoking the old key and the new one landing,
+   every `Bucket` in the cluster drops to `Failed`.
+
+### If the operator refuses the new key
+
+A candidate that does not parse, names a different project, is not usable key material, or that the
+provider will not mint a token with, is **discarded** — the operator carries on with the key it
+already holds. That is deliberate: it means a truncated write or an already-revoked key cannot take
+down a healthy operator. It also means a failed rotation is invisible from the outside until the old
+key expires, so it has its own signals:
+
+| Signal | What it says |
+|---|---|
+| `stackit_s3_provisioner_sa_key_reload_failing` is `1` | the operator is refusing the key currently on disk |
+| `StackitS3SaKeyReloadFailing` (warning, after 30m) | the same, as an alert |
+| A log line `rejected a candidate StackIT service-account key; carrying on with the key in use` | the reason, logged once per distinct file content, with `definitive` telling you whether retrying can help |
+
+A rejected candidate is never given up on. A definitive rejection — the file does not parse, it names
+a foreign project, the key material is unusable, or the provider answered a structured `400`/`401`/
+`403` — is retried on a doubling schedule from one interval up to ten minutes, and the schedule
+resets the moment the file content changes. Anything else, meaning the provider did not actually
+answer, is retried every interval. So a key that is simply slow to propagate activates by itself.
+
+### The project guard is not a boundary
+
+The running process refuses a candidate whose `projectId` differs from the one it started with. That
+comparison lives in memory, so a **pod restart erases it**: the new process has no memory of the
+previous project and adopts whatever the mounted key names. The guard is worth having because it is
+free, not because it protects anything
+([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D4).
+
+What actually protects the data if the wrong key is ever mounted is
+[ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md): every provisioned
+`Bucket` reports its bucket as missing and nothing is re-created or overwritten. Reading that state
+is [vanished-buckets.md](vanished-buckets.md).
+
+### Rotating with the reload switched off
+
+`stackit.serviceAccountKey.reloadInterval: "0"` restores the behaviour that needed a restart. The
+rotation is then steps 1 and 2 above, followed by:
+
+```bash
+kubectl -n $NS rollout restart deploy/stackit-s3-provisioner
+kubectl -n $NS logs deploy/stackit-s3-provisioner | grep 'StackIT client configured'
+# expected: the project id from the NEW key, and the configured region
+```
+
+With the reload off, none of the `sa_key` metrics is exported, so neither the expiry warning nor the
+rejection alert can fire. A key path that is unreadable or unusable **at startup** is still a startup
+failure and crash-loops the pod, whatever the interval is.
+
+### Not verified
+
+The live rotation of a real key against the real API has not been run. Everything above is derived
+from the implementation and reproduced offline against the in-memory provider fake. In particular,
+that a credentials group and its access keys outlive the service-account key that created them is a
+design argument — no cloud IAM model cascade-deletes an administrator's creations when that
+administrator's credential is rotated — and not an observation.
+
+---
+
 ## Related
 
 | Page | Why |
@@ -429,3 +546,6 @@ outgoing process still holds one has not been analysed.
 | [gitops.md](gitops.md) | why a repeated sync of the same rotation trigger does nothing |
 | [docs/developer/credentials.md](../developer/credentials.md) | the mechanics behind everything on this page |
 | [docs/security/credentials-and-secrets.md](../security/credentials-and-secrets.md) | where every credential lives and what its loss or leak costs |
+| [prerequisites.md](prerequisites.md) | issuing the service-account key and the role it needs |
+| [configuration.md](configuration.md#the-service-account-key-reload-interval) | the reload interval, the full window, and switching it off |
+| [docs/developer/service-account-key-reload.md](../developer/service-account-key-reload.md) | how the poll, the validation and the atomic swap are built |

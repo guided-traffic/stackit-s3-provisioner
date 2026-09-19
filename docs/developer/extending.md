@@ -67,14 +67,16 @@ are about to take obvious rather than mechanical.
 
 ## Add a metric and its alert
 
-1. Declare the `prometheus.Desc` in
-   [`internal/controller/metrics.go`](../../internal/controller/metrics.go) with the
-   `stackit_s3_provisioner_` prefix.
+1. Decide which collector owns it — see [the note below](#where-a-metric-is-registered-decides-what-it-can-say).
+   A series derived from `Bucket` objects belongs in
+   [`internal/controller/metrics.go`](../../internal/controller/metrics.go); declare its
+   `prometheus.Desc` there, with the `stackit_s3_provisioner_` prefix.
 2. Emit it in `Describe` **and** in `Collect`. A series only in `Describe` never appears; one only in
    `Collect` breaks registration.
-3. The collector reads live `Bucket` objects at scrape time, so a per-bucket series carries the
-   bucket's identifying labels and is simply absent when the object is gone. Absent is not zero —
-   write the alert expression accordingly ([monitoring.md](../operations/monitoring.md)).
+3. The collector in `metrics.go` reads live `Bucket` objects at scrape time, so a per-bucket series
+   carries the bucket's identifying labels and is simply absent when the object is gone. Absent is
+   not zero — write the alert expression accordingly
+   ([monitoring.md](../operations/monitoring.md)).
 4. Add the alert to
    [`deploy/helm/stackit-s3-provisioner/templates/prometheusrule.yaml`](../../deploy/helm/stackit-s3-provisioner/templates/prometheusrule.yaml),
    wrapped in its own `{{- if $alerts.<name>.enabled }}` guard.
@@ -82,16 +84,41 @@ are about to take obvious rather than mechanical.
    is disabled, because prometheus-operator rejects an empty rule group — a new alert that is not in
    that `or` disappears when it is the only one enabled.
 6. Add the toggle to `monitoring.prometheusRule.alerts` in
-   [`values.yaml`](../../deploy/helm/stackit-s3-provisioner/values.yaml).
+   [`values.yaml`](../../deploy/helm/stackit-s3-provisioner/values.yaml), together with any
+   threshold the expression reads. A threshold belongs in the values and is rendered into the
+   expression — `saKeyExpiring.leadTimeDays` becomes `{{ mul $alerts.saKeyExpiring.leadTimeDays 86400 }}`
+   in the rule — so the operator tunes it without a fork of the template.
 7. Add the toggle to the chart-value reference in [README.md](../../README.md) and the alert's
    meaning to [monitoring.md](../operations/monitoring.md) — the key list lives in the README, its
-   meaning in the operations page.
+   meaning in the operations page. Both pages state how many alerts there are and how many ship on;
+   keep the counts right in the same change.
 8. Run `make test-helm-render` to confirm the chart still renders.
+
+### Where a metric is registered decides what it can say
+
+`RegisterBucketMetrics` is not the only registration point, and using it for everything is a
+mistake with one specific shape: a series exported as `0` while the mechanism it measures is not
+running reads as *healthy*, which is the one answer it must never give.
+
+So a metric goes into its own collector, registered separately, when it describes process state
+rather than object state **and** the process may be running without that state at all.
+[`sakey_reload.go`](../../internal/controller/sakey_reload.go) is the precedent:
+`SAKeyReloadObserver` is a `prometheus.Collector` over its own counters, and
+`RegisterSAKeyReloadMetrics` is called from [`cmd/main.go`](../../cmd/main.go) only when the
+service-account key reload is actually wired up — in skeleton mode, or at
+`--stackit-sa-key-reload-interval` `0`, none of its four series is exported at all.
+
+The same collector shows the per-series form of the rule. The expiry gauge is emitted only when the
+loaded key carries a `validUntil`, so an operator whose key has no expiry exports nothing there and
+the two expiry alerts, which evaluate `min(<gauge> - time())`, match no series and stay silent —
+instead of firing on a `0` that would read as "expired in 1970". Absent is a supported answer, and
+writing the expression against a gauge that may be missing is part of adding the metric, not a
+follow-up ([ADR 0016 D10](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)).
 
 ## Add a Helm value that reaches the operator
 
 1. Add the flag in [`cmd/main.go`](../../cmd/main.go) with a default and, where it is useful, an
-   environment-variable fallback. Twenty-two of the twenty-five flags have one
+   environment-variable fallback. Twenty-three of the twenty-six flags have one
    ([package-map.md](package-map.md#cmd--the-manager-binary)).
 2. Validate it at startup if a bad value would only surface later as a confusing reconcile failure.
    The naming policy and the usage price both exit the process instead.
@@ -102,8 +129,17 @@ are about to take obvious rather than mechanical.
    A Go duration needs a unit — a bare number is rejected by the flag parser and the pod crash-loops.
 5. Add the key to the chart-value reference in [README.md](../../README.md), marked `# default` or
    `# example`.
-6. Explain what it does in [configuration.md](../operations/configuration.md), and say whether
-   changing it needs a restart. Nothing is hot-reloaded today.
+6. Explain what it does in [configuration.md](../operations/configuration.md), and say that changing
+   it needs a restart — because it does. **Exactly one input of this operator is re-read while it
+   runs, the service-account key, and a new setting is not going to be the second**
+   ([ADR 0016 D1](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)).
+   The line is not squeamishness about reload code: the key is the only input that changes without
+   anybody touching the deployment, because an external rotation mechanism writes it, and every
+   other setting arrives through a rollout that restarts the process anyway. `--ownership-name` is
+   the case that settles it — it is part of the bucket ownership key, so re-reading it at runtime
+   would make the operator treat its own buckets as foreign. If a value really does need to take
+   effect without a restart, that is an amendment to D1 agreed with the maintainer first, not a
+   ticker added quietly beside the flag.
 7. If the setting adds a Kubernetes permission, edit the chart's ClusterRole by hand. `make
    manifests` regenerates only `config/rbac/role.yaml`, and nothing copies it into the chart
    ([package-map.md](package-map.md#what-is-wrong-today)).

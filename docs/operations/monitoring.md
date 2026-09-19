@@ -29,11 +29,15 @@ port. Verified in `cmd/main.go` and
 **The health probes say nothing about the provider.** Both are registered as
 `healthz.Ping`: they report that the process is alive, not that the StackIT API
 is reachable or that a service-account key was ever loaded. That is precisely
-why `StackitS3SkeletonMode` exists and why it is one of only two `critical`
+why `StackitS3SkeletonMode` exists and why it is one of only three `critical`
 alerts in the set — an operator with no key comes up, passes both probes forever
-and provisions nothing. The other one, `StackitS3BucketMissing`, reports the
-other thing a green probe says nothing about: a provisioned bucket the provider
-answers for as gone ([vanished-buckets.md](vanished-buckets.md)).
+and provisions nothing. The other two report the other things a green probe says
+nothing about: `StackitS3BucketMissing`, a provisioned bucket the provider answers
+for as gone ([vanished-buckets.md](vanished-buckets.md)), and
+`StackitS3SaKeyExpiringCritical`, the service-account key the process runs on
+being days from expiry — when it does expire the provider's refusal is definitive,
+so it is not held through the degraded grace and every `Bucket` drops to `Failed`
+at once ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)).
 
 ---
 
@@ -60,8 +64,8 @@ monitoring:
     enabled: true                      # false # default
     labels:
       release: kube-prometheus-stack   # example — same selector as above
-    # alerts.<name>.enabled toggles each rule individually; twelve of the
-    # thirteen default to true and bucketRecreated is the one that ships off.
+    # alerts.<name>.enabled toggles each rule individually; fifteen of the
+    # sixteen default to true and bucketRecreated is the one that ships off.
     # The whole PrometheusRule is skipped when every toggle is false, because
     # prometheus-operator rejects a rule group with no rules.
 ```
@@ -122,7 +126,7 @@ stackit_s3_provisioner_skeleton_mode
 
 ## The metric catalogue
 
-24 series in total, on top of the standard controller-runtime and Go collectors.
+28 series in total, on top of the standard controller-runtime and Go collectors.
 The controller-runtime series matter too: the reconcile-error alert is built on
 `controller_runtime_reconcile_errors_total`, and the two controllers are labelled
 `controller="bucket"` (provisioning) and `controller="bucketusage"` (size
@@ -140,11 +144,19 @@ consequences follow, and alert expressions depend on all three:
 | A failed cache list omits **every** bucket-derived series for that scrape | An absent series, not a zero. The collector bounds the wait at 10s so a scrape during startup cannot hang the handler |
 | Every replica exports the full fleet, leader or not | The metrics server is not gated on leader election. During a rolling update two pods export the same numbers, which is why the fleet-gauge expressions wrap their selector in `max(…)` rather than `sum(…)`. This does not apply to the counter-based expressions: reconciling and measuring *are* gated on leader election (`leaderElection.enabled: true` # default), so a non-leader replica never increments `controller_runtime_reconcile_errors_total`, `..._usage_measurement_failures_total` or `..._bucket_recreated_total` and `sum(increase(…))` over them is safe. Verified in `cmd/main.go` and `deploy/helm/stackit-s3-provisioner/values.yaml` |
 
-The three process metrics are the deliberate exception, and none of them can be
-derived from the resources: a failed measurement leaves nothing on the `Bucket`
-beyond a message, the duration of a listing pass is gone once it finished, and an
-authorised re-creation leaves no durable trace on the CR at all
+The [process series](#process-series) are the deliberate exception, and one rule
+decides which side a series falls on: it is derived from the cache when the
+`Bucket` resources carry the answer, and process-scoped when they cannot. Three of
+them describe work that leaves nothing durable behind — a failed measurement
+leaves nothing on the `Bucket` beyond a message, the duration of a listing pass is
+gone once it finished, and an authorised re-creation leaves no durable trace on
+the CR at all
 ([ADR 0015 D13](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)).
+The other four describe the operator's own service-account key, which no `Bucket`
+mentions at all. Every replica polls that file and swaps on its own
+([ADR 0016 D13](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)),
+so the four are per-pod state: two replicas can report different values while a
+rotation is landing.
 
 ### Fleet-wide series
 
@@ -187,10 +199,23 @@ them — that is the design, so `absent()` separates "no measurement" from "zero
 | `stackit_s3_provisioner_usage_measurement_failures_total` | counter | Measurements that could not complete. A failed measurement deliberately returns **no** reconcile error ([ADR 0014 D3](../adr/0014-bucket-size-is-measured-by-a-separate-controller.md)), so this counter is the only place they aggregate — `controller_runtime_reconcile_errors_total{controller="bucketusage"}` stays flat through them |
 | `stackit_s3_provisioner_bucket_recreated_total` | counter | Vanished buckets rebuilt automatically because `spec.allowRecreate` authorised it ([ADR 0015 D9](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)). The one series in this table that carries `{namespace, name}`, because it has to name the `Bucket` whose workload is now holding a replaced Secret — and it belongs here rather than with the per-`Bucket` gauges because it cannot be derived from the cache: an authorised re-creation ends with the CR back in `Ready` and leaves nothing behind on it. A process counter, so it restarts at zero with the operator |
 | `stackit_s3_provisioner_usage_measurement_duration_seconds` | histogram | Duration of one successful listing pass. Buckets: `0.1, 0.5, 1, 5, 15, 60, 300, 900, 1800` seconds. This is the number to look at before lowering `bucketUsage.interval`, and the one that shows a bucket outgrowing its cap |
+| `stackit_s3_provisioner_sa_key_reload_total{result}` | counter | Polls of the service-account key file, by what the poll decided: `applied`, `rejected`, `unchanged`. All three label values are exported from the first scrape, starting at `0`, so an expression never races an absent label. `unchanged` is the normal case and costs no provider call — only a changed file is validated ([ADR 0016 D2](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)). Polls skipped while a definitively rejected candidate is backing off are not counted at all: the counter measures decisions, not ticks |
+| `stackit_s3_provisioner_sa_key_loaded_timestamp_seconds` | gauge | When **this process** started using the key it is running on — process start for the key it booted with, the moment of the swap after a reload. `time() - <series>` is therefore the age of this pod's key in this pod, not the age of the key itself |
+| `stackit_s3_provisioner_sa_key_reload_failing` | gauge | `1` while a candidate on disk keeps being rejected and the operator carries on with the key it already holds. Back to `0` on the first poll that either applies a candidate or finds the file unchanged ([ADR 0016 D8](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)) |
+| `stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds` | gauge | When the key in use expires, taken from the `validUntil` the provider stamps into the key file. **Absent** when the file carries none — see [Absent is not zero](#absent-is-not-zero) ([ADR 0016 D10](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)) |
+
+The four `sa_key_*` series exist only while the reload is actually running: an
+operator in skeleton mode, or one with
+`stackit.serviceAccountKey.reloadInterval` set to `"0"`, exports none of them
+rather than a reassuring zero for a mechanism that is not there
+([ADR 0016 D12](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)).
+Their absence therefore does not distinguish a stopped operator from a deliberate
+configuration; the scrape check above tests `skeleton_mode`, which a running
+operator exports either way.
 
 ### Absent is not zero
 
-The four cases an expression has to keep apart:
+The five cases an expression has to keep apart:
 
 | You see | It means |
 | --- | --- |
@@ -198,21 +223,22 @@ The four cases an expression has to keep apart:
 | Every `stackit_s3_provisioner_*` series is gone | The operator is down, not scraped, or the scrape config was never discovered. **No shipped alert fires on this** — see [What is deliberately not alerted on](#what-is-deliberately-not-alerted-on) |
 | Only the bucket-derived series are gone while `skeleton_mode` and `provider_circuit_open` remain | The collector's list against the cache failed on that scrape |
 | A per-bucket usage series is absent | That bucket was never measured — not that it is empty |
+| `..._sa_key_valid_until_timestamp_seconds` is absent while the other three `sa_key_*` series are there | The key file carries no `validUntil`. A real shape rather than a fault, and the consequence is that the two expiry alerts simply never fire for such a key instead of firing falsely — the rotation deadline then has to be tracked outside this chart ([ADR 0016 D10](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)) |
 
 ---
 
 ## The shipped alerts
 
-Thirteen rules, each with its own `enabled` toggle under
-`monitoring.prometheusRule.alerts.<name>`. Twelve default to `true`;
+Sixteen rules, each with its own `enabled` toggle under
+`monitoring.prometheusRule.alerts.<name>`. Fifteen default to `true`;
 `StackitS3BucketRecreated` is the single exception and ships disabled, because it
 can only ever fire on a deployment that has adopted `spec.allowRecreate`
 ([ADR 0015 D12](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)).
 They are only rendered when `monitoring.prometheusRule.enabled` is `true` **and**
 at least one toggle is on.
 
-The alert names, their toggle keys and which two of them are `critical` are in
-the [README reference](../../README.md); the other eleven are `warning`. What
+The alert names, their toggle keys and which three of them are `critical` are in
+the [README reference](../../README.md); the other thirteen are `warning`. What
 that list does not carry is the `for`
 window each rule waits out before it fires, and the rendered expression behind
 it — and the `for` window is what separates an alert reporting a state from one
@@ -226,6 +252,9 @@ reporting a transient:
 | `StackitS3BucketStuckDeleting` | 30m |
 | `StackitS3CloneFailed` | 30m |
 | `StackitS3SkeletonMode` | 15m |
+| `StackitS3SaKeyReloadFailing` | 30m |
+| `StackitS3SaKeyExpiring` | 1h |
+| `StackitS3SaKeyExpiringCritical` | 1h |
 | `StackitS3WipeRequestedButGateDisabled` | 15m |
 | `StackitS3BucketProviderDegraded` | 1m |
 | `StackitS3BucketMissing` | 5m |
@@ -245,7 +274,7 @@ expression itself (`holdForSeconds`, the `increase()` lookback `window` and a
 redundant delay.
 
 <details>
-<summary>The thirteen expressions as rendered</summary>
+<summary>The sixteen expressions as rendered</summary>
 
 ```promql
 # StackitS3BucketsWipeOnDelete            for: 5m
@@ -265,6 +294,15 @@ max(stackit_s3_provisioner_buckets_clone{phase="Failed"}) > 0
 
 # StackitS3SkeletonMode                   for: 15m   severity: critical
 max(stackit_s3_provisioner_skeleton_mode) == 1
+
+# StackitS3SaKeyReloadFailing             for: 30m
+max(stackit_s3_provisioner_sa_key_reload_failing) > 0
+
+# StackitS3SaKeyExpiring                  for: 1h
+min(stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds - time()) < 1209600   # leadTimeDays: 14 # default
+
+# StackitS3SaKeyExpiringCritical          for: 1h    severity: critical
+min(stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds - time()) < 259200    # leadTimeDays: 3 # default
 
 # StackitS3WipeRequestedButGateDisabled   for: 15m
 max(stackit_s3_provisioner_buckets_wipe_on_delete) > 0
@@ -308,11 +346,12 @@ not in the alert; it is in `kubectl get bkt -A`.
 
 ## The alerts that carry a number
 
-Nine of the thirteen are threshold-free statements about a state that should not
-persist. Four carry numbers. Three of those numbers are Helm values — two
-constrained by something else in the configuration, the third by a property of
-the counter it reads; the fourth is hardcoded in the rule template. All four are
-here because their implications are not obvious.
+Ten of the sixteen are threshold-free statements about a state that should not
+persist. Six carry numbers. Five of those numbers are Helm values — two
+constrained by something else in the configuration, one by a property of the
+counter it reads, and the two key-expiry lead times by each other; the sixth is
+hardcoded in the rule template. All six are here because their implications are
+not obvious.
 
 ### `StackitS3ReconcileErrors` — and why it excludes provider outages
 
@@ -438,6 +477,29 @@ extrapolates, so a single permanently failing bucket may or may not cross it;
 two failing buckets always do. This is arithmetic from the retry constant and the
 default interval floor, not a measured figure.
 
+### The two key-expiry alerts — two lead times on one gauge
+
+```promql
+min(stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds - time()) < 1209600   # 14 days
+```
+
+Both rules compute the remaining lifetime inside the expression, from the
+absolute timestamp the operator exports. That is deliberate: a countdown
+exported by the operator would change on every scrape, make the pod's clock a
+fault source, and let a hung exporter report a healthy-looking constant
+([ADR 0016 D10](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)).
+
+| Value | Default | Constraint |
+| --- | --- | --- |
+| `monitoring.prometheusRule.alerts.saKeyExpiring.leadTimeDays` | `14` | Has to outlast the slowest rotation path actually in use, issuing the new key included. Integer days; the rule multiplies by 86400 |
+| `monitoring.prometheusRule.alerts.saKeyExpiringCritical.leadTimeDays` | `3` | The same measurement at a shorter lead and `critical` severity. Keep it well below the warning lead |
+
+Two things follow. The expressions are identical apart from the number, so once
+the critical lead is crossed **both** fire — route them apart by severity rather
+than expecting one to replace the other. And both are dead by construction for a
+key file carrying no `validUntil`: the gauge is absent, the expression evaluates
+to nothing, and no rule in this chart reports that silence.
+
 ---
 
 ## What each alert means and what to do
@@ -445,6 +507,9 @@ default interval floor, not a measured figure.
 | Alert | What you look at | What it usually is |
 | --- | --- | --- |
 | `StackitS3SkeletonMode` | `kubectl logs` for `running in skeleton mode`; `stackit.serviceAccountKey.secretName` and the referenced Secret | The key Secret is missing, misnamed, or the release was installed without it. See [prerequisites.md](prerequisites.md) |
+| `StackitS3SaKeyReloadFailing` | The operator log for `rejected a candidate StackIT service-account key`, then the Secret named by `stackit.serviceAccountKey.secretName` | A rotation the operator is refusing. Nothing is broken yet — it is still working on the key it holds, and a rejected candidate never displaces it — and the log line carries the reason: a file that does not parse, a key naming a different project, or a key the provider will not mint a token with. The danger is the old key expiring while the replacement keeps being refused, which turns this warning into the whole fleet failing at once; `StackitS3SaKeyExpiring` is what bounds that ([ADR 0016 D8](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)) |
+| `StackitS3SaKeyExpiring` | `stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds`, and whether a replacement key has been written to the Secret at all | The key in use runs out within the warning lead time. Issue a new one and write it into the Secret named by `stackit.serviceAccountKey.secretName`; the operator picks it up within `stackit.serviceAccountKey.reloadInterval` without a restart, and `StackitS3SaKeyReloadFailing` is what tells you if it will not take it |
+| `StackitS3SaKeyExpiringCritical` | The same series, and `stackit_s3_provisioner_sa_key_loaded_timestamp_seconds` to see whether this pod has already picked a new key up | Days from expiry. At expiry every `Bucket` drops to `Failed` in the same minute and the fleet-wide breaker opens on top, and nothing heals until a valid key is in place. The warning alert is still firing alongside this one |
 | `StackitS3BucketMissing` | `stackit_s3_provisioner_bucket_provisioned_missing` for **which** `Bucket` — the alert expression drops the labels — then its `BucketPresent` condition and `status.message` | Data loss, not an outage: a bucket the operator provisioned was deleted behind its back, or the operator is authenticated against a project that never held it. It is deliberately **not** re-created. Runbook in [vanished-buckets.md](vanished-buckets.md) |
 | `StackitS3BucketRecreated` | `stackit_s3_provisioner_bucket_recreated_total` for which `Bucket`, then the `BucketRecreated` event on it and the workloads mounting its Secret | An authorised rebuild under `spec.allowRecreate` that already happened: the contents are gone, the credentials Secret was replaced, and consumers keep failing with `403` until they re-read it. The previous credentials group is left standing and its cleanup is manual. See [vanished-buckets.md](vanished-buckets.md) |
 | `StackitS3BucketFailed` | `kubectl get bkt -A`, then `status.message` on the failed ones | A configuration fault that parks without requeueing: a Secret key collision, a `spec.region` mismatch, a `secretRef` aimed at the admin Secret, an ownership collision. A vanished bucket lands here too — it keeps retrying rather than parking, and `StackitS3BucketMissing` has already fired ten minutes earlier. See [bucket-status.md](bucket-status.md) |
@@ -484,8 +549,8 @@ which is exactly why the failure counter and its alert exist.
 
 **The operator being absent.** This is a gap, stated plainly: every shipped
 expression tests a series the operator itself exports — a fleet gauge, a
-per-bucket gauge, or an `increase()` over a counter it exports — and all thirteen
-evaluate to nothing when the operator is down, not scraped, or its
+per-bucket gauge, a process gauge, or an `increase()` over a counter it exports —
+and all sixteen evaluate to nothing when the operator is down, not scraped, or its
 `ServiceMonitor` was never discovered because of the label trap above. Nothing in
 this chart notices that.
 The cover is generic and comes from the monitoring stack, not from here —
@@ -516,7 +581,7 @@ context of [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md).
 
 That alert is **not** shipped by this chart. It lives in the consuming cluster's
 own monitoring stack — nothing in this repository renders a rule watching Flux
-resources, and the thirteen rules in `prometheusrule.yaml` all test series the
+resources, and the sixteen rules in `prometheusrule.yaml` all test series the
 operator itself exports. On that cluster it carried severity `warning` and
 `for: 5m` over the Flux readiness conditions:
 
@@ -566,5 +631,6 @@ then looks like two, two hours apart.
 - [vanished-buckets.md](vanished-buckets.md) — what the two alerts on a missing bucket mean on the `Bucket` itself, and what to do
 - [bucket-status.md](bucket-status.md) — phases, conditions and events on a single `Bucket`
 - [deployment.md](deployment.md) — replicas, leader election and rolling updates
+- [../developer/service-account-key-reload.md](../developer/service-account-key-reload.md) — how the poll, the validation and the swap behind the four `sa_key_*` series are built
 - [README reference](../../README.md) — the complete Helm value and `Bucket` field list
-- [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md), [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md), [ADR 0014](../adr/0014-bucket-size-is-measured-by-a-separate-controller.md), [ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)
+- [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md), [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md), [ADR 0014](../adr/0014-bucket-size-is-measured-by-a-separate-controller.md), [ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md), [ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)
