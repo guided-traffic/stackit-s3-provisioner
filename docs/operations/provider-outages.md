@@ -395,7 +395,7 @@ measured distribution of outage lengths.
 
 | Page | What it adds |
 | --- | --- |
-| [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) | The decision behind the hold, the classification rule, and the closed list of definitive faults |
+| [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) | The decision behind the hold, the classification rule, and the enumerated definitive faults |
 | [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) | The decision behind the breaker, the 2026-09-02 incident record, and the alerting retune |
 | [monitoring.md](monitoring.md) | The full metric catalogue and every alert |
 | [bucket-status.md](bucket-status.md) | Phases, conditions and the faults that park a `Bucket` |

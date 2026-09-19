@@ -346,7 +346,7 @@ covers it.
 
 This is an unrecorded consequence rather than a contradiction, and the distinction is worth getting
 right before anyone "fixes" it. [ADR 0013 D3](../adr/0013-a-provider-outage-is-held-fleet-wide.md)
-exempts a definitive fault *in the closed list held by*
+exempts a definitive fault *as enumerated by*
 [ADR 0012 D6](../adr/0012-ready-describes-the-last-verified-state.md) — structured `400`/`401`/`403`,
 a self-destroyed credential, the six configuration faults (the code's `failNoRequeue` set), plus the
 subject-state exclusions. A non-empty bucket refusing its own deletion is on none of those lists,

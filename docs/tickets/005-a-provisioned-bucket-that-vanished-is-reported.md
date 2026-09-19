@@ -1,7 +1,9 @@
 # Ticket: a provisioned bucket that vanished is reported, never silently re-created
 
 **Status:** Draft — behavior decided in review on 2026-09-19, design proposal, open questions listed.
-Not approved for implementation.
+Not approved for implementation. Q8 and Q9 answered in a second review on 2026-09-19, which also
+corrected the failure routing in [D3](#d3--the-failure-state); no question is open. Sequencing
+confirmed there: this ticket lands before the hot-reload ticket.
 **Scope:** this repo (`stackit-s3-provisioner`).
 **Blocks:** [hot-reload the StackIT service-account key](007-hot-reload-the-stackit-service-account-key.md) —
 that ticket's Q12 concluded that this guard, not a project-identity check, is what makes a foreign key
@@ -161,8 +163,24 @@ not-ready.** That is correct here and must not be "fixed" later: the transient-e
 404 for a bucket we provisioned is the opposite — it is information about the bucket, and it is the
 worst news the operator can deliver.
 
-Requeue with `fail`, not `failNoRequeue`: rate-limited retry (1s → 15min cap) means a restored bucket
-or a corrected key recovers on its own, satisfying SC4 with no extra machinery.
+~~Requeue with `fail`, not `failNoRequeue`~~ — **corrected in review on 2026-09-19: neither.** `fail`
+calls `Breaker.Failure()` on every error it handles
+([bucket_controller.go:1559](../../internal/controller/bucket_controller.go#L1559)). After a restart
+with a foreign key *every* provisioned Bucket reads as absent, so three of them through `fail` would
+open the circuit fleet-wide and stop every provider call, teardowns included — for an answer the
+provider gave definitively. [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) D3 says a
+definitive fault neither trips nor resets the breaker. `failNoRequeue` is wrong for the other reason:
+it never retries, and SC4 needs the retry.
+
+So the guard gets a third path: `markFailed` with `ReasonBucketMissing` and the `BucketPresent`
+condition, **no** breaker call in either direction, and a rate-limited requeue (1s → 15min cap) by
+returning the error. A restored bucket or a corrected key then recovers on its own, satisfying SC4
+with no extra machinery.
+
+Assumed, not decided (sensible default): the alert is a dedicated `StackitS3BucketMissing` on the
+gauge, severity critical, `for: 5m`; the existing `StackitS3BucketFailed` (warning, 15m) keeps
+firing on the phase as it does today. One incident, two alerts of different severity, which is how
+the degraded alerts already behave.
 
 ### D4 — Re-creating once: delete the CR and re-apply it
 
@@ -343,6 +361,30 @@ For this one: "a provisioned bucket is never re-created implicitly", stating the
 `spec.allowRecreate` opt-in, delete-and-re-apply as the way to re-create once, the structured-404 rule
 from [D2](#d2--what-counts-as-absent-and-why-the-current-check-is-the-wrong-one), and explicitly that
 this failure is **not** covered by the degraded-Ready hold of [ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md).
+
+### Q8 — ANSWERED: ADR 0012 D6 is extended, ADR 0013 stays as it is
+**Decision (2026-09-19): approved.** ADR 0012 D3/D6 enumerate the definitive faults and say the set
+grows only by amending that record; the guard adds one — a structured `404` from the per-bucket read
+for a Bucket whose `status.resolvedBucketName` is set. The change to ADR 0012: one row in the D6
+table pointing at this ticket's record, `Status` gains "Amended 2026-09-19 by ADR NNNN", and the
+"Still open: a provisioned bucket that has vanished ..." paragraph in `Status` is removed. ADR 0013 is
+not touched: its D3 already exempts every fault ADR 0012 enumerates from tripping or resetting the
+breaker, which is what the corrected [D3](#d3--the-failure-state) implements. The alternative —
+naming the case only in the new record — would leave ADR 0012 stating an incomplete set as complete
+and was not offered.
+
+In the same review the phrase "closed list" was removed from every record and page that used it
+(ADR 0008, 0012, 0013 and five pages under `docs/`): a record is amended over time, and the wording
+implied it could not be. The enumerated-default semantics of ADR 0012 D3 — only what is enumerated
+is definitive, everything else is held — are unchanged.
+
+### Q9 — ANSWERED: no durable trace of an automatic re-creation on the CR
+**Decision (2026-09-19): event and counter only, as in [D5](#d5--permanent-opt-in-specallowrecreate).**
+A `status.lastRecreatedAt` field was offered — cheap, since the CRD changes for `spec.allowRecreate`
+anyway, and durable where the event (one hour) and the metric (five days of retention on the
+management cluster) are not — and declined. Consequence to document in the operations page: after
+an unattended re-creation the only durable evidence is the Warning event while it lasts and
+`stackit_s3_provisioner_bucket_recreated_total` while Prometheus keeps it.
 
 ## References
 

@@ -99,7 +99,7 @@ not lose its own provisioning because a consumer is missing.
 | Names the grantor itself | Ignored with `ReadGrantPending`; absent from `status.grantedReadTo` |
 | Names a Bucket whose `credentials-group-id` tag points at a group the provider has not yet made consistently visible | **Not** skipped: the grantor's reconcile fails and retries |
 
-The table is the closed list of skips. Anything else that goes wrong while resolving fails the
+The table enumerates every skip. Anything else that goes wrong while resolving fails the
 grantor's reconcile and is classified by [ADR 0012](0012-ready-describes-the-last-verified-state.md):
 a provider error, a failed read of the grantee CR, and the last row above — a grantee tagged before
 the `credentials-group-urn` tag existed, whose group the provider confirms by id but does not yet

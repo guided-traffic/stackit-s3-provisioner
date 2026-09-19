@@ -86,7 +86,7 @@ requires no knowledge of what the provider's failure looks like.
 
 **D3 — Only non-definitive failures count toward the trip; any completed reconcile closes the
 breaker immediately.** A definitive fault — one the operator established locally about that one
-bucket, in the closed list held by [ADR 0012](0012-ready-describes-the-last-verified-state.md) —
+bucket, as enumerated by [ADR 0012](0012-ready-describes-the-last-verified-state.md) —
 neither trips the breaker nor resets it, because it says nothing about the provider. A successful
 provisioning pass and a successful teardown both count as success: the provider answered.
 

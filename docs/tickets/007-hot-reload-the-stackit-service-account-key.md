@@ -1,8 +1,10 @@
 # Ticket: hot-reload the StackIT service-account key
 
-**Status:** Draft — design proposal plus open questions. Not approved for implementation.
+**Status:** Draft — design decided, waiting on its precondition. Not approved for implementation.
 Q1, Q2, Q3 and Q12 answered in review on 2026-09-19. Q12 replaced the project-binding idea with a
-vanished-bucket guard that is proposed as its own ticket and precondition.
+vanished-bucket guard that is proposed as its own ticket and precondition. Q13–Q17 answered in a
+second review on 2026-09-19; no question is open. Sequencing confirmed there: the vanished-bucket
+guard lands first ([Q14](#q14--answered-the-vanished-bucket-guard-lands-first)).
 **Scope:** this repo (`stackit-s3-provisioner`).
 **ADR:** its own, written as part of implementing this ticket (see
 [Q11](#q11--answered-its-own-adr-written-with-the-implementation)) — not signed off in advance.
@@ -103,7 +105,11 @@ in seconds instead of at the next restart, when somebody is watching.
 
 Order, all of it before anything is swapped:
 
-1. Read the file. Empty or unreadable → reject.
+1. Read the file **once** and keep the bytes. Empty or unreadable → reject. The bytes are what gets
+   hashed (A1) and what the SDK receives: core v0.26.0 offers `config.WithServiceAccountKey(content)`
+   next to `WithServiceAccountKeyPath`, so the candidate client is built from the same bytes that
+   were validated, and no second read of a file that may be mid-rewrite happens between the hash and
+   the client construction. Verified in the module cache on 2026-09-19.
 2. `stackit.LoadAccount` → reject if it does not parse or carries no `projectId`.
 3. **Project sanity check:** reject if `projectId` differs from the one the running process started
    with ([Q1](#q1--answered-project-binding)). One string comparison, no state, no configuration — it
@@ -118,7 +124,9 @@ Order, all of it before anything is swapped:
    1-4 all pass for a perfectly well-formed key that the provider has revoked.
 
 Only after (5) does the swap happen. Every rejection increments a counter and logs once per distinct
-file hash (not once per tick).
+file hash (not once per tick). The probe in (5) does **not** consult the circuit breaker's `Allow()`
+([Q15](#q15--answered-the-validation-probe-bypasses-the-circuit-breaker)), and a rejected candidate
+is retried on the schedule of [Q16](#q16--answered-a-rejected-candidate-is-retried-with-a-backoff).
 
 ### A3 — The swap
 
@@ -160,7 +168,12 @@ replica must already hold a fresh client at the moment it takes the lease, not s
   was loaded; makes "this pod is running a key from before the rotation" a query
 * `stackit_s3_provisioner_sa_key_reload_failing` (gauge 0/1) — a rejected reload must be loud, or it
   looks exactly like a healthy operator right up to the moment the old key expires
-* A `PrometheusRule` entry for a rejection that persists
+* `stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds` (gauge, absolute Unix time) — the
+  `validUntil` of the loaded key, exported only when the file carries the field; re-set on every
+  swap ([Q17](#q17--answered-the-keys-validuntil-is-exported-as-a-timestamp-gauge))
+* `PrometheusRule` entries: a rejection that persists; the key expiring within 14 days (warning)
+  and within 3 days (critical), both computed as `<gauge> - time()` in the rule, never as a
+  countdown exported by the operator
 
 Log the `projectId` and the SA issuer on a successful reload. Never the file content.
 
@@ -402,6 +415,87 @@ re-create once, and its own open questions. It is a **precondition** of hot relo
 stands on the out-of-band-deletion bug alone, and it is what lets this ticket's ADR describe the
 project check honestly as a guardrail.
 
+### Q13 — ANSWERED: ADR 0005 D8 is struck through, the reload contract gets its own record
+**Decision (2026-09-19): approved.** ADR 0005 D8 ("the binding is fixed for the lifetime of the
+process ... replacing the key ... takes effect on the next restart") contradicts this ticket for the
+credential and stays true for project and region. D8 is struck through in place with a pointer to the
+new record; the Residual-risks paragraph "replacing the key requires restarting the operator" and the
+index row are trued up in the same change. D1 (the project comes from the key) and D2 (region at
+install time) are untouched. The new record carries the whole reload contract: the key as the single
+runtime-mutable input ([Q9](#q9--answered-the-service-account-key-and-nothing-else)), validate-before-
+swap, the rejection and retry semantics, the project check as a guardrail, the metrics, and under
+Consequences the widened effect of a write to the key Secret (Security considerations above).
+Numbering is assigned when written; the vanished-bucket record precedes it
+([Q14](#q14--answered-the-vanished-bucket-guard-lands-first)).
+
+Rejected: amending D8 in place inside ADR 0005 with no separate record. The reload contract is more
+than one rule and has alternatives of its own (fsnotify, self-restart, checksum annotation), and
+[Q11](#q11--answered-its-own-adr-written-with-the-implementation) had already decided on a separate
+record.
+
+### Q14 — ANSWERED: the vanished-bucket guard lands first
+**Decision (2026-09-19): confirmed — [005](005-a-provisioned-bucket-that-vanished-is-reported.md)
+is implemented before this ticket.** Put to the user again because the dependency is one of
+documentation honesty, not of code: the restart-with-a-foreign-key path exists today and hot reload
+does not widen it (the in-process project check rejects a foreign key where today's restart adopts
+it). The alternative — this ticket first, with the gap named under Residual risks and closed when the
+guard lands — was offered and declined. The rotation feature therefore waits for the guard.
+
+### Q15 — ANSWERED: the validation probe bypasses the circuit breaker
+**Decision (2026-09-19): the probe of A2.5 does not consult `Allow()`, and ADR 0013 D4 is amended
+to say so.** D4 reads "while the breaker is open the operator makes no provider call at all"; it gains
+the exception "except the single validation call of a candidate service-account key", approved by
+the user in this review. Reason: the one scenario where it matters is an old key revoked before the
+new one arrived — the circuit is then open, tripped by `400 invalid_grant` (verified: a structured
+refusal runs through `fail()` and therefore `Breaker.Failure()`,
+[bucket_controller.go:1559](../../internal/controller/bucket_controller.go#L1559)). Obeying `Allow()`
+would delay the reload by up to `--provider-circuit-max-cooldown` while reconcile probes with the dead
+key keep doubling the cooldown. The probe is one call per distinct file hash on the schedule of
+[Q16](#q16--answered-a-rejected-candidate-is-retried-with-a-backoff), which cannot drive a provider
+blip into a rate limit — the thing the breaker exists to prevent. Its success calls `Success()`
+([Q4](#q4--answered-a-successful-reload-resets-the-breaker)); its failure never calls `Failure()`.
+
+Rejected: obeying `Allow()`. No record change, but up to five minutes of delay in the scenario hot
+reload is meant to heal, plus a third reload result ("held") that says nothing about the key.
+
+### Q16 — ANSWERED: a rejected candidate is retried with a backoff
+**Decision (2026-09-19): two rejection classes, two schedules; a candidate is never given up on
+while its hash differs from the loaded key.**
+
+| Rejection | Cases | Retry |
+|---|---|---|
+| Definitive | empty or unparsable file, foreign `projectId`, SDK rejects the PEM, structured `400`/`401`/`403` on the probe (`stackit.ProviderRefused`) | doubling interval starting at one tick (30s, 60s, 2m, 4m, ...), capped at 10min, reset when the file hash changes |
+| Non-definitive | 5xx, HTML gateway page, transport error — anything `apiAnswer` does not accept as an answer | every tick, no backoff: the provider is not answering and the candidate is innocent |
+
+The case that decides the policy: a freshly issued key the token endpoint does not know yet answers
+with a *definitive* `400` for a while. **Not verified** that STACKIT has such a propagation delay; the
+policy has to survive it either way. Worst-case cost of the chosen policy with a foreign key left in
+place permanently: one token request every 10 minutes, in a state that already alarms via
+`stackit_s3_provisioner_sa_key_reload_failing`.
+
+Rejected: holding a definitively rejected hash until it changes (zero calls, but a delayed-activation
+key is rejected until somebody touches the file, and the alert then fires for a case the operator
+could have healed); retrying every tick regardless (the rate-limit exposure of ADR 0013 for no gain).
+
+### Q17 — ANSWERED: the key's `validUntil` is exported as a timestamp gauge
+**Decision (2026-09-19): in scope.** `LoadAccount` reads `validUntil` (parsed by the SDK today,
+read by nothing — [docs/developer/stackit-api.md](../developer/stackit-api.md)) and the operator
+exports it as `stackit_s3_provisioner_sa_key_valid_until_timestamp_seconds`, an absolute Unix time,
+present only when the file carries the field, re-set on every swap. Two `PrometheusRule` entries
+compute the remaining lifetime in the rule — `<gauge> - time() < 14 * 86400` (warning),
+`< 3 * 86400` (critical). Reason: the reload answers "does the new key arrive"; the gauge answers
+"does it arrive in time", which is the question a 90-day rotation actually asks. The
+`_timestamp_seconds` shape follows the three existing timestamp gauges in the operator; a countdown
+exported by the operator was rejected because it changes on every scrape, makes the pod's clock a
+fault source, and looks healthy from a hung exporter.
+
+**Verified on 2026-09-19:** the production key in the `awe-d` cluster (Secret
+`storage-provisioner/stackit-sa-key`) carries `validUntil`, set by the provider to exactly 90 days
+after `createdAt` — the rotation period is encoded in the key itself, so the gauge measures the
+process rule directly. The e2e key (`account-1.json`) carries **no** `validUntil`; the absent-gauge
+path is therefore what the offline and e2e tests exercise, and it must be a tested path, not a
+fallback. A `createdAt`-based gauge was considered as a substitute and dropped once the production
+key was checked.
 
 ## References
 

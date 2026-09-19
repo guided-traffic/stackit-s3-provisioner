@@ -187,7 +187,7 @@ with reason `ProviderUnreachable`, a `Warning` event with reason `Failed` is sti
 and the error is still in `status.message` — but the health check passes. The hold is bounded
 by `providerDegradedGrace` (`30m` # default); once it elapses the `Bucket` drops to `Failed`
 and the health check fails as it did before
-([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D5). A closed list of cases
+([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D5). An enumerated set of cases
 skips the hold entirely and drops `Ready` at once — a structured `400`, `401` or `403` from the
 provider (a revoked service-account key is the `400`), a workload credential the operator
 itself destroyed, a configuration fault, a `Bucket` being deleted, a spec that has not been

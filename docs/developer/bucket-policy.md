@@ -361,7 +361,7 @@ attribution chain itself is [bucket-identity.md](bucket-identity.md); the saniti
 second line of defence behind it, not the first.
 
 An entry that does not resolve is skipped with a `ReadGrantPending` warning event and never blocks
-the grantor's readiness. The closed list of skips is
+the grantor's readiness. The enumerated skips are
 [ADR 0008](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md) D5; where it
 sits in the pass, and the grantee watch that wakes grantors, is
 [reconcile-pipeline.md](reconcile-pipeline.md).

@@ -80,9 +80,10 @@ that arose while talking to another system is non-definitive and is held. Where 
 structured answer must be told apart from an intermediary's error page, the discriminator is the
 shape of the body - a structured answer against anything else - and never the status code alone.
 
-**D3 - An unrecognised error is non-definitive by construction.** The definitive set is a closed
-list maintained here; everything not on it is held. The default is reached by not being enumerated,
-so a new provider failure mode cannot land on the wrong side of the line by being unknown.
+**D3 - An unrecognised error is non-definitive by construction.** The definitive set is
+enumerated in this record and grows only by amending it; everything not enumerated is held. The
+default is reached by not being enumerated, so a new provider failure mode cannot land on the wrong
+side of the line by being unknown.
 
 **D4 - A held state is reported separately, and the existing signals are unchanged.** While a Bucket
 is held it carries `status.degradedSince` (the moment the run of failures began, written once and
@@ -100,8 +101,8 @@ record, keeping `status.degradedSince` so the status still says when the trouble
 disables the hold entirely and restores the previous behaviour without a different image. The grace
 is not per-Bucket: no Bucket can ask for a longer or a shorter hold than the operator's.
 
-**D6 - The exceptions are a closed list, and each one drops `Ready` immediately whatever the grace
-says.**
+**D6 - The exceptions are the cases enumerated below, and each one drops `Ready` immediately
+whatever the grace says.**
 
 | Case | Why it is definitive |
 | --- | --- |
