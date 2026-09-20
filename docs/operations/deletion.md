@@ -188,10 +188,9 @@ stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds
 ```
 
 The operator also logs `provider circuit open; deferring teardown` with the bucket
-name and the retry delay. It is a debug-verbosity line; the operator's default logging
-is development mode, under which debug lines are emitted (`cmd/main.go`). *Not
-verified against the pinned controller-runtime release:* the debug-by-default
-behaviour was read in an older version of that library present locally.
+name and the retry delay. It is a debug-verbosity line, which the chart's default
+`logging.level: info` does not emit; set `logging.level: debug` to see it
+([configuration.md](configuration.md#the-log-level)).
 
 There is nothing to do here but wait, or fix the provider. Do not remove the finalizer
 to "help" — the resources are still there and the teardown will run. See

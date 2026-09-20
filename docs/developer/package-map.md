@@ -193,8 +193,12 @@ the release.
 the chart can pass whichever is more convenient; the exceptions are `--metrics-bind-address`,
 `--health-probe-bind-address` and `--leader-elect`, which take literal defaults only. One setting
 runs the other way and has no flag at all: the clone Job's pod resources are read from
-`CLONE_JOB_RESOURCES` as JSON, which is how the chart passes `clone.resources` through. What `main`
-decides, in order:
+`CLONE_JOB_RESOURCES` as JSON, which is how the chart passes `clone.resources` through. The log
+level is the odd one out: `--zap-log-level` is bound by controller-runtime, not declared here, so
+it cannot take `LOGLEVEL` as its default the way the operator's own flags do; `applyLogLevelEnv`
+feeds the variable through the flag's parser after `flag.Parse` unless the flag was given
+explicitly, which keeps one set of accepted values and the flag-beats-variable precedence. What
+`main` decides, in order:
 
 1. Parses flags, then validates the naming policy — an invalid `--bucket-name-prefix` exits at
    startup rather than producing unusable bucket names later.

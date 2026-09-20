@@ -149,7 +149,7 @@ only when `providerHoldNeedsWrite` says the record would actually change:
 
 The `Warning` event with reason `Failed` comes from `degrade()` and `markFailed()`, which are reached
 only on those two visits. Every other held reconcile therefore emits **no event, no status write and
-no log line at the default verbosity**. That is what turns an hours-long outage into a handful of
+no log line at the chart's default verbosity (`logging.level: info`)**. That is what turns an hours-long outage into a handful of
 writes; `TestProviderCircuitHoldsReadyWithoutChurn` pins it.
 
 The error text recorded on the object is `errProviderUnavailable`, wrapped with the remaining wait:

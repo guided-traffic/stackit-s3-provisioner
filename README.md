@@ -335,6 +335,9 @@ tolerations: []                          # default
 affinity: {}                             # default
 leaderElection:
   enabled: true                          # default; keep it on
+logging:
+  level: info                            # default; debug, info, error, panic or an integer > 0;
+                                         # there is no warn - reaches the pod as LOGLEVEL
 driftResyncInterval: "10m"               # default; Go duration WITH a unit, "0" disables
 providerDegradedGrace: "30m"             # default; "0" disables the hold on Ready
 providerCircuit:
@@ -429,8 +432,10 @@ values render Kubernetes objects instead and map to no flag — `crds.install`, 
 `image`, `imagePullSecrets`, `nameOverride`, `fullnameOverride`, `serviceAccount`,
 `bucketRoles.create`, `podAnnotations`, `podLabels`, `resources`, `nodeSelector`, `tolerations`,
 `affinity`, `clone.networkPolicy.enabled`, everything under `monitoring`, and `clone.resources`,
-which is passed as the `CLONE_JOB_RESOURCES` environment variable. Four of the operator's flags
-have no chart key at all.
+which is passed as the `CLONE_JOB_RESOURCES` environment variable. `logging.level` is passed as
+the `LOGLEVEL` environment variable on purpose — a rendered flag would win over it, and the
+variable is what `kubectl set env` can change. Eight of the operator's flags have no chart key at
+all.
 
 | Flag / environment variable | Default | Meaning |
 | --- | --- | --- |
@@ -438,6 +443,8 @@ have no chart key at all.
 | `--operator-namespace` / `POD_NAMESPACE` | the pod's namespace, injected by the chart | Where that Secret and every clone Job live. |
 | `--metrics-bind-address` | `:8080` | The metrics listener. The chart passes it explicitly, at this value. |
 | `--health-probe-bind-address` | `:8081` | The liveness and readiness listener. The chart passes it explicitly, at this value. |
+| `--zap-log-level` / `LOGLEVEL` | `debug` (development mode) | The log level. The chart sets `LOGLEVEL` from `logging.level` and never renders the flag. |
+| `--zap-devel`, `--zap-encoder`, `--zap-stacktrace-level`, `--zap-time-encoding` | development mode on: console encoder, stack traces from `warn`, RFC 3339 timestamps | The logger's remaining knobs. Only the level has a key; these four keep the operator's built-in defaults, so the log format under this chart is always console lines. |
 
 </details>
 

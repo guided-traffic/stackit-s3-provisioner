@@ -198,9 +198,17 @@ func main() {
 		"Currency the cost estimate is labelled with. Display only; no conversion happens. "+
 			"Can also be set via BUCKET_USAGE_CURRENCY.")
 
+	// Development mode picks the console encoder and a debug default level. The
+	// Helm chart overrides the level through LOGLEVEL (logging.level, info by
+	// default); the encoder stays console either way.
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	if err := applyLogLevelEnv(flag.CommandLine); err != nil {
+		// The logger is not built yet, so this goes where a flag parse error goes.
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -410,6 +418,31 @@ func parseUsagePrice(raw string) (float64, error) {
 }
 
 // envOrDefault returns the value of the environment variable key, or def when unset.
+// applyLogLevelEnv makes LOGLEVEL the fallback for --zap-log-level. The flag is
+// bound by controller-runtime, so unlike the operator's own flags it cannot read
+// the variable as its default; the value is fed through the flag's own parser
+// instead, so both surfaces accept exactly the same levels. An explicit flag
+// wins, and the variable is then not even parsed.
+func applyLogLevelEnv(fs *flag.FlagSet) error {
+	v := os.Getenv("LOGLEVEL")
+	if v == "" {
+		return nil
+	}
+	explicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "zap-log-level" {
+			explicit = true
+		}
+	})
+	if explicit {
+		return nil
+	}
+	if err := fs.Set("zap-log-level", v); err != nil {
+		return fmt.Errorf("invalid value %q for LOGLEVEL: %w", v, err)
+	}
+	return nil
+}
+
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

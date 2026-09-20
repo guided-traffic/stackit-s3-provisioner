@@ -82,6 +82,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Deliberately an environment variable and not the --zap-log-level
+            # flag, so `kubectl set env` can change it without touching the args.
+            # A rendered flag would win over it (see configuration.md).
+            - name: LOGLEVEL
+              value: {{ .Values.logging.level | quote }}
             {{- with .Values.clone.resources }}
             - name: CLONE_JOB_RESOURCES
               value: {{ toJson . | quote }}
