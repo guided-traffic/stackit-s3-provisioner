@@ -304,8 +304,9 @@ Work down this list; each step distinguishes a case the one above cannot.
 
    Two lines matter: `reconcile failed; provider circuit open` (error level, with
    `bucket` and `retryAfter`) and `provider circuit open; deferring teardown`
-   (debug level, emitted for a held deletion). The operator's logger runs in
-   development mode, so debug lines are printed by default.
+   (debug level, emitted for a held deletion). The chart's default
+   `logging.level: info` does not print the second one; set `logging.level: debug`
+   to see held deletions ([configuration.md](configuration.md#the-log-level)).
 
 4. **Read the error, not its status code.** An HTML error page from an
    intermediary and a real refusal by the API arrive in the same shape and can

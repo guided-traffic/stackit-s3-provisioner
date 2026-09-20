@@ -65,7 +65,7 @@ crash-loops. Both are rendered in
 `LOGLEVEL` is the third variable the chart writes, and the one case where the chart has a flag
 available and chooses the variable: `--zap-log-level` exists, `LOGLEVEL` is its fallback, and the
 chart renders only the variable so that `kubectl set env` can change the level without editing the
-container args — a rendered flag would beat it. The other is [the log level](#the-log-level).
+container args — a rendered flag would beat it. It is explained under [the log level](#the-log-level).
 
 A handful of flags are rendered only when their value is non-empty or true — `--bucket-name-prefix`,
 `--bucket-name-include-namespace`, `--ownership-name`, `--enable-wipe-on-delete`, `--leader-elect`,
@@ -462,22 +462,26 @@ as the environment variable `LOGLEVEL`, which the operator reads as the fallback
 `--zap-log-level` — the chart deliberately renders the variable and not the flag, because a
 rendered flag would win over the variable. The accepted values are the same on both surfaces, since
 the variable is fed through the flag's own parser: `debug`, `info`, `error`, `panic`, or an integer
-above 0 selecting a debug depth, where `1` is `debug` and nothing in the operator logs deeper than
-that (every verbosity call site is `V(1)`, verified on 2026-09-20 across
-[`internal/controller/`](../../internal/controller/)). **There is no `warn`.** Anything else is
+above 0 selecting a debug depth, where `1` is `debug`. **There is no `warn`.** Anything else is
 rejected at startup exactly like a duration without a unit; see [Failure modes](#failure-modes).
+The one input the two surfaces treat differently is the empty string: the flag rejects it, while
+an empty `LOGLEVEL` reads as *unset* and the binary falls back to its own default, `debug`. The
+chart therefore refuses to render an empty `logging.level` at all.
 
 Because it is a variable, it can be changed without a Helm upgrade:
 
 ```bash
+NS=stackit-s3-provisioner-system      # example; the release namespace
 kubectl -n $NS set env deployment/stackit-s3-provisioner LOGLEVEL=debug   # example; rolls the pod
 ```
 
 The next `helm upgrade` puts `logging.level` back, so a quick debug session leaves nothing behind
 unless the value is changed there too.
 
-Everything the operator writes at `Info` or `Error` is visible at `info`. What `debug` adds is the
-retry chatter underneath those lines, and this is all of it:
+Everything the operator writes at `Info` or `Error` is visible at `info`. What `debug` adds from
+the operator's own code is the retry chatter underneath those lines — every verbosity call site in
+this repository is `V(1)`, verified on 2026-09-20 across
+[`internal/controller/`](../../internal/controller/), and these are all of them:
 
 | Line at `debug` | What it is |
 | --- | --- |
@@ -486,7 +490,15 @@ retry chatter underneath those lines, and this is all of it:
 | `bucket size measurement waiting for admin credentials`, `bucket size measured`, `bucket size measurement failed` | The measurement controller's own progress ([usage-and-cost.md](usage-and-cost.md)). |
 | `clone stats unavailable` | A clone Job whose progress endpoint did not answer this poll ([cloning.md](cloning.md)). |
 | `could not probe recorded credentials group` | The existence check on a credentials group the `Bucket` no longer attributes failed; the warning event that follows is unaffected ([credentials.md](credentials.md)). |
-| `… status update did not apply`, `… status patch did not apply` | A status write that lost a conflict; the next reconcile writes it again. |
+| `provisioning status update did not apply`, `status update after degradation did not apply`, `status update after failure did not apply`, `wipe status update did not apply`, `clone progress status update did not apply`, `status patch after measurement did not apply`, `usage status patch did not apply` | A status write that lost a conflict; the next reconcile writes it again. |
+
+The framework underneath adds its own lines at the same and at deeper levels. At `debug`, every
+Kubernetes event the operator raises is echoed as `Event occurred` by the `events` logger (seen in
+a live log on 2026-09-20), and a failed health check logs `healthz check failed`. Integer levels of
+`5` and above additionally print controller-runtime's per-reconcile lines — `Reconciling`,
+`Reconcile successful`, `Reconcile done, requeueing after …` — for every pass of both controllers
+(verified in the pinned controller-runtime v0.25.0 source). Levels `2` to `4` add nothing this
+operator or its framework writes.
 
 The format is not part of this setting. The chart leaves the encoder, the stack-trace threshold and
 the timestamp format at the operator's built-in defaults — human-readable console lines, stack

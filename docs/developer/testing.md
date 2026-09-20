@@ -46,7 +46,7 @@ generated DeepCopy code.
 | [api/v1/bucket_types_test.go](../../api/v1/bucket_types_test.go) | Name composition and validation, `EffectiveBucketName`, the Secret data map and its key overrides, the key-collision refusal, the rotation trigger, the `cloneFrom` accessors |
 | [api/v1/bucket_usage_test.go](../../api/v1/bucket_usage_test.go) | The three-state `spec.usage` accessors (`Enabled`, `IncludeVersions`, `Interval`) against a cluster default |
 | [api/v1/deepcopy_test.go](../../api/v1/deepcopy_test.go) | The generated DeepCopy over a fully populated object, so an added field without `make generate-all` is caught |
-| [cmd/main_test.go](../../cmd/main_test.go) | The environment-variable fallbacks for the flags, including that `"0"` survives `envDurationOrDefault` rather than reading as unset — for the key reload it is the documented off switch — and that `setupSAKeyReload` adds nothing to the manager in skeleton mode or at an interval of `0` (it is handed a **nil** manager, which is the cheapest possible proof that neither case reaches one) |
+| [cmd/main_test.go](../../cmd/main_test.go) | The environment-variable fallbacks for the flags, including that `"0"` survives `envDurationOrDefault` rather than reading as unset — for the key reload it is the documented off switch; that `LOGLEVEL` becomes the level through the flag's own parser, is ignored when `--zap-log-level` is given explicitly, and fails with the parser's wording when invalid; and that `setupSAKeyReload` adds nothing to the manager in skeleton mode or at an interval of `0` (it is handed a **nil** manager, which is the cheapest possible proof that neither case reaches one) |
 | [stackit/client_test.go](../../stackit/client_test.go) | Service-account key parsing, and that the two key files name two different projects |
 | [stackit/newclient_test.go](../../stackit/newclient_test.go) | Client construction against a throwaway generated RSA key — parsing and JWT-signer setup only, never a call |
 | [stackit/errors_test.go](../../stackit/errors_test.go) | `ProviderRefused` and `isServiceNotEnabled`, against error bodies captured verbatim from the live API on 2026-08-25, plus the proof that `oapierror.Model` is not a usable discriminator |
@@ -210,7 +210,9 @@ See [The cloud end-to-end run](#the-cloud-end-to-end-run).
 
 [test/helm/render_test.go](../../test/helm/render_test.go) shells out to
 `helm template` and asserts on the rendered user-facing ClusterRoles and on the
-manager container's arguments. It exists because the Kind install only ever
+manager container's arguments and environment — including that `logging.level`
+reaches the container as `LOGLEVEL` and never as a flag, and that an empty level
+fails the render. It exists because the Kind install only ever
 exercises the default values: the non-default combination
 (`bucketRoles.create=false`) and the exact rule shape are visible to nothing
 else.

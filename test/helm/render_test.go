@@ -65,10 +65,9 @@ type object struct {
 	} `json:"spec"`
 }
 
-// render runs `helm template` with the given --set arguments and indexes the
-// rendered objects by kind/name.
-func render(t *testing.T, sets ...string) map[string]object {
-	t.Helper()
+// helmTemplate runs `helm template` with the given --set arguments and returns
+// the rendered manifests, helm's stderr and its error.
+func helmTemplate(sets ...string) ([]byte, string, error) {
 	args := make([]string, 0, 3+2*len(sets))
 	args = append(args, "template", releaseName, chartDir)
 	for _, s := range sets {
@@ -78,7 +77,15 @@ func render(t *testing.T, sets ...string) map[string]object {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
-	require.NoError(t, err, "helm template failed: %s", stderr.String())
+	return out, stderr.String(), err
+}
+
+// render runs `helm template` with the given --set arguments and indexes the
+// rendered objects by kind/name.
+func render(t *testing.T, sets ...string) map[string]object {
+	t.Helper()
+	out, stderr, err := helmTemplate(sets...)
+	require.NoError(t, err, "helm template failed: %s", stderr)
 
 	objs := map[string]object{}
 	dec := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(out), 4096)
@@ -248,4 +255,13 @@ func TestLogLevelRendersAsEnvOnly(t *testing.T) {
 	overridden := manager(t, render(t, "logging.level=debug"))
 	assert.Equal(t, "debug", envValue(overridden.Env, "LOGLEVEL"))
 	assert.False(t, hasArgPrefix(overridden.Args, "--zap-log-level"))
+
+	// An integer level stays a string on the wire, or the API server rejects it.
+	assert.Equal(t, "2", envValue(manager(t, render(t, "logging.level=2")).Env, "LOGLEVEL"))
+
+	// An empty level must fail the render: the operator reads an empty LOGLEVEL
+	// as unset and would silently run at its own default, debug.
+	_, stderr, err := helmTemplate("logging.level=")
+	require.Error(t, err, "an empty logging.level must not render")
+	assert.Contains(t, stderr, "logging.level must be")
 }
