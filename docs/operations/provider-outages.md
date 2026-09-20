@@ -33,7 +33,7 @@ team-a      my-bucket   my-bucket   Ready   True    ensure bucket: unexpected EO
 ```
 
 (The `SIZE` and `COST/MONTH` cells are filled only where size measurement is on;
-six further columns carry `priority=1` and appear with `-o wide` - see
+seven further columns carry `priority=1` and appear with `-o wide` - see
 [bucket-status.md](bucket-status.md).)
 
 ```yaml
@@ -304,8 +304,9 @@ Work down this list; each step distinguishes a case the one above cannot.
 
    Two lines matter: `reconcile failed; provider circuit open` (error level, with
    `bucket` and `retryAfter`) and `provider circuit open; deferring teardown`
-   (debug level, emitted for a held deletion). The operator's logger runs in
-   development mode, so debug lines are printed by default.
+   (debug level, emitted for a held deletion). The chart's default
+   `logging.level: info` does not print the second one; set `logging.level: debug`
+   to see held deletions ([configuration.md](configuration.md#the-log-level)).
 
 4. **Read the error, not its status code.** An HTML error page from an
    intermediary and a real refusal by the API arrive in the same shape and can
@@ -326,6 +327,12 @@ Work down this list; each step distinguishes a case the one above cannot.
    controller runs at controller-runtime's default concurrency of one. The
    fleet-wide rate limit of 1 requeue per second applies to *failed* reconciles
    only, so it does not pace the recovery pass.
+
+   Each recovering `Bucket` reports itself: a `bucket provisioned` line at `Info`
+   and a `Provisioned` event, both carrying `recovered to Ready`
+   ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D2). The
+   fleet is back when those stop arriving, which is cheaper to watch than polling
+   the conditions of every `Bucket`.
 
 ## When a Bucket falls to Failed after the grace
 

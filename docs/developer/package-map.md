@@ -321,7 +321,7 @@ The test tree, with the build tag each suite hides behind:
 | [`test/e2e/e2e_test.go`](../../test/e2e/e2e_test.go) | `e2e` | Kind smoke test in skeleton mode — operator healthy, CR reconciled, no cloud call |
 | [`test/e2e/cloud_test.go`](../../test/e2e/cloud_test.go) | `e2e` + `E2E_STACKIT=1` | the whole chain against the real provider: provisioning, read grants, measurement, a real rclone clone |
 | [`test/e2e/rbac_test.go`](../../test/e2e/rbac_test.go) | `e2e` | that the chart's fragments really aggregate into built-in `view`/`edit`, by SubjectAccessReview |
-| [`test/helm/render_test.go`](../../test/helm/render_test.go) | `helm` | `helm template` assertions on the user-facing roles, including the non-default values the Kind install never exercises |
+| [`test/helm/render_test.go`](../../test/helm/render_test.go) | `helm` | `helm template` assertions on the user-facing roles and on the manager container's args and env, including the non-default values the Kind install never exercises |
 
 Offline tests carry no build tag and live next to the code they cover, so `go test ./...` is the
 complete net-free suite. Which suite to run when, and what each costs, is [testing.md](testing.md).
@@ -356,6 +356,7 @@ complete net-free suite. Which suite to run when, and what each costs, is [testi
 | [`internal/controller/reconciler_errors_test.go`](../../internal/controller/reconciler_errors_test.go) | — | the failure paths, and that a failed Secret write rolls the freshly minted key back |
 | [`internal/controller/reconciler_degraded_test.go`](../../internal/controller/reconciler_degraded_test.go) | — | sticky readiness: what is held, what is never held, and grace expiry |
 | [`internal/controller/reconciler_circuit_test.go`](../../internal/controller/reconciler_circuit_test.go) | — | the breaker in the reconciler: trip, hold without churn, grace, recovery, an isolated broken bucket, deferred teardown |
+| [`internal/controller/reconciler_report_test.go`](../../internal/controller/reconciler_report_test.go) | — | the reporting of a successful pass: change versus verification, the first pass after a start, `lastVerifiedTime` |
 | [`internal/controller/breaker_test.go`](../../internal/controller/breaker_test.go) | — | the breaker alone, on a manually advanced clock |
 | [`internal/controller/reconciler_clone_test.go`](../../internal/controller/reconciler_clone_test.go) | — | hold semantics, progress, job failure retry, guards, artifact teardown, job-name length |
 | [`internal/controller/reconciler_usage_test.go`](../../internal/controller/reconciler_usage_test.go) | — | the measurement controller: gate, default, clamp, cap, versions, failure, skip conditions |
@@ -365,7 +366,7 @@ complete net-free suite. Which suite to run when, and what each costs, is [testi
 | [`internal/controller/attribution_integration_test.go`](../../internal/controller/attribution_integration_test.go) | `integration` | the legacy-bucket migration against the real API, creating and deleting nothing |
 | [`internal/stackitfake/fake_test.go`](../../internal/stackitfake/fake_test.go) | — | the fake's own routing and inspection helpers |
 | [`test/integration/sa_key_reload_test.go`](../../test/integration/sa_key_reload_test.go) | `integration` | envtest: the key poller runs on a manager whose lease is held by another identity |
-| [`cmd/main_test.go`](../../cmd/main_test.go) | — | the environment helpers, and the two ways the key reload stays off |
+| [`cmd/main_test.go`](../../cmd/main_test.go) | — | the environment helpers, the `LOGLEVEL` fallback and its precedence, and the two ways the key reload stays off |
 
 </details>
 

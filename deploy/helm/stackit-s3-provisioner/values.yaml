@@ -86,7 +86,8 @@ logging:
   # also be changed with `kubectl set env` (which rolls the pod) without a Helm
   # upgrade. Accepted: debug, info, error, panic, or an integer above 0 selecting
   # a debug depth. There is NO warn; anything else is rejected at startup and
-  # crash-loops the operator.
+  # crash-loops the operator. An empty value fails the render: the operator would
+  # read an empty LOGLEVEL as unset and fall back to its own default, debug.
   level: info
 
 # driftResyncInterval is how often an already-provisioned Bucket is re-reconciled

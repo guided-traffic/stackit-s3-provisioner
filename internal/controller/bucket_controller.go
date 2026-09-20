@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,6 +82,12 @@ type BucketReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
+
+	// verifiedSinceStart holds every Bucket this process has completed a
+	// successful pass over. The first such pass is reported at Info even when it
+	// changed nothing, so a restart or a leader change shows the state of the
+	// fleet once; every later unchanged pass is silent at the default level.
+	verifiedSinceStart sync.Map
 
 	// Stackit is the StackIT Object Storage client bound to this operator's project.
 	// It is nil when the operator runs without a service-account key (skeleton mode);
@@ -313,6 +320,7 @@ func (r *BucketReconciler) reconcileDelete(ctx context.Context, b *s3v1.Bucket) 
 
 // dropFinalizer releases the CR once its cloud resources are gone.
 func (r *BucketReconciler) dropFinalizer(ctx context.Context, b *s3v1.Bucket) (ctrl.Result, error) {
+	r.verifiedSinceStart.Delete(client.ObjectKeyFromObject(b))
 	controllerutil.RemoveFinalizer(b, s3v1.BucketFinalizer)
 	return ctrl.Result{}, client.IgnoreNotFound(r.Update(ctx, b))
 }
@@ -321,8 +329,6 @@ func (r *BucketReconciler) dropFinalizer(ctx context.Context, b *s3v1.Bucket) (c
 // step is idempotent so repeated reconciles converge without creating duplicate
 // cloud resources.
 func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
 	// Configuration faults a retry cannot fix are surfaced without a requeue
 	// hammer (they re-reconcile on spec change).
 	if err := r.specGuardError(b); err != nil {
@@ -342,6 +348,13 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	if err := r.persistResolvedName(ctx, b, name); err != nil {
 		return r.fail(ctx, b, fmt.Errorf("persist resolved bucket name: %w", err))
 	}
+
+	// changes collects what this pass actually does, so the terminal report can
+	// tell a pass that changed something from one that only verified.
+	var changes passChanges
+	changes.note(b.Status.ObservedGeneration != b.Generation, fmt.Sprintf("spec generation %d observed", b.Generation))
+	// Read before markProvisioning, which overwrites the phase this looks at.
+	changes.note(recovering(b), "recovered to Ready")
 
 	r.markProvisioning(ctx, b)
 
@@ -366,6 +379,7 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	if err != nil {
 		return r.failEnsureBucket(ctx, b, err)
 	}
+	changes.note(freshBucket, "bucket created")
 	if recreating && freshBucket {
 		r.reportAuthorizedRecreate(ctx, b, name)
 	}
@@ -375,7 +389,7 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("bucket connection info: %w", err))
 	}
 
-	creds, done, res, err := r.provisionCredentialsAndClone(ctx, b, name, admin, host, bucketURL, freshBucket)
+	creds, done, res, err := r.provisionCredentialsAndClone(ctx, b, name, admin, host, bucketURL, freshBucket, &changes)
 	if !done {
 		return res, err
 	}
@@ -393,6 +407,11 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	b.Status.OperatorVersion = r.OperatorVersion
 	b.Status.Phase = s3v1.PhaseReady
 	b.Status.Message = fmt.Sprintf("bucket %q provisioned with isolated workload credentials", name)
+	// Every successful pass advances lastVerifiedTime, changed or not: it is the
+	// per-object proof that the resync is running, now that an unchanged pass
+	// raises no event and logs nothing at the default level.
+	now := metav1.Now()
+	b.Status.LastVerifiedTime = &now
 	// The provider answered for every step of this pass, so any held-over
 	// degradation is over. The bucket was verified present (or re-created) in
 	// this pass too, so a previous BucketMissing report is over as well — removed
@@ -412,8 +431,7 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	// The provider answered every call in this pass, so it is reachable: close
 	// the breaker even if earlier Buckets in this sweep failed.
 	r.Breaker.Success()
-	logger.Info("bucket provisioned", "bucket", name, "requested", b.Spec.BucketName, "credentialsGroup", creds.gid)
-	r.event(b, corev1.EventTypeNormal, s3v1.ReasonProvisioned, "bucket and isolated workload credentials provisioned")
+	r.reportPass(ctx, b, name, creds, changes)
 	// Requeue on a timer so drift (notably a policy change from an operator
 	// upgrade) self-heals without an event. RequeueAfter <= 0 means no requeue,
 	// so a zero interval leaves the behavior unchanged (event-driven only).
@@ -444,6 +462,37 @@ func (r *BucketReconciler) specGuardError(b *s3v1.Bucket) error {
 
 // workloadCreds bundles the provisioned credential identifiers recorded in
 // Bucket status after a successful reconcile.
+// passChanges names what a provisioning pass actually did — a bucket created,
+// a policy rewritten, a credential issued. Empty means the pass only verified.
+type passChanges []string
+
+// note records what when did is true.
+func (c *passChanges) note(did bool, what string) {
+	if did {
+		*c = append(*c, what)
+	}
+}
+
+// reportPass ends a successful pass. A pass that changed something is reported
+// at Info, naming what it did, and raises the Provisioned event. A pass that only
+// verified is silent at the default level — except the first one this process
+// completes for the Bucket, which is reported at Info without an event, so a
+// restart or a leader change shows the state of the fleet once.
+func (r *BucketReconciler) reportPass(ctx context.Context, b *s3v1.Bucket, name string, creds workloadCreds, changes passChanges) {
+	logger := log.FromContext(ctx).WithValues("bucket", name, "requested", b.Spec.BucketName, "credentialsGroup", creds.gid)
+	_, seen := r.verifiedSinceStart.LoadOrStore(client.ObjectKeyFromObject(b), struct{}{})
+	switch {
+	case len(changes) > 0:
+		logger.Info("bucket provisioned", "changes", []string(changes))
+		r.event(b, corev1.EventTypeNormal, s3v1.ReasonProvisioned,
+			"bucket and isolated workload credentials provisioned: "+strings.Join(changes, ", "))
+	case !seen:
+		logger.Info("bucket verified after operator start")
+	default:
+		logger.V(1).Info("bucket verified")
+	}
+}
+
 type workloadCreds struct {
 	gid, urn, accessKeyID string
 
@@ -469,8 +518,10 @@ type workloadCreds struct {
 // up front. Ready always waits for the clone either way.
 func (r *BucketReconciler) provisionCredentialsAndClone(
 	ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds, host, bucketURL string, freshBucket bool,
+	changes *passChanges,
 ) (workloadCreds, bool, ctrl.Result, error) {
 	var creds workloadCreds
+	var issued bool
 	failed := func(err error) (workloadCreds, bool, ctrl.Result, error) {
 		res, rerr := r.fail(ctx, b, err)
 		return creds, false, res, rerr
@@ -480,10 +531,11 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 	if err != nil {
 		return failed(fmt.Errorf("list credentials groups: %w", err))
 	}
-	group, err := r.resolveWorkloadGroup(ctx, b, name, admin, groups, true, freshBucket)
+	group, attributed, err := r.resolveWorkloadGroup(ctx, b, name, admin, groups, true, freshBucket)
 	if err != nil {
 		return failed(fmt.Errorf("ensure credentials group: %w", err))
 	}
+	changes.note(attributed, "credentials group attributed")
 	creds.gid, creds.urn = group.id, group.urn
 	// Publish the group identity as soon as it exists rather than only on the
 	// terminal status write. It is the signal grantors watch for
@@ -510,7 +562,9 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 	applyPolicy := func(readers, granted []string) error {
 		creds.grantedTo = granted
 		b.Status.GrantedReadTo = granted
-		return r.ensureBucketPolicy(ctx, name, admin, creds.urn, readers)
+		written, err := r.ensureBucketPolicy(ctx, name, admin, creds.urn, readers)
+		changes.note(written, "isolation policy written")
+		return err
 	}
 
 	// While a clone is still populating the bucket, granted readers stay out of
@@ -536,10 +590,11 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 
 	if cloning {
 		if !b.Spec.CloneFrom.HoldSecret() {
-			creds.accessKeyID, err = r.ensureAccessKeyAndSecret(ctx, b, creds.gid, host, bucketURL)
+			creds.accessKeyID, issued, err = r.ensureAccessKeyAndSecret(ctx, b, creds.gid, host, bucketURL)
 			if err != nil {
 				return failed(fmt.Errorf("ensure workload credentials: %w", err))
 			}
+			changes.note(issued, "workload credentials issued")
 			// Record a just-performed rotation immediately: the terminal status
 			// write is not reached while the clone runs, and the pending trigger
 			// would otherwise re-rotate on every clone poll. The clone progress
@@ -550,6 +605,7 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 		if !done {
 			return creds, false, res, cerr
 		}
+		changes.note(true, "clone completed")
 		// The copy finished in this very pass, so the reader hold above is over:
 		// re-apply the policy, now including the granted readers. Without this the
 		// grants would only land on the next reconcile.
@@ -559,10 +615,11 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 	}
 
 	if creds.accessKeyID == "" {
-		creds.accessKeyID, err = r.ensureAccessKeyAndSecret(ctx, b, creds.gid, host, bucketURL)
+		creds.accessKeyID, issued, err = r.ensureAccessKeyAndSecret(ctx, b, creds.gid, host, bucketURL)
 		if err != nil {
 			return failed(fmt.Errorf("ensure workload credentials: %w", err))
 		}
+		changes.note(issued, "workload credentials issued")
 	}
 	return creds, true, ctrl.Result{}, nil
 }
@@ -925,42 +982,47 @@ func (r *BucketReconciler) listGroups(ctx context.Context) (*groupIndex, error) 
 // The group's display name is never consulted.
 func (r *BucketReconciler) resolveWorkloadGroup(
 	ctx context.Context, b *s3v1.Bucket, name string, admin *adminCreds, groups *groupIndex, create, freshBucket bool,
-) (workloadGroupRef, error) {
+) (workloadGroupRef, bool, error) {
 	s3admin, err := r.newS3Admin(ctx, name, admin)
 	if err != nil {
-		return workloadGroupRef{}, err
+		return workloadGroupRef{}, false, err
 	}
 	tags, err := s3admin.BucketTags(ctx, name)
 	if err != nil {
-		return workloadGroupRef{}, err
+		return workloadGroupRef{}, false, err
 	}
 	if !r.isOwnedByUs(tags, b) {
-		return workloadGroupRef{}, fmt.Errorf("%w: bucket %q carries managed-by=%q owner=%q",
+		return workloadGroupRef{}, false, fmt.Errorf("%w: bucket %q carries managed-by=%q owner=%q",
 			errBucketNotOwned, name, tags[tagOwnershipManagedBy], tags[tagOwnershipOwner])
 	}
-	// stamp records the group on the bucket, preserving every other tag.
+	// stamp records the group on the bucket, preserving every other tag. Every
+	// write this resolution can make goes through it — a URN backfill, the
+	// policy migration, a fresh group — so it is also what reports the change.
+	written := false
 	stamp := func(ref workloadGroupRef) error {
 		tags[tagCredentialsGroupID] = ref.id
 		tags[tagCredentialsGroupURN] = ref.urn
 		if err := s3admin.SetBucketTags(ctx, name, tags); err != nil {
 			return fmt.Errorf("record credentials group %s on bucket %q: %w", ref.id, name, err)
 		}
+		written = true
 		return nil
 	}
 
 	if ref, found, err := r.groupFromTags(ctx, name, tags, groups, stamp); err != nil || found {
-		return ref, err
+		return ref, written, err
 	}
 	if ref, found, err := r.groupFromPolicy(ctx, s3admin, b, name, groups, stamp); err != nil || found {
-		return ref, err
+		return ref, written, err
 	}
 	if !create {
-		return workloadGroupRef{}, fmt.Errorf("%w: bucket %q", errGroupNotAttributable, name)
+		return workloadGroupRef{}, false, fmt.Errorf("%w: bucket %q", errGroupNotAttributable, name)
 	}
 	if err := r.guardGroupCreate(ctx, b, name, freshBucket); err != nil {
-		return workloadGroupRef{}, err
+		return workloadGroupRef{}, false, err
 	}
-	return r.createWorkloadGroup(ctx, b, stamp)
+	ref, err := r.createWorkloadGroup(ctx, b, stamp)
+	return ref, written, err
 }
 
 // groupFromTags resolves the group the bucket's tags name. The group's
@@ -1118,34 +1180,34 @@ func (e *ownershipCollisionError) Error() string {
 // Errors raised after the clear are wrapped in errCredentialDestroyed: from that
 // point the workload's published credential is known dead, which the degraded
 // hold must not paper over.
-func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1.Bucket, groupID, host, bucketURL string) (string, error) {
+func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1.Bucket, groupID, host, bucketURL string) (accessKeyID string, issued bool, err error) {
 	secretKey := types.NamespacedName{Name: b.Spec.SecretRef.Name, Namespace: b.Namespace}
 
 	var sec corev1.Secret
 	getErr := r.Get(ctx, secretKey, &sec)
 	if getErr != nil && !apierrors.IsNotFound(getErr) {
-		return "", fmt.Errorf("get credentials secret %s: %w", secretKey, getErr)
+		return "", false, fmt.Errorf("get credentials secret %s: %w", secretKey, getErr)
 	}
 
 	keyIDs, err := r.Stackit.ListAccessKeyIDs(ctx, groupID)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	if getErr == nil && secretHasCreds(&sec, b) && len(keyIDs) > 0 && b.PendingRotationTrigger() == "" {
 		// Already provisioned, the group still backs the credential and no
 		// rotation is requested.
-		return secretAccessKeyID(&sec, b), nil
+		return secretAccessKeyID(&sec, b), false, nil
 	}
 
 	// (Re)provision. Clear any stale keys first so a crash-orphaned key cannot
 	// accumulate, then create the single fresh key.
 	if err := r.Stackit.DeleteAllAccessKeys(ctx, groupID); err != nil {
-		return "", fmt.Errorf("clear stale access keys: %w", err)
+		return "", false, fmt.Errorf("clear stale access keys: %w", err)
 	}
 	ak, err := r.Stackit.CreateAccessKey(ctx, groupID)
 	if err != nil {
-		return "", fmt.Errorf("%w: create replacement access key: %w", errCredentialDestroyed, err)
+		return "", false, fmt.Errorf("%w: create replacement access key: %w", errCredentialDestroyed, err)
 	}
 	data := b.SecretData(s3v1.SecretValues{
 		AccessKeyID:     ak.AccessKeyID,
@@ -1159,9 +1221,9 @@ func (r *BucketReconciler) ensureAccessKeyAndSecret(ctx context.Context, b *s3v1
 		if delErr := r.Stackit.DeleteAccessKey(ctx, groupID, ak.KeyID); delErr != nil {
 			log.FromContext(ctx).Error(delErr, "failed to roll back orphaned access key", "group", groupID)
 		}
-		return "", fmt.Errorf("%w: write credentials secret %s: %w", errCredentialDestroyed, secretKey, err)
+		return "", false, fmt.Errorf("%w: write credentials secret %s: %w", errCredentialDestroyed, secretKey, err)
 	}
-	return ak.AccessKeyID, nil
+	return ak.AccessKeyID, true, nil
 }
 
 // recordPendingRotation stamps a just-performed annotation-triggered rotation
@@ -1272,7 +1334,7 @@ func (r *BucketReconciler) resolveReadGrants(
 			pending(ref.Name, "has no bucket yet")
 			continue
 		}
-		group, err := r.resolveWorkloadGroup(ctx, &grantee, granteeBucket, admin, groups, false, false)
+		group, _, err := r.resolveWorkloadGroup(ctx, &grantee, granteeBucket, admin, groups, false, false)
 		switch {
 		case err == nil:
 		case errors.Is(err, errGroupNotAttributable):
@@ -1296,16 +1358,19 @@ func (r *BucketReconciler) resolveReadGrants(
 // policy at its two original statements.
 func (r *BucketReconciler) ensureBucketPolicy(
 	ctx context.Context, name string, admin *adminCreds, workloadURN string, readerURNs []string,
-) error {
+) (written bool, err error) {
 	s3admin, err := r.newS3Admin(ctx, name, admin)
 	if err != nil {
-		return err
+		return false, err
 	}
 	desired := stackit.BuildIsolationPolicy(name, admin.urn, workloadURN, readerURNs)
 	if current, err := s3admin.GetBucketPolicy(ctx, name); err == nil && stackit.PoliciesEquivalent(current, desired) {
-		return nil
+		return false, nil
 	}
-	return s3admin.SetBucketPolicy(ctx, name, desired)
+	if err := s3admin.SetBucketPolicy(ctx, name, desired); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // teardown releases the StackIT resources backing a Bucket during finalization,
@@ -1508,7 +1573,7 @@ func (r *BucketReconciler) releaseWorkloadGroup(ctx context.Context, b *s3v1.Buc
 	if err != nil {
 		return err
 	}
-	group, err := r.resolveWorkloadGroup(ctx, b, name, admin, groups, false, false)
+	group, _, err := r.resolveWorkloadGroup(ctx, b, name, admin, groups, false, false)
 	switch {
 	case err == nil:
 	case errors.Is(err, errGroupNotAttributable), errors.Is(err, errBucketNotOwned):
@@ -1788,6 +1853,18 @@ func (r *BucketReconciler) holdsReadyThrough(b *s3v1.Bucket, err error) bool {
 // The condition is removed rather than set to True so that a Bucket which never
 // degraded and one which recovered look identical, and so an operator upgrade
 // writes nothing to Buckets that are simply healthy.
+// recovering reports whether this Bucket is currently in a state a successful
+// pass ends: held through a provider outage, reported Failed, or reported with
+// its bucket missing. Such a pass often writes nothing at the provider, so
+// without this note it would be reported as unchanged — yet the recovery is
+// exactly what somebody watching an outage is waiting for.
+func recovering(b *s3v1.Bucket) bool {
+	return b.Status.Phase == s3v1.PhaseFailed ||
+		b.Status.DegradedSince != nil ||
+		meta.FindStatusCondition(b.Status.Conditions, s3v1.ConditionProviderReachable) != nil ||
+		meta.FindStatusCondition(b.Status.Conditions, s3v1.ConditionBucketPresent) != nil
+}
+
 func clearDegraded(b *s3v1.Bucket) {
 	b.Status.DegradedSince = nil
 	meta.RemoveStatusCondition(&b.Status.Conditions, s3v1.ConditionProviderReachable)

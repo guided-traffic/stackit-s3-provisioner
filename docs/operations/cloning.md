@@ -179,7 +179,7 @@ at the source are left alone, which is what makes a retry safe
 ```bash
 kubectl -n team-a get bkt my-bucket -o wide
 # columns abbreviated to the clone-relevant ones; -o wide also prints
-# REGION, SIZE, COST/MONTH, DEGRADED, RESOLVED, SECRET, OBJECTS, MEASURED, AGE
+# REGION, SIZE, COST/MONTH, DEGRADED, RESOLVED, SECRET, OBJECTS, MEASURED, VERIFIED, AGE
 # NAME        BUCKET      PHASE          READY   STATUS                                              CLONE
 # my-bucket   my-bucket   Provisioning   False   cloning from …/seed-data: 2.0 GiB / 18.0 GiB (11%)   2.0 GiB / 18.0 GiB (11%)
 ```

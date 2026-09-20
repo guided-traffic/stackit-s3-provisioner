@@ -65,7 +65,7 @@ crash-loops. Both are rendered in
 `LOGLEVEL` is the third variable the chart writes, and the one case where the chart has a flag
 available and chooses the variable: `--zap-log-level` exists, `LOGLEVEL` is its fallback, and the
 chart renders only the variable so that `kubectl set env` can change the level without editing the
-container args — a rendered flag would beat it. The other is [the log level](#the-log-level).
+container args — a rendered flag would beat it. It is explained under [the log level](#the-log-level).
 
 A handful of flags are rendered only when their value is non-empty or true — `--bucket-name-prefix`,
 `--bucket-name-include-namespace`, `--ownership-name`, `--enable-wipe-on-delete`, `--leader-elect`,
@@ -331,7 +331,7 @@ It is a full provisioning pass, not a policy-only check. Against the provider it
 
 | Checked every pass | What happens on a difference |
 | --- | --- |
-| The bucket still exists under its frozen name | It is re-created if missing |
+| The bucket still exists under its frozen name | Reported as `BucketMissing` and never re-created, unless `spec.allowRecreate` authorises the rebuild ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)) |
 | Its ownership tags still name this operator and this CR | Ownership collision: the CR is parked ([ADR 0009](../adr/0009-the-physical-bucket-name-is-composed-and-then-frozen.md), [ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md)) |
 | The credentials group the bucket's tags attribute still exists | A vanished group is replaced and re-tagged |
 | Read grants named in `spec.grantReadAccess` still resolve | Newly resolvable grants are added, unresolvable ones skipped ([read-grants.md](read-grants.md)) |
@@ -392,18 +392,31 @@ never noticed. Use it only when something else re-applies the CRs on a schedule.
 
 ### Verify it is running
 
-Every successful pass logs one line, whether or not anything changed:
+A pass that changes nothing is silent at the default log level — no `Info` line, no event
+([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D1) — so the proof that the
+resync runs is on the object and in the metrics, not in the log:
 
 ```bash
-NS=stackit-s3-provisioner-system      # example; the release namespace
-kubectl -n $NS logs -f deploy/stackit-s3-provisioner \
-  | grep 'bucket provisioned'
-# one line per Bucket per interval, carrying "bucket", "requested" and "credentialsGroup"
+# Per Bucket: the age of the last successful pass, advancing every interval.
+kubectl get bkt -A -o wide          # the VERIFIED column
+kubectl get bkt -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,VERIFIED:.status.lastVerifiedTime
+
+# Fleet-wide: successful Bucket reconciles per interval, from the operator's metrics endpoint.
+# A pass that schedules the next resync counts as requeue_after; success is what a pass
+# counts as only when the resync is off.
+rate(controller_runtime_reconcile_total{controller="bucket",result=~"success|requeue_after"}[30m])
 ```
 
-If that line stops appearing while `Bucket` resources exist, the resync is off (`"0"`), the operator
-is in skeleton mode, or the provider circuit is open — in the last case the operator deliberately
-makes no provider call at all until a probe succeeds
+What the log shows at `logging.level: info` is the *changes*: one `bucket verified after operator
+start` line per Bucket after a restart or a leader change, then a `bucket provisioned` line only
+when a pass did something, with the `changes` it made — `isolation policy written` is what a policy
+shipped in a new version looks like when it lands. With `logging.level: debug` every unchanged pass
+logs `bucket verified` as well, which is the old behaviour minus the event
+([the log level](#the-log-level)).
+
+If `lastVerifiedTime` stops advancing while `Bucket` resources exist, the resync is off (`"0"`), the
+operator is in skeleton mode, or the provider circuit is open — in the last case the operator
+deliberately makes no provider call at all until a probe succeeds
 ([ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) D4).
 
 Skeleton mode has no resync either: a `Bucket` reconciled without a service-account key returns
@@ -451,30 +464,45 @@ as the environment variable `LOGLEVEL`, which the operator reads as the fallback
 `--zap-log-level` — the chart deliberately renders the variable and not the flag, because a
 rendered flag would win over the variable. The accepted values are the same on both surfaces, since
 the variable is fed through the flag's own parser: `debug`, `info`, `error`, `panic`, or an integer
-above 0 selecting a debug depth, where `1` is `debug` and nothing in the operator logs deeper than
-that (every verbosity call site is `V(1)`, verified on 2026-09-20 across
-[`internal/controller/`](../../internal/controller/)). **There is no `warn`.** Anything else is
+above 0 selecting a debug depth, where `1` is `debug`. **There is no `warn`.** Anything else is
 rejected at startup exactly like a duration without a unit; see [Failure modes](#failure-modes).
+The one input the two surfaces treat differently is the empty string: the flag rejects it, while
+an empty `LOGLEVEL` reads as *unset* and the binary falls back to its own default, `debug`. The
+chart therefore refuses to render an empty `logging.level` at all.
 
 Because it is a variable, it can be changed without a Helm upgrade:
 
 ```bash
+NS=stackit-s3-provisioner-system      # example; the release namespace
 kubectl -n $NS set env deployment/stackit-s3-provisioner LOGLEVEL=debug   # example; rolls the pod
 ```
 
 The next `helm upgrade` puts `logging.level` back, so a quick debug session leaves nothing behind
 unless the value is changed there too.
 
-Everything the operator writes at `Info` or `Error` is visible at `info`. What `debug` adds is the
-retry chatter underneath those lines, and this is all of it:
+Everything the operator writes at `Info` or `Error` is visible at `info`. What `debug` adds from
+the operator's own code is the retry chatter underneath those lines — every verbosity call site in
+this repository is `V(1)`, verified on 2026-09-20 across
+[`internal/controller/`](../../internal/controller/), and these are all of them:
 
 | Line at `debug` | What it is |
 | --- | --- |
+| `bucket verified` | A successful pass that changed nothing — every drift resync of an untouched Bucket ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md)). |
 | `provider circuit open; deferring teardown` | A deletion held while the circuit is open ([deletion.md](deletion.md), [provider-outages.md](provider-outages.md)). |
 | `bucket size measurement waiting for admin credentials`, `bucket size measured`, `bucket size measurement failed` | The measurement controller's own progress ([usage-and-cost.md](usage-and-cost.md)). |
 | `clone stats unavailable` | A clone Job whose progress endpoint did not answer this poll ([cloning.md](cloning.md)). |
 | `could not probe recorded credentials group` | The existence check on a credentials group the `Bucket` no longer attributes failed; the warning event that follows is unaffected ([credentials.md](credentials.md)). |
-| `… status update did not apply`, `… status patch did not apply` | A status write that lost a conflict; the next reconcile writes it again. |
+| `provisioning status update did not apply`, `status update after degradation did not apply`, `status update after failure did not apply`, `wipe status update did not apply`, `clone progress status update did not apply`, `status patch after measurement did not apply`, `usage status patch did not apply` | A status write that lost a conflict; the next reconcile writes it again. |
+
+The framework underneath adds its own lines at the same and at deeper levels. At `debug`, every
+Kubernetes event the operator raises is echoed as `Event occurred` by the `events` logger (seen in
+a live log on 2026-09-20), and a failed health probe logs one `healthz check failed` line per
+failing checker, carrying `checker` and `error` — the aggregate line of the same name is at `Info`
+and shows at the default level. Integer levels of `5` and above additionally print
+controller-runtime's per-reconcile lines — `Reconciling`, `Reconcile successful`, `Reconcile done,
+requeueing after …` — for every pass of both controllers (both verified in the pinned
+controller-runtime v0.25.0 source). Levels `2` to `4` add no line of this operator's own; what the
+framework and client-go write at those levels was not measured.
 
 The format is not part of this setting. The chart leaves the encoder, the stack-trace threshold and
 the timestamp format at the operator's built-in defaults — human-readable console lines, stack
@@ -522,7 +550,7 @@ the pod crash-loops with the reason in its log rather than running half-configur
 | `CrashLoopBackOff`; log ends with `invalid value "600" for flag -drift-resync-interval: parse error` and a usage block | A duration value without a unit. Nothing validates it before the rollout. | Quote it and give a unit: `driftResyncInterval: "10m"`. |
 | Every `Bucket` in `Failed` with `spec.region "…" does not match this operator's region "…"` | `stackit.region` and the CRD's `eu01` default for `spec.region` disagree. Definitive, never retried ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D3/D4). | Either set `stackit.region: eu01`, or set `spec.region` explicitly on every `Bucket`. |
 | A new operator version's policy has not reached existing buckets | The `Bucket` watch does not fire for untouched CRs; only the drift resync does ([ADR 0003](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md) D8). | Wait one `driftResyncInterval`. Confirm it is not `"0"`. **Never delete a `Bucket` CR to force it** — deletion is a teardown ([ADR 0006](../adr/0006-a-bucket-is-deleted-only-when-it-is-empty.md)). |
-| No `bucket provisioned` log line for minutes, `Bucket` resources exist | `driftResyncInterval: "0"`, skeleton mode, or an open provider circuit. | Check the startup log line for the interval; check `stackit_s3_provisioner_skeleton_mode` and `stackit_s3_provisioner_provider_circuit_open` ([monitoring.md](monitoring.md)). |
+| `status.lastVerifiedTime` stops advancing on every `Bucket` while the resources exist | `driftResyncInterval: "0"`, skeleton mode, or an open provider circuit. An unchanged pass logs nothing at the default level, so the absence of log lines alone means nothing ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md)). | Check the startup log line for the interval; check `stackit_s3_provisioner_skeleton_mode` and `stackit_s3_provisioner_provider_circuit_open` ([monitoring.md](monitoring.md)). |
 | A rotated service-account key still has not taken effect | Either the reload is switched off (`reloadInterval: "0"`), or the window has not elapsed: the kubelet needs up to about 90 seconds to refresh the Secret volume, then one `reloadInterval`, then one `driftResyncInterval` for the fleet. | Wait out the window. If the reload is off, `kubectl rollout restart` the Deployment and confirm the project id in the `StackIT client configured` log line. |
 | `stackit_s3_provisioner_sa_key_reload_failing` is `1`, the fleet is healthy | The operator is **refusing** the key on disk and carrying on with the one it holds: the file does not parse, it names a different StackIT project, or the provider will not mint a token with it ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D3). | Read the operator log for the rejection reason — it is logged once per distinct file content — and fix the Secret. Nothing breaks until the old key expires, which is what `StackitS3SaKeyExpiring` watches. |
 | The operator log says a candidate key `names project … , the operator is bound to …` | The mounted Secret was replaced with a key for a different project. The running process refuses it. | Mount the right key. Note that this guard is gone after a restart: the new process adopts whatever the file names, and the protection is then [ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) reporting every bucket as missing. |
