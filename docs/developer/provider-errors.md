@@ -122,9 +122,16 @@ A deleted or rotated service-account key does not produce an API `401` or `403`.
 the Object Storage API at all: the key flow fails earlier, at the token endpoint. Measured live on
 2026-08-25 against `https://accounts.stackit.cloud/oauth/v2/token`:
 
-| Case | Status | Body (`# example`, captured 2026-08-25) |
+| Case | Status | Body (`# example`, captured live) |
 | --- | --- | --- |
-| Key revoked or absent | `400` | `{"error":"invalid_grant"}`, content type `application/json` (RFC 6749 §5.2) |
+| Key revoked or absent | `400` | `{"error":"invalid_grant"}`, content type `application/json` (RFC 6749 §5.2) — captured 2026-08-25 |
+| Assertion signed with a key the provider cannot verify | `400` | `{"error":"invalid_grant","error_description":"JWT signature validation failed."}` — captured 2026-09-20 |
+
+The second row was measured while proving the key reload: a key document with its `projectId`,
+`iss`, `sub`, `kid`, `aud` and `tokenEndpoint` intact and only the RSA private key replaced. It
+matters because it is the shape a *candidate* key produces when the provider will not accept it, and
+because it is structured JSON — so `ProviderRefused` matches it and the reload classifies it as a
+definitive rejection rather than as a failure to reach the provider.
 
 `parseTokenResponse` stamps that status and body into the same `*oapierror.GenericOpenAPIError` used
 for API errors, so the failure surfaces at the operator wearing an API error's clothes. That is why

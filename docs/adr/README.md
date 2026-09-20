@@ -65,7 +65,7 @@ A reader must never find an old rule stated as current.
 
 ## Index
 
-The **State** column is a coarse reading aid, last trued up on 2026-09-19. Each record's own
+The **State** column is a coarse reading aid, last trued up on 2026-09-20. Each record's own
 `Status` section is the authority on what is built and what is open.
 
 ### Isolation and tenancy
@@ -101,7 +101,7 @@ The **State** column is a coarse reading aid, last trued up on 2026-09-19. Each 
 | [0012](0012-ready-describes-the-last-verified-state.md) | `Ready` describes the last verified state of a bucket, not the last verification attempt | Implemented |
 | [0013](0013-a-provider-outage-is-held-fleet-wide.md) | A provider outage is held fleet-wide, and the trip condition is the absence of success rather than a parsed error | Implemented; D4 amended by [0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) to exempt the validation call of a candidate key. Open: the size-measurement queue is not held by the breaker |
 | [0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md) | A provisioned bucket that has vanished is reported, never re-created implicitly, unless `spec.allowRecreate` authorises it | Implemented, except that only this guard asks per bucket — provisioning, read grants and teardown still decide existence from a project-wide listing |
-| [0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) | The service-account key is re-read at runtime and swapped only after it is proven, and it is the only runtime-mutable input | Implemented, except that the live rotation against the real API has not been run |
+| [0016](0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) | The service-account key is re-read at runtime and swapped only after it is proven, and it is the only runtime-mutable input | Implemented and verified live on 2026-09-20, except that whether a credentials group outlives the revocation of the key that created it is still unmeasured |
 
 ### Measurement
 

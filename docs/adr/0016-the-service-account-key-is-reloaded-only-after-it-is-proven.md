@@ -13,10 +13,12 @@ candidate never displaces the running key, is counted, alarmed and retried. ADR 
 credential was fixed for the lifetime of the process; that half of it is struck through in place and
 replaced by this record. The project and the region remain fixed at start.
 
-Open: the live rotation of a real key against the real API is the last step of the work and is
-**not yet done** — every case in this record is exercised offline against the in-memory fake. Whether
-STACKIT's token endpoint has a propagation delay for a freshly issued key is **not verified**; D7 is
-written so that the answer does not change the outcome.
+Verified live on 2026-09-20: a running operator was rotated between two service accounts of one
+project against the real API, adopted the second key without a restart, and kept every resource the
+first had created. Open: whether those resources outlive the *revocation* of the key that created
+them is still **not verified** — the run added a second service account rather than removing the
+first (see Residual risks). Whether STACKIT's token endpoint has a propagation delay for a freshly
+issued key is also **not verified**; D7 is written so that the answer does not change the outcome.
 
 ## Context
 
@@ -305,14 +307,24 @@ new content in a loop would be matched call for call. Nothing observed does that
 written so the answer does not change the outcome, but the ten-minute worst case is a policy choice
 made against an unmeasured behaviour.
 
-**Not verified: that a credentials group and its access keys outlive the service-account key that
-created them.** D11 rests on a design argument, not an observation. The live rotation confirms it for
-free — a fleet that keeps working after the rotation *is* the confirmation — and until that run has
-happened it is an assumption.
+**Half of D11 is now measured, and the half that matters most is not.** The live rotation of
+2026-09-20 established the *additive* half: a bucket, a credentials group and an access key created
+by one service account stayed visible, kept the same id and urn, and stayed manageable — a fresh key
+was minted into that group and deleted again — after the operator authenticated as a different
+service account of the same project. What it does **not** establish is the *subtractive* half: that
+they survive the deletion or revocation of the key that created them. The run added a second service
+account instead of removing the first, because the first is the credential both other real-API
+suites depend on. A real rotation ends with the old key revoked, so this is the half a rotation
+actually leans on, and it is still reasoning rather than observation.
 
-**Not verified: the whole feature against the real API.** Every case here is reproduced offline
-against the in-memory fake. Rotating a real key of a real project and watching the fleet recover
-without a restart is the last step of the work and has not been done.
+**The live run was library-level, not fleet-level.** On 2026-09-20 the swap itself was exercised
+against the real API — including the one refusal that can only come from the provider, an
+unverifiable assertion, which answers a structured `400` carrying `invalid_grant` and
+`JWT signature validation failed.` and is therefore definitive as D7 assumes. What was *not* run is
+the whole chain in a cluster: a fleet of `Bucket` resources going unhealthy on a dead key and
+recovering on the new one without a restart. That path is reasoned from the requeue machinery of D9,
+and the end-to-end suite does not read the operator's metrics, so none of the four series of D8 has
+been observed from outside the process.
 
 **The reload cannot help a credential the operator minted itself.** A bootstrap S3 admin key deleted
 at the provider is not in a file and no file watch can see it; that failure and its manual recovery

@@ -324,6 +324,7 @@ several rules are actually proved rather than modelled.
 | [stackit/credentials_integration_test.go](../../stackit/credentials_integration_test.go) | Layer-2 isolation: a workload reads and writes its own bucket, is denied every access to the other one, and is denied bucket management on its own ([ADR 0003 D1–D4](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md)). It builds the document with the production `BuildIsolationPolicy`, so what is enforced is what the operator writes |
 | [stackit/grants_integration_test.go](../../stackit/grants_integration_test.go) | That the three-statement document is enforced as designed — a `Deny` whose `Principal` is a *list*, which no offline fake evaluates. Granted reader reads, cannot write; ungranted workload stays locked out entirely ([ADR 0008 D6, D7](../adr/0008-a-read-grant-is-declared-by-the-bucket-that-owns-the-data.md)) |
 | [stackit/tagging_integration_test.go](../../stackit/tagging_integration_test.go) | That the backend supports S3 bucket-level tagging at all, and that the production `SetBucketTags`/`BucketTags` wrappers round-trip against it. If this fails, the ownership marker cannot live in a tag and [ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) needs a different carrier |
+| [stackit/keyrotation_integration_test.go](../../stackit/keyrotation_integration_test.go) | That a running client really does adopt a replaced service-account key without a restart, and that the provider is the one refusing an unverifiable one — no offline fake mints a token, so nothing else can tell a key the provider accepts from one it does not ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md)). It also establishes that a credentials group and its access keys stay visible and manageable under a *different* service account of the same project. It needs a third key file, `account-1b.json`, and prefixes its resources `s3rot` rather than `s3e2e` so the e2e sweep, which runs with `-admin`, cannot delete them mid-run |
 | [internal/controller/attribution_integration_test.go](../../internal/controller/attribution_integration_test.go) | That a bucket provisioned the pre-ADR-0002 way survives the upgrade **untouched** — the group is neither renamed, re-created nor re-keyed, only tagged — and that a CR restored without status re-attaches to the surviving group ([ADR 0002 D1, D2, D7](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md)) |
 
 The attribution suite is a hybrid worth knowing about: the production reconciler
@@ -640,14 +641,17 @@ mechanism covered only by them reads as uncovered.
   actually prove the swap is never switched on. It was run by hand with
   `go test -race ./stackit/... ./internal/controller/...` on 2026-09-19 and
   passed; nothing repeats that, and the test's own comment says so.
-- **The live rotation of a real key has not been done, and the repository holds
-  no material for it.** Every case of the reload is exercised offline against
-  the fake and a local token endpoint. Rotating a key of the *working* project
-  needs a **second** key for project 1, issued by hand: `account-2.json` is
-  deliberately a different project — `TestLoadAccount` asserts exactly that, and
-  the assertion is load-bearing for the cross-project tests — so it cannot stand
-  in for a rotation. Until that run happens, ADR 0016's own "not verified"
-  entries stand.
+- **The live rotation was run once, by hand, at library level.** `account-2.json`
+  is deliberately a different project — `TestLoadAccount` asserts exactly that,
+  and the assertion is load-bearing for the cross-project tests — so a rotation
+  needs a **third** key file: a second service account of project 1, at
+  `account-1b.json` (override `STACKIT_ACCOUNT_1B`). With it present,
+  [`stackit/keyrotation_integration_test.go`](../../stackit/keyrotation_integration_test.go)
+  passed on 2026-09-20. Nothing repeats it: it has no `make` target, CI has no
+  key files, and it skips cleanly without them. What it still does not cover is
+  a *fleet* rotating in a cluster, and it deliberately adds a service account
+  rather than revoking one — so ADR 0016's residual entry about a group
+  outliving a revoked creator stands.
 - **No end-to-end suite reads the operator's metrics endpoint.** Verified on
   2026-09-19 by grepping [test/e2e/](../../test/e2e/): nothing there scrapes
   `/metrics` or the metrics port at all. None of the four `sa_key` series is
