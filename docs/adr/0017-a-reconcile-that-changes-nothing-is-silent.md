@@ -65,8 +65,10 @@ per-object proof that the resync is running, and it replaces what the per-pass e
 It is also a wide column (`VERIFIED`) of `kubectl get`.
 
 **D5 — The fleet-wide proof that the resync is running is the framework's own counter,
-`controller_runtime_reconcile_total{controller="bucket",result="success"}`.** Nothing in the
-operator's own metric set is added for it.
+`controller_runtime_reconcile_total{controller="bucket",result=~"success|requeue_after"}`.** A
+successful pass that schedules the next resync is counted under `requeue_after`, not `success`;
+only with the resync switched off (`driftResyncInterval: "0"`) does a successful pass count as
+`success`. Nothing in the operator's own metric set is added for it.
 
 ## Consequences
 

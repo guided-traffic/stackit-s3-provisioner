@@ -33,7 +33,7 @@ team-a      my-bucket   my-bucket   Ready   True    ensure bucket: unexpected EO
 ```
 
 (The `SIZE` and `COST/MONTH` cells are filled only where size measurement is on;
-six further columns carry `priority=1` and appear with `-o wide` - see
+seven further columns carry `priority=1` and appear with `-o wide` - see
 [bucket-status.md](bucket-status.md).)
 
 ```yaml

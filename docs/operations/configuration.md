@@ -331,7 +331,7 @@ It is a full provisioning pass, not a policy-only check. Against the provider it
 
 | Checked every pass | What happens on a difference |
 | --- | --- |
-| The bucket still exists under its frozen name | It is re-created if missing |
+| The bucket still exists under its frozen name | Reported as `BucketMissing` and never re-created, unless `spec.allowRecreate` authorises the rebuild ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)) |
 | Its ownership tags still name this operator and this CR | Ownership collision: the CR is parked ([ADR 0009](../adr/0009-the-physical-bucket-name-is-composed-and-then-frozen.md), [ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md)) |
 | The credentials group the bucket's tags attribute still exists | A vanished group is replaced and re-tagged |
 | Read grants named in `spec.grantReadAccess` still resolve | Newly resolvable grants are added, unresolvable ones skipped ([read-grants.md](read-grants.md)) |
@@ -402,7 +402,9 @@ kubectl get bkt -A -o wide          # the VERIFIED column
 kubectl get bkt -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,VERIFIED:.status.lastVerifiedTime
 
 # Fleet-wide: successful Bucket reconciles per interval, from the operator's metrics endpoint.
-rate(controller_runtime_reconcile_total{controller="bucket",result="success"}[30m])
+# A pass that schedules the next resync counts as requeue_after; success is what a pass
+# counts as only when the resync is off.
+rate(controller_runtime_reconcile_total{controller="bucket",result=~"success|requeue_after"}[30m])
 ```
 
 What the log shows at `logging.level: info` is the *changes*: one `bucket verified after operator
@@ -494,11 +496,13 @@ this repository is `V(1)`, verified on 2026-09-20 across
 
 The framework underneath adds its own lines at the same and at deeper levels. At `debug`, every
 Kubernetes event the operator raises is echoed as `Event occurred` by the `events` logger (seen in
-a live log on 2026-09-20), and a failed health check logs `healthz check failed`. Integer levels of
-`5` and above additionally print controller-runtime's per-reconcile lines — `Reconciling`,
-`Reconcile successful`, `Reconcile done, requeueing after …` — for every pass of both controllers
-(verified in the pinned controller-runtime v0.25.0 source). Levels `2` to `4` add nothing this
-operator or its framework writes.
+a live log on 2026-09-20), and a failed health probe logs one `healthz check failed` line per
+failing checker, carrying `checker` and `error` — the aggregate line of the same name is at `Info`
+and shows at the default level. Integer levels of `5` and above additionally print
+controller-runtime's per-reconcile lines — `Reconciling`, `Reconcile successful`, `Reconcile done,
+requeueing after …` — for every pass of both controllers (both verified in the pinned
+controller-runtime v0.25.0 source). Levels `2` to `4` add no line of this operator's own; what the
+framework and client-go write at those levels was not measured.
 
 The format is not part of this setting. The chart leaves the encoder, the stack-trace threshold and
 the timestamp format at the operator's built-in defaults — human-readable console lines, stack

@@ -31,7 +31,7 @@ spec:
 
 ```bash
 kubectl -n team-a get bkt                       # bkt is the short name
-kubectl -n team-a get bkt -o wide               # adds the six priority columns
+kubectl -n team-a get bkt -o wide               # adds the seven priority columns
 kubectl -n team-a describe bkt artifacts        # conditions + the event stream
 kubectl -n team-a get bkt artifacts -o jsonpath='{.status}' | jq   # everything
 
@@ -56,7 +56,7 @@ for hours therefore shows a current-generation message (`cloning from …`) whil
 
 The columns come from the printer markers on the CRD
 ([api/v1/bucket_types.go](../../api/v1/bucket_types.go), regenerated into
-[config/crd/bases](../../config/crd/bases/)). Fourteen are declared; six carry
+[config/crd/bases](../../config/crd/bases/)). Fifteen are declared; seven carry
 `priority=1` and appear only with `-o wide`. `kubectl` prepends `NAME`, the CR's
 own name.
 
@@ -76,8 +76,8 @@ from this repository.)
 Wide — the same first row:
 
 ```
-NAME        BUCKET      PHASE   READY   STATUS  REGION   SIZE       COST/MONTH   DEGRADED   CLONE   RESOLVED                SECRET          OBJECTS   MEASURED   AGE
-artifacts   artifacts   Ready   True    ...     eu01     18.0 GiB   0.53 EUR                        prod-team-a-artifacts   artifacts-s3    12043     14m        4d
+NAME        BUCKET      PHASE   READY   STATUS  REGION   SIZE       COST/MONTH   DEGRADED   CLONE   RESOLVED                SECRET          OBJECTS   MEASURED   VERIFIED   AGE
+artifacts   artifacts   Ready   True    ...     eu01     18.0 GiB   0.53 EUR                        prod-team-a-artifacts   artifacts-s3    12043     14m        3m         4d
 ```
 
 | Column | Source | Wide only | Notes |
@@ -94,8 +94,8 @@ artifacts   artifacts   Ready   True    ...     eu01     18.0 GiB   0.53 EUR    
 | `RESOLVED` | `status.resolvedBucketName` | yes | The physical bucket name, written at the end of the first successful pass |
 | `SECRET` | `spec.secretRef.name` | yes | The Secret in the Bucket's own namespace |
 | `OBJECTS` | `status.usage.objects` | yes | Current objects at the last measurement |
-| `VERIFIED` | `status.lastVerifiedTime` | yes | Age of the last successful pass, changed or not — advances every drift resync ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D4) |
 | `MEASURED` | `status.usage.lastMeasurementTime` | yes | Rendered as an age (`14m`) — this marker is typed as a date |
+| `VERIFIED` | `status.lastVerifiedTime` | yes | Age of the last successful pass, changed or not — advances every drift resync ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D4) |
 | `AGE` | `metadata.creationTimestamp` | no | Age of the CR, not of the cloud bucket |
 
 `RESOLVED` being empty while the bucket is being provisioned for the first time
@@ -363,13 +363,15 @@ runs out ([ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) D4,
 D5) — so a Bucket held for hours shows one timestamp and no churn. See
 [provider-outages.md](provider-outages.md).
 
-**Somebody changed the bucket policy by hand.** Nothing on the CR says so. The
+**Somebody changed the bucket policy by hand.** No status field says so. The
 operator re-asserts its own document whenever it looks and rewrites it on drift
 ([ADR 0003](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md) D8),
-which the drift-resync timer makes happen without an event
+which the drift-resync timer makes happen without anyone touching the CR
 ([ADR 0010](../adr/0010-the-operator-never-writes-to-a-bucket-spec.md) D8). The
-correction is silent — expect the change to disappear, not a status field to
-report it.
+correction is reported as a change: a `Provisioned` event carrying `isolation
+policy written`, and the same words in the operator log at `Info`
+([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D2) —
+expect the edit to disappear and that event to say when.
 
 **The bucket was deleted behind the operator's back.** The status says so, and
 nothing is repaired over it. A `Bucket` that completed a provisioning round and
