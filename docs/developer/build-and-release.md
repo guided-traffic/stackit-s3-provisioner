@@ -124,17 +124,17 @@ Renovate classifies a pseudo-version update as a digest and would otherwise walk
 newest commit on master, where they compile against Kubernetes master alone. That is not a
 hypothetical: `kube-openapi` master moved `pkg/schemaconv` to `sigs.k8s.io/structured-merge-diff/v7`
 while `k8s.io/apimachinery v0.37.0` still constructs its type converter from
-`structured-merge-diff/v6`, so `go build` failed inside apimachinery and took lint, unit tests,
-envtest, govulncheck, the e2e image build and the container scan with it. The grouping rule matches
-these modules too, so one unbumpable module also blocks every other Kubernetes update sharing the
-pull request.
+`structured-merge-diff/v6`, so `go build` failed inside apimachinery itself. Six of the eleven CI
+jobs ([testing.md](testing.md#what-ci-runs)) went red on that single error and two more were skipped
+behind them. The grouping rule matches these modules too, so one unbumpable module also blocks every
+other Kubernetes update sharing the pull request.
 
 A package rule in [`renovate.json`](../../renovate.json) therefore disables updates for those three
 module paths. They still move — `gomodTidy` raises them whenever a `k8s.io/*` bump lifts the minimum
 version — but only as a consequence of the release line, never ahead of it.
 
-**Security note.** Disabling the rule means a fix published in one of the three no longer arrives on
-its own. What catches it instead is the vulnerability job: `make vuln` runs govulncheck on every pull
+**Security note.** Switching those updates off means a fix published in one of the three no longer
+arrives on its own. What catches it instead is the vulnerability job: `make vuln` runs govulncheck on every pull
 request and fails the pipeline if our code calls a known vulnerability, in a direct or an indirect
 module. The residual gap is a vulnerability that govulncheck does not report as called; raising the
 pin by hand is then the only route, and nothing prompts for it.
