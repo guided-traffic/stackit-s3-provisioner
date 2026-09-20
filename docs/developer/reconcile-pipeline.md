@@ -62,8 +62,9 @@ third path that marks the failure itself (see [Guards](#guards-and-their-outcome
 | 17 | Re-write the policy with readers | `applyPolicy` closure | Only reached in the pass in which the copy finishes, so grants land without waiting a cycle |
 | 18 | Publish the access key and the Secret | `ensureAccessKeyAndSecret` | Secret is the source of truth; clear-before-create ([ADR 0007](../adr/0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md) D1/D5) |
 | 19 | Record a handled rotation trigger | `recordPendingRotation` | Turns the annotation back into a level-triggered no-op ([ADR 0010](../adr/0010-the-operator-never-writes-to-a-bucket-spec.md) D6) |
-| 20 | Terminal status write, `Ready=True`, `clearDegraded`, `BucketPresent` removed, `Breaker.Success()` | inline in `reconcileNormal` | The provider answered for every step of this pass, and the bucket was verified present (or re-created) in it |
-| 21 | `RequeueAfter: DriftResyncInterval` | inline | See [Drift resync](#drift-resync) |
+| 20 | Terminal status write, `Ready=True`, `status.lastVerifiedTime`, `clearDegraded`, `BucketPresent` removed, `Breaker.Success()` | inline in `reconcileNormal` | The provider answered for every step of this pass, and the bucket was verified present (or re-created) in it. The timestamp moves on every successful pass, so this write always differs from the last one ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D4) |
+| 21 | Report the pass | `reportPass` | `Info` plus the `Provisioned` event only when the `passChanges` collected through the pass are non-empty, `Info` without an event the first time this process sees the Bucket (`verifiedSinceStart`), otherwise `V(1)` ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D1–D3). The notes come from the bool each write site returns — `ensureBucket`, the `stamp` closure in `resolveWorkloadGroup`, `ensureBucketPolicy`, `ensureAccessKeyAndSecret` — plus the spec generation and a finished clone; a new write site without a `changes.note` is reported as unchanged |
+| 22 | `RequeueAfter: DriftResyncInterval` | inline | See [Drift resync](#drift-resync) |
 
 Three orderings in that list are load-bearing and easy to break by accident.
 
@@ -427,7 +428,9 @@ the `Bucket` predicate discards.
 **The defect this exists for.** Verified live on infra-d on 2026-07-22: a 1.6.0 → 1.9.0 rollout left
 `test-bucket` on the old five-action isolation policy although the new version's
 `BuildIsolationPolicy` produces eight. Nothing appeared in the container log, because the happy-path
-policy write is not logged and the bucket was simply never re-reconciled. Three causes compounded:
+policy write was not logged at the time (since [ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md)
+it is reported as `isolation policy written`) and the bucket was simply never re-reconciled. Three
+causes compounded:
 the `Ready` path returned `ctrl.Result{}, nil`, so a steady-state bucket only reconciled on an
 event; the watch predicate discarded controller-runtime's periodic resync, so an unchanged CR
 produced no event; and with `replicaCount: 1` # default and Kubernetes' default `RollingUpdate`

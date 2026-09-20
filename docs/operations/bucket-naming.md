@@ -87,7 +87,7 @@ below, not the name.
 | `kubectl get bkt -o wide`, column `RESOLVED` | The frozen name — **wide output only** |
 | Ownership and attribution tags on the bucket | All four are stamped on the bucket that carries the frozen name: the ownership pair ([ADR 0001](../adr/0001-a-bucket-only-affects-its-own-namespace.md) D2) and the attribution pair ([ADR 0002](../adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D1) |
 | Isolation policy, read grants, size measurement, teardown | Every one of them addresses the frozen name ([ADR 0009](../adr/0009-the-physical-bucket-name-is-composed-and-then-frozen.md) D8) |
-| Operator log, line `bucket provisioned` | Both names: `bucket=<frozen>` and `requested=<spec.bucketName>` |
+| Operator log, lines `bucket provisioned` and `bucket verified` | Both names: `bucket=<frozen>` and `requested=<spec.bucketName>` |
 
 Two places deliberately do **not** carry it. The `BUCKET` column of `kubectl get bkt` shows
 `spec.bucketName`, the name that was requested. And the Prometheus metrics are labelled with the

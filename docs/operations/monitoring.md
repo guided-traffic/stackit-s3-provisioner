@@ -130,7 +130,11 @@ stackit_s3_provisioner_skeleton_mode
 The controller-runtime series matter too: the reconcile-error alert is built on
 `controller_runtime_reconcile_errors_total`, and the two controllers are labelled
 `controller="bucket"` (provisioning) and `controller="bucketusage"` (size
-measurement).
+measurement). `controller_runtime_reconcile_total{controller="bucket",result="success"}`
+is the fleet-wide proof that the drift resync is running — an unchanged pass
+raises no event and logs nothing at the default level, so this counter and the
+per-object `status.lastVerifiedTime` are what remain
+([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D4/D5).
 
 ### How they are produced
 

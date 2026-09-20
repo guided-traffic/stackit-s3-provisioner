@@ -355,6 +355,7 @@ complete net-free suite. Which suite to run when, and what each costs, is [testi
 | [`internal/controller/reconciler_errors_test.go`](../../internal/controller/reconciler_errors_test.go) | — | the failure paths, and that a failed Secret write rolls the freshly minted key back |
 | [`internal/controller/reconciler_degraded_test.go`](../../internal/controller/reconciler_degraded_test.go) | — | sticky readiness: what is held, what is never held, and grace expiry |
 | [`internal/controller/reconciler_circuit_test.go`](../../internal/controller/reconciler_circuit_test.go) | — | the breaker in the reconciler: trip, hold without churn, grace, recovery, an isolated broken bucket, deferred teardown |
+| [`internal/controller/reconciler_report_test.go`](../../internal/controller/reconciler_report_test.go) | — | the reporting of a successful pass: change versus verification, the first pass after a start, `lastVerifiedTime` |
 | [`internal/controller/breaker_test.go`](../../internal/controller/breaker_test.go) | — | the breaker alone, on a manually advanced clock |
 | [`internal/controller/reconciler_clone_test.go`](../../internal/controller/reconciler_clone_test.go) | — | hold semantics, progress, job failure retry, guards, artifact teardown, job-name length |
 | [`internal/controller/reconciler_usage_test.go`](../../internal/controller/reconciler_usage_test.go) | — | the measurement controller: gate, default, clamp, cap, versions, failure, skip conditions |

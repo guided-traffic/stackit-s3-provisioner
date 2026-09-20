@@ -392,18 +392,29 @@ never noticed. Use it only when something else re-applies the CRs on a schedule.
 
 ### Verify it is running
 
-Every successful pass logs one line, whether or not anything changed:
+A pass that changes nothing is silent at the default log level — no `Info` line, no event
+([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D1) — so the proof that the
+resync runs is on the object and in the metrics, not in the log:
 
 ```bash
-NS=stackit-s3-provisioner-system      # example; the release namespace
-kubectl -n $NS logs -f deploy/stackit-s3-provisioner \
-  | grep 'bucket provisioned'
-# one line per Bucket per interval, carrying "bucket", "requested" and "credentialsGroup"
+# Per Bucket: the age of the last successful pass, advancing every interval.
+kubectl get bkt -A -o wide          # the VERIFIED column
+kubectl get bkt -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,VERIFIED:.status.lastVerifiedTime
+
+# Fleet-wide: successful Bucket reconciles per interval, from the operator's metrics endpoint.
+rate(controller_runtime_reconcile_total{controller="bucket",result="success"}[30m])
 ```
 
-If that line stops appearing while `Bucket` resources exist, the resync is off (`"0"`), the operator
-is in skeleton mode, or the provider circuit is open — in the last case the operator deliberately
-makes no provider call at all until a probe succeeds
+What the log shows at `logging.level: info` is the *changes*: one `bucket verified after operator
+start` line per Bucket after a restart or a leader change, then a `bucket provisioned` line only
+when a pass did something, with the `changes` it made — `isolation policy written` is what a policy
+shipped in a new version looks like when it lands. With `logging.level: debug` every unchanged pass
+logs `bucket verified` as well, which is the old behaviour minus the event
+([the log level](#the-log-level)).
+
+If `lastVerifiedTime` stops advancing while `Bucket` resources exist, the resync is off (`"0"`), the
+operator is in skeleton mode, or the provider circuit is open — in the last case the operator
+deliberately makes no provider call at all until a probe succeeds
 ([ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) D4).
 
 Skeleton mode has no resync either: a `Bucket` reconciled without a service-account key returns
@@ -470,6 +481,7 @@ retry chatter underneath those lines, and this is all of it:
 
 | Line at `debug` | What it is |
 | --- | --- |
+| `bucket verified` | A successful pass that changed nothing — every drift resync of an untouched Bucket ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md)). |
 | `provider circuit open; deferring teardown` | A deletion held while the circuit is open ([deletion.md](deletion.md), [provider-outages.md](provider-outages.md)). |
 | `bucket size measurement waiting for admin credentials`, `bucket size measured`, `bucket size measurement failed` | The measurement controller's own progress ([usage-and-cost.md](usage-and-cost.md)). |
 | `clone stats unavailable` | A clone Job whose progress endpoint did not answer this poll ([cloning.md](cloning.md)). |
@@ -522,7 +534,7 @@ the pod crash-loops with the reason in its log rather than running half-configur
 | `CrashLoopBackOff`; log ends with `invalid value "600" for flag -drift-resync-interval: parse error` and a usage block | A duration value without a unit. Nothing validates it before the rollout. | Quote it and give a unit: `driftResyncInterval: "10m"`. |
 | Every `Bucket` in `Failed` with `spec.region "…" does not match this operator's region "…"` | `stackit.region` and the CRD's `eu01` default for `spec.region` disagree. Definitive, never retried ([ADR 0005](../adr/0005-the-operator-serves-one-project-in-one-region.md) D3/D4). | Either set `stackit.region: eu01`, or set `spec.region` explicitly on every `Bucket`. |
 | A new operator version's policy has not reached existing buckets | The `Bucket` watch does not fire for untouched CRs; only the drift resync does ([ADR 0003](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md) D8). | Wait one `driftResyncInterval`. Confirm it is not `"0"`. **Never delete a `Bucket` CR to force it** — deletion is a teardown ([ADR 0006](../adr/0006-a-bucket-is-deleted-only-when-it-is-empty.md)). |
-| No `bucket provisioned` log line for minutes, `Bucket` resources exist | `driftResyncInterval: "0"`, skeleton mode, or an open provider circuit. | Check the startup log line for the interval; check `stackit_s3_provisioner_skeleton_mode` and `stackit_s3_provisioner_provider_circuit_open` ([monitoring.md](monitoring.md)). |
+| `status.lastVerifiedTime` stops advancing on every `Bucket` while the resources exist | `driftResyncInterval: "0"`, skeleton mode, or an open provider circuit. An unchanged pass logs nothing at the default level, so the absence of log lines alone means nothing ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md)). | Check the startup log line for the interval; check `stackit_s3_provisioner_skeleton_mode` and `stackit_s3_provisioner_provider_circuit_open` ([monitoring.md](monitoring.md)). |
 | A rotated service-account key still has not taken effect | Either the reload is switched off (`reloadInterval: "0"`), or the window has not elapsed: the kubelet needs up to about 90 seconds to refresh the Secret volume, then one `reloadInterval`, then one `driftResyncInterval` for the fleet. | Wait out the window. If the reload is off, `kubectl rollout restart` the Deployment and confirm the project id in the `StackIT client configured` log line. |
 | `stackit_s3_provisioner_sa_key_reload_failing` is `1`, the fleet is healthy | The operator is **refusing** the key on disk and carrying on with the one it holds: the file does not parse, it names a different StackIT project, or the provider will not mint a token with it ([ADR 0016](../adr/0016-the-service-account-key-is-reloaded-only-after-it-is-proven.md) D3). | Read the operator log for the rejection reason — it is logged once per distinct file content — and fix the Secret. Nothing breaks until the old key expires, which is what `StackitS3SaKeyExpiring` watches. |
 | The operator log says a candidate key `names project … , the operator is bound to …` | The mounted Secret was replaced with a key for a different project. The running process refuses it. | Mount the right key. Note that this guard is gone after a restart: the new process adopts whatever the file names, and the protection is then [ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) reporting every bucket as missing. |

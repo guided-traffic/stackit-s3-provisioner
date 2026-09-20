@@ -856,6 +856,15 @@ type BucketStatus struct {
 	// +optional
 	LastRotationTime *metav1.Time `json:"lastRotationTime,omitempty"`
 
+	// LastVerifiedTime is when the operator last completed a successful pass over
+	// this Bucket: bucket, credentials group, isolation policy and Secret found
+	// in, or brought to, their desired state. It advances on every successful
+	// pass whether or not the pass changed anything, and is the per-object proof
+	// that the drift resync is running — a pass that changes nothing is otherwise
+	// silent.
+	// +optional
+	LastVerifiedTime *metav1.Time `json:"lastVerifiedTime,omitempty"`
+
 	// DegradedSince is when the operator first failed to reconcile this already
 	// provisioned Bucket for a reason that carries no information about the
 	// Bucket itself — an unreachable provider, a gateway error page, a
@@ -907,6 +916,7 @@ type BucketStatus struct {
 // +kubebuilder:printcolumn:name="Secret",type="string",JSONPath=".spec.secretRef.name",description="Secret holding the workload credentials",priority=1
 // +kubebuilder:printcolumn:name="Objects",type="integer",JSONPath=".status.usage.objects",description="Number of current objects at the last measurement",priority=1
 // +kubebuilder:printcolumn:name="Measured",type="date",JSONPath=".status.usage.lastMeasurementTime",description="When the bucket size was last measured",priority=1
+// +kubebuilder:printcolumn:name="Verified",type="date",JSONPath=".status.lastVerifiedTime",description="When the operator last verified this bucket against StackIT",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // Bucket is the Schema for the buckets API. One Bucket maps to a StackIT bucket,

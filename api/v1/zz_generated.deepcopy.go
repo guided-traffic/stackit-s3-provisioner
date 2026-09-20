@@ -147,6 +147,10 @@ func (in *BucketStatus) DeepCopyInto(out *BucketStatus) {
 		in, out := &in.LastRotationTime, &out.LastRotationTime
 		*out = (*in).DeepCopy()
 	}
+	if in.LastVerifiedTime != nil {
+		in, out := &in.LastVerifiedTime, &out.LastVerifiedTime
+		*out = (*in).DeepCopy()
+	}
 	if in.DegradedSince != nil {
 		in, out := &in.DegradedSince, &out.DegradedSince
 		*out = (*in).DeepCopy()

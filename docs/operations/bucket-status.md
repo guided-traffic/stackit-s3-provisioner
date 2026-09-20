@@ -94,6 +94,7 @@ artifacts   artifacts   Ready   True    ...     eu01     18.0 GiB   0.53 EUR    
 | `RESOLVED` | `status.resolvedBucketName` | yes | The physical bucket name, written at the end of the first successful pass |
 | `SECRET` | `spec.secretRef.name` | yes | The Secret in the Bucket's own namespace |
 | `OBJECTS` | `status.usage.objects` | yes | Current objects at the last measurement |
+| `VERIFIED` | `status.lastVerifiedTime` | yes | Age of the last successful pass, changed or not — advances every drift resync ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D4) |
 | `MEASURED` | `status.usage.lastMeasurementTime` | yes | Rendered as an age (`14m`) — this marker is typed as a date |
 | `AGE` | `metadata.creationTimestamp` | no | Age of the CR, not of the cloud bucket |
 
@@ -267,6 +268,7 @@ only applies after a successful reconcile
 | `grantedReadTo` | The `spec.grantReadAccess` entries actually in the policy right now | [read-grants.md](read-grants.md) |
 | `clone` | Phase, timestamps, bytes, progress, rate, ETA of the one-shot copy | [cloning.md](cloning.md) |
 | `lastRotationTrigger` / `lastRotationTime` | The rotation annotation value already acted upon, and when | [credentials.md](credentials.md) |
+| `lastVerifiedTime` | When the last successful pass over this Bucket completed, whether or not it changed anything. The per-object proof that the drift resync is running, now that an unchanged pass raises no event ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D4) | [configuration.md](configuration.md#verify-it-is-running) |
 | `degradedSince` | When the current run of non-definitive failures began | [provider-outages.md](provider-outages.md) |
 | `operatorVersion` | The operator version that last wrote this status | this page |
 | `usage` | Measured size, object counts, cost estimate, and how old the measurement is | [usage-and-cost.md](usage-and-cost.md) |
@@ -317,7 +319,7 @@ shows up — a skipped read grant, a refused wipe, a clamped measurement interva
 
 | Reason | Type | Emitted when |
 |---|---|---|
-| `Provisioned` | Normal | A pass completed: bucket, credentials and policy are in place |
+| `Provisioned` | Normal | A pass **changed** something — created the bucket, wrote the policy, issued credentials, finished a clone — and the message names what. A pass that only verified raises no event ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D1/D2); its trace is `status.lastVerifiedTime` |
 | `Failed` | Warning | Any failed pass — including one whose `Ready` is being held, so a hold is as visible in the event stream as a hard failure. The one failure that carries a different reason is the vanished bucket below |
 | `BucketMissing` | Warning | A bucket that was provisioned is gone at the provider and the operator refuses to re-create it. The event carries the same text as `status.message`, and the same reason as the `Ready` and `BucketPresent` conditions ([vanished-buckets.md](vanished-buckets.md)) |
 | `BucketRecreated` | Warning | A vanished bucket was rebuilt automatically because `spec.allowRecreate` is set: the contents are still lost, and the workload Secret is replaced later in the same pass. This reason exists **only** in the event stream — no condition ever carries it, and the CR is simply `Ready` again ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md) D9, D13) |
