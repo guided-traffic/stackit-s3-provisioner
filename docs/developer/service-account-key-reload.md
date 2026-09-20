@@ -151,7 +151,7 @@ What survives a swap, and why:
 |---|---|---|
 | The SDK's access token | no | it goes with the retired key flow, which is the whole point |
 | `Client.serviceReady` | yes | project-scoped, and a reload may not change the project |
-| `BucketReconciler.admin` | yes | the bootstrap S3 credential belongs to a credentials group, a project resource, not to the service account that created it — reasoning, **not verified** until a live rotation confirms it |
+| `BucketReconciler.admin` | yes | the bootstrap S3 credential belongs to a credentials group, a project resource, not to the service account that created it. Measured live on 2026-09-20 for the case that matters here — a group and its keys stay visible and manageable after the operator authenticates as a different service account; **not verified** for a revoked creator (see below) |
 | `ProviderBreaker` | reset on success | the validation has just made a successful authenticated call, which is the exact evidence `Success()` waits for |
 
 Nothing outside `stackit` holds anything derived from the client across calls, and nothing assumes
@@ -236,11 +236,22 @@ only way to prove the poller runs on a replica that is *not* the leader. The sui
 
 ## What is wrong today
 
-**The live rotation has not been done.** Every case above is reproduced offline. Rotating a real key
-of a real project and watching the fleet recover without a restart is outstanding, and the
-repository holds no material for it: `account-2.json` is deliberately a *different* project, so this
-needs a second key for project 1 issued by hand. Until that run happens, the claim that a
-credentials group outlives the service-account key that created it is reasoning, not an observation.
+**The live rotation has been done at library level, not at fleet level.**
+[`stackit/keyrotation_integration_test.go`](../../stackit/keyrotation_integration_test.go) rotated a
+real client between two service accounts of one project against the real API on 2026-09-20: the
+second key was proven and adopted, the issuer, the content hash and the state pointer all changed,
+the project and the cached service-ready answer did not, and the bucket, credentials group and
+access key the first account had created stayed visible and manageable. The refusal leg reached the
+real token endpoint and measured a shape nothing had recorded before —
+`400 {"error":"invalid_grant","error_description":"JWT signature validation failed."}`, structured
+JSON and therefore definitive, as the retry policy assumes ([provider-errors.md](provider-errors.md)).
+
+What that run did **not** do is watch a fleet. No `Bucket` went unhealthy on a dead key and
+recovered on a new one in a cluster, and no suite has observed the four metrics from outside the
+process. Nor did it revoke anything: it *added* a second service account rather than removing the
+first, because the first is the credential the other real-API suites depend on. So the half of the
+credentials-group assumption that a real rotation actually leans on — that a group survives the
+revocation of the key that created it — is still reasoning.
 
 **Nothing in this repository runs with `-race`.** The swap-atomicity test spawns concurrent readers
 across twenty swaps, which proves much less in CI than it looks like. It was run manually with

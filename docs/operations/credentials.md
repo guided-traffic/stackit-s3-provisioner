@@ -525,11 +525,20 @@ failure and crash-loops the pod, whatever the interval is.
 
 ### Not verified
 
-The live rotation of a real key against the real API has not been run. Everything above is derived
-from the implementation and reproduced offline against the in-memory provider fake. In particular,
-that a credentials group and its access keys outlive the service-account key that created them is a
-design argument — no cloud IAM model cascade-deletes an administrator's creations when that
-administrator's credential is rotated — and not an observation.
+The procedure above was exercised against the real API on 2026-09-20, between two service accounts
+of one project: the replacement key was proven and adopted without a restart, and the bucket,
+credentials group and access key the previous account had created stayed exactly where they were.
+
+Two things that run did not settle, and a rotation leans on both:
+
+* **It added a service account rather than revoking one.** That a credentials group and its access
+  keys outlive the *revocation* of the key that created them is still a design argument — no cloud
+  IAM model cascade-deletes an administrator's creations when that administrator's credential is
+  rotated — and not an observation. It is the reason step 5 of the procedure says to revoke the old
+  key only after the new one has demonstrably landed.
+* **No fleet was watched.** The recovery of already-failed `Bucket` resources after a swap follows
+  from the ordinary requeue machinery rather than from a measurement, so the "within one
+  `driftResyncInterval`" figure is derived, not timed.
 
 ---
 

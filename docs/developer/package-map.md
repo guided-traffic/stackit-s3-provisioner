@@ -344,6 +344,7 @@ complete net-free suite. Which suite to run when, and what each costs, is [testi
 | [`stackit/credentials_integration_test.go`](../../stackit/credentials_integration_test.go) | `integration` | workload credentials confined to one bucket, and a second workload locked out |
 | [`stackit/grants_integration_test.go`](../../stackit/grants_integration_test.go) | `integration` | a granted reader may read and may not write; an ungranted one sees nothing |
 | [`stackit/tagging_integration_test.go`](../../stackit/tagging_integration_test.go) | `integration` | that the StorageGRID backend supports bucket tagging at all, and that the wrappers round-trip |
+| [`stackit/keyrotation_integration_test.go`](../../stackit/keyrotation_integration_test.go) | `integration` | that a live client adopts a replaced service-account key without a restart, and that the real token endpoint refuses an unverifiable one; needs `account-1b.json`, a second service account of project 1 |
 | [`api/v1/bucket_types_test.go`](../../api/v1/bucket_types_test.go) | — | every derivation helper: naming, effective name, Secret keys and data, rotation trigger, clone defaults |
 | [`api/v1/bucket_usage_test.go`](../../api/v1/bucket_usage_test.go) | — | the three `spec.usage` resolvers |
 | [`api/v1/deepcopy_test.go`](../../api/v1/deepcopy_test.go) | — | the generated deepcopy over a fully populated object |
