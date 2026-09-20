@@ -122,7 +122,8 @@ started without `--bucket-usage-price-per-gb-hour` writes no cost estimate at al
 4. If the columns stay empty, work through [Failure modes](#failure-modes). Most
    reasons carry a warning event on the resource, but four do not: a missing or
    incomplete admin Secret is visible only as the operator log line `bucket size
-   measurement waiting for admin credentials` at `V(1)`, and a bucket that is not
+   measurement waiting for admin credentials` at `V(1)`, which needs
+   `logging.level: debug`, and a bucket that is not
    provisioned yet, skeleton mode and a bucket being deleted produce nothing at
    all. Two more — an unparseable interval or price in the Helm values — never
    reach a resource either: the operator crash-loops or exits at startup, so look

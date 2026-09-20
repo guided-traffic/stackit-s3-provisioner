@@ -1,8 +1,12 @@
 package main
 
 import (
+	"flag"
 	"testing"
 	"time"
+
+	"go.uber.org/zap/zapcore"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/guided-traffic/stackit-s3-provisioner/stackit"
 )
@@ -72,6 +76,64 @@ func TestSetupSAKeyReloadStaysOff(t *testing.T) {
 	t.Run("an interval of zero switches it off", func(t *testing.T) {
 		if err := setupSAKeyReload(nil, client, nil, "/etc/stackit/sa-key.json", 0); err != nil {
 			t.Errorf("setupSAKeyReload(interval 0) = %v, want nil", err)
+		}
+	})
+}
+
+// bindLogLevel returns a fresh flag set with the zap flags bound, parsed with
+// args, and the options they write into.
+func bindLogLevel(t *testing.T, args ...string) (*flag.FlagSet, *zap.Options) {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	opts := &zap.Options{}
+	opts.BindFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse %v: %v", args, err)
+	}
+	return fs, opts
+}
+
+func TestApplyLogLevelEnv(t *testing.T) {
+	t.Run("unset leaves the level alone", func(t *testing.T) {
+		t.Setenv("LOGLEVEL", "")
+		fs, opts := bindLogLevel(t)
+		if err := applyLogLevelEnv(fs); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.Level != nil {
+			t.Errorf("Level = %v, want nil", opts.Level)
+		}
+	})
+
+	t.Run("set becomes the level", func(t *testing.T) {
+		t.Setenv("LOGLEVEL", "error")
+		fs, opts := bindLogLevel(t)
+		if err := applyLogLevelEnv(fs); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.Level == nil || !opts.Level.Enabled(zapcore.ErrorLevel) || opts.Level.Enabled(zapcore.InfoLevel) {
+			t.Errorf("Level = %v, want error", opts.Level)
+		}
+	})
+
+	t.Run("an explicit flag wins and the variable is not parsed", func(t *testing.T) {
+		t.Setenv("LOGLEVEL", "not-a-level")
+		fs, opts := bindLogLevel(t, "--zap-log-level=info")
+		if err := applyLogLevelEnv(fs); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.Level == nil || !opts.Level.Enabled(zapcore.InfoLevel) || opts.Level.Enabled(zapcore.DebugLevel) {
+			t.Errorf("Level = %v, want info", opts.Level)
+		}
+	})
+
+	t.Run("an invalid value is the flag parser's error", func(t *testing.T) {
+		t.Setenv("LOGLEVEL", "warn")
+		fs, _ := bindLogLevel(t)
+		err := applyLogLevelEnv(fs)
+		want := `invalid value "warn" for LOGLEVEL: invalid log level "warn"`
+		if err == nil || err.Error() != want {
+			t.Errorf("err = %v, want %q", err, want)
 		}
 	})
 }

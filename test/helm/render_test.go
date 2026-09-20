@@ -36,9 +36,15 @@ type rule struct {
 	Verbs     []string `json:"verbs"`
 }
 
+type envVar struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 type container struct {
 	Name string   `json:"name"`
 	Args []string `json:"args"`
+	Env  []envVar `json:"env"`
 }
 
 type object struct {
@@ -104,14 +110,30 @@ func verbsFor(o object, resource string) []string {
 	return verbs
 }
 
-// managerArgs returns the args of the operator container in the rendered
-// Deployment.
-func managerArgs(t *testing.T, objs map[string]object) []string {
+// manager returns the operator container of the rendered Deployment.
+func manager(t *testing.T, objs map[string]object) container {
 	t.Helper()
 	dep, ok := objs["Deployment/"+fullname]
 	require.True(t, ok, "Deployment must be rendered")
 	require.Len(t, dep.Spec.Template.Spec.Containers, 1, "expected exactly one container")
-	return dep.Spec.Template.Spec.Containers[0].Args
+	return dep.Spec.Template.Spec.Containers[0]
+}
+
+// managerArgs returns the args of the operator container in the rendered
+// Deployment.
+func managerArgs(t *testing.T, objs map[string]object) []string {
+	t.Helper()
+	return manager(t, objs).Args
+}
+
+// envValue returns the literal value of the named variable, or "" if absent.
+func envValue(env []envVar, name string) string {
+	for _, e := range env {
+		if e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
 }
 
 // hasArgPrefix reports whether any arg starts with prefix.
@@ -208,4 +230,22 @@ func TestServiceAccountKeyArgsRenderTogether(t *testing.T) {
 		"skeleton mode must render no key path")
 	assert.False(t, hasArgPrefix(skeleton, "--stackit-sa-key-reload-interval="),
 		"a reload interval without a key is meaningless and must not be rendered")
+}
+
+// TestLogLevelRendersAsEnvOnly pins that logging.level reaches the operator as
+// LOGLEVEL, that the shipped default is info, and that the chart renders NO
+// --zap-log-level flag: a rendered flag beats the variable, which would make
+// `kubectl set env LOGLEVEL=debug` a silent no-op. Without either the binary
+// falls back to its own development default, debug, which is exactly what
+// this key exists to override.
+func TestLogLevelRendersAsEnvOnly(t *testing.T) {
+	byDefault := manager(t, render(t))
+	assert.Equal(t, "info", envValue(byDefault.Env, "LOGLEVEL"),
+		"the shipped default must reach the operator unchanged")
+	assert.False(t, hasArgPrefix(byDefault.Args, "--zap-log-level"),
+		"a rendered flag would override LOGLEVEL")
+
+	overridden := manager(t, render(t, "logging.level=debug"))
+	assert.Equal(t, "debug", envValue(overridden.Env, "LOGLEVEL"))
+	assert.False(t, hasArgPrefix(overridden.Args, "--zap-log-level"))
 }

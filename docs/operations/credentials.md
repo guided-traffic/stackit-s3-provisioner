@@ -348,7 +348,7 @@ measurement and caches nothing
 So between step 1 and step 2 below, provisioning keeps running on the cached
 credential while measurement starts failing immediately — the measuring
 reconcile logs `bucket size measurement waiting for admin credentials` at
-verbosity 1 and leaves `status.usage` untouched; it never touches `Ready`
+verbosity 1 (`logging.level: debug`) and leaves `status.usage` untouched; it never touches `Ready`
 ([usage-and-cost.md](usage-and-cost.md)). Keep the gap short.
 
 1. Delete the Secret in the operator namespace:

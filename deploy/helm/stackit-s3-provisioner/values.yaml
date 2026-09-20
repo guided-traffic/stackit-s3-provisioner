@@ -74,6 +74,21 @@ affinity: {}
 leaderElection:
   enabled: true
 
+# logging sets the verbosity of the operator's own log. info shows what the
+# operator decides and what failed; debug adds the retry chatter underneath: a
+# teardown held while the provider circuit is open, a status write that did not
+# apply, clone and measurement progress. The format is not part of this key: the
+# chart leaves the encoder at the operator's default, human-readable console
+# lines.
+# Details: ../../../docs/operations/configuration.md
+logging:
+  # level reaches the operator as the environment variable LOGLEVEL, so it can
+  # also be changed with `kubectl set env` (which rolls the pod) without a Helm
+  # upgrade. Accepted: debug, info, error, panic, or an integer above 0 selecting
+  # a debug depth. There is NO warn; anything else is rejected at startup and
+  # crash-loops the operator.
+  level: info
+
 # driftResyncInterval is how often an already-provisioned Bucket is re-reconciled
 # with no event to prompt it. It is what carries a policy change from a new
 # operator version onto buckets whose CR nobody touched. Must be a Go duration

@@ -21,6 +21,7 @@ rather than explained twice.
 - [The region, and the trap under it](#the-region-and-the-trap-under-it)
 - [The drift resync interval](#the-drift-resync-interval)
 - [Leader election](#leader-election)
+- [The log level](#the-log-level)
 - [Where every other setting is explained](#where-every-other-setting-is-explained)
 - [Failure modes](#failure-modes)
 
@@ -34,7 +35,7 @@ Three surfaces exist, and they are not alternatives — they are layers:
 | --- | --- | --- |
 | Helm value | a key in `values.yaml` | you |
 | Command-line flag | an entry under `args:` in the Deployment | the chart, from the value |
-| Environment variable | the fallback a flag reads when it is absent, and for two settings the *only* surface | the chart, for the two settings that have no flag: `POD_NAMESPACE` (downward API) and `CLONE_JOB_RESOURCES` (from `clone.resources`); otherwise nobody |
+| Environment variable | the fallback a flag reads when it is absent, and for two settings the *only* surface | the chart, for the two settings that have no flag: `POD_NAMESPACE` (downward API) and `CLONE_JOB_RESOURCES` (from `clone.resources`), and for `LOGLEVEL` (from `logging.level`), whose flag exists but is deliberately not rendered; otherwise nobody |
 
 The chart renders the flags in
 [`templates/deployment.yaml`](../../deploy/helm/stackit-s3-provisioner/templates/deployment.yaml), and
@@ -55,11 +56,16 @@ It also goes the other way. `POD_NAMESPACE` and `CLONE_JOB_RESOURCES` have no fl
 the process only as environment variables the chart writes itself: `POD_NAMESPACE` carries the
 operator namespace in through the downward API, and `CLONE_JOB_RESOURCES` carries `clone.resources`
 in as JSON, which the operator unmarshals into the clone Job's pod resources. That makes
-`clone.resources` the one Helm value whose malformed content is a startup exit exactly like the
+`clone.resources` one of two Helm values whose malformed content is a startup exit exactly like the
 duration faults below — `invalid CLONE_JOB_RESOURCES JSON`, then the process exits and the pod
 crash-loops. Both are rendered in
 [`templates/deployment.yaml`](../../deploy/helm/stackit-s3-provisioner/templates/deployment.yaml);
 `CLONE_JOB_RESOURCES` only when `clone.resources` is non-empty.
+
+`LOGLEVEL` is the third variable the chart writes, and the one case where the chart has a flag
+available and chooses the variable: `--zap-log-level` exists, `LOGLEVEL` is its fallback, and the
+chart renders only the variable so that `kubectl set env` can change the level without editing the
+container args — a rendered flag would beat it. The other is [the log level](#the-log-level).
 
 A handful of flags are rendered only when their value is non-empty or true — `--bucket-name-prefix`,
 `--bucket-name-include-namespace`, `--ownership-name`, `--enable-wipe-on-delete`, `--leader-elect`,
@@ -438,6 +444,52 @@ kubectl -n $NS get lease stackit-s3-provisioner.stackit-bucket.gtrfc.com \
 
 ---
 
+## The log level
+
+`logging.level` (`info` # default) sets the verbosity of the operator's own log. It reaches the pod
+as the environment variable `LOGLEVEL`, which the operator reads as the fallback for
+`--zap-log-level` — the chart deliberately renders the variable and not the flag, because a
+rendered flag would win over the variable. The accepted values are the same on both surfaces, since
+the variable is fed through the flag's own parser: `debug`, `info`, `error`, `panic`, or an integer
+above 0 selecting a debug depth, where `1` is `debug` and nothing in the operator logs deeper than
+that (every verbosity call site is `V(1)`, verified on 2026-09-20 across
+[`internal/controller/`](../../internal/controller/)). **There is no `warn`.** Anything else is
+rejected at startup exactly like a duration without a unit; see [Failure modes](#failure-modes).
+
+Because it is a variable, it can be changed without a Helm upgrade:
+
+```bash
+kubectl -n $NS set env deployment/stackit-s3-provisioner LOGLEVEL=debug   # example; rolls the pod
+```
+
+The next `helm upgrade` puts `logging.level` back, so a quick debug session leaves nothing behind
+unless the value is changed there too.
+
+Everything the operator writes at `Info` or `Error` is visible at `info`. What `debug` adds is the
+retry chatter underneath those lines, and this is all of it:
+
+| Line at `debug` | What it is |
+| --- | --- |
+| `provider circuit open; deferring teardown` | A deletion held while the circuit is open ([deletion.md](deletion.md), [provider-outages.md](provider-outages.md)). |
+| `bucket size measurement waiting for admin credentials`, `bucket size measured`, `bucket size measurement failed` | The measurement controller's own progress ([usage-and-cost.md](usage-and-cost.md)). |
+| `clone stats unavailable` | A clone Job whose progress endpoint did not answer this poll ([cloning.md](cloning.md)). |
+| `could not probe recorded credentials group` | The existence check on a credentials group the `Bucket` no longer attributes failed; the warning event that follows is unaffected ([credentials.md](credentials.md)). |
+| `… status update did not apply`, `… status patch did not apply` | A status write that lost a conflict; the next reconcile writes it again. |
+
+The format is not part of this setting. The chart leaves the encoder, the stack-trace threshold and
+the timestamp format at the operator's built-in defaults — human-readable console lines, stack
+traces from `warn`, RFC 3339 timestamps — and exposes no key for them; the flags behind them are
+listed under *Flags the chart does not render* in the [README reference](../../README.md#reference).
+
+Changing it takes effect on the next rollout — `helm upgrade` or `kubectl set env` restarts the pod
+— like every setting except the service-account key ([above](#exactly-one-setting-is-hot-reloaded)).
+
+Outside this chart the picture differs: the binary's own default, with neither `--zap-log-level` on
+its command line nor `LOGLEVEL` in its environment, is `debug` — the development mode set in
+[`cmd/main.go`](../../cmd/main.go) — which is also what `make run` passes explicitly.
+
+---
+
 ## Where every other setting is explained
 
 Each block below is explained on exactly one page. The complete key list, with every default, is in
@@ -452,6 +504,7 @@ the [README reference](../../README.md) and nowhere else.
 | `wipeOnDelete` | The destructive gate, and the two other authorizations it needs | [deletion.md](deletion.md#the-wipe-path) |
 | `providerDegradedGrace`, `providerCircuit` | What the operator does while the provider is unreachable | [provider-outages.md](provider-outages.md) |
 | `bucketUsage` | Size measurement, its guards and the cost estimate | [usage-and-cost.md](usage-and-cost.md) |
+| `logging` | The verbosity of the operator's own log | [above](#the-log-level) |
 | `clone` | The clone job's image, resources and network policy | [cloning.md](cloning.md) |
 | `monitoring` | What each metric and each alert means, and how they are tuned against each other | [monitoring.md](monitoring.md) |
 | `spec.secretRef.keys` on a `Bucket` | The Secret data-key contract and the collision fault | [credentials.md](credentials.md#the-workload-secret) |
@@ -476,6 +529,7 @@ the pod crash-loops with the reason in its log rather than running half-configur
 | Provider answers `rate limit on IP level exceeded` during normal operation | Steady drift-resync traffic scaled past the provider's per-IP limit. Resync requeues are not paced by the workqueue rate limiter. | Raise `driftResyncInterval`. Background and the 2026-09-02 incident: [provider-outages.md](provider-outages.md). |
 | Two operator pods **from two different releases** in one namespace, only one ever reconciles (for one release, this is the intended `replicaCount: 2` behaviour and not a fault) | The leader-election lease identity is a constant, not release-scoped, so both releases contend for one lease. | Install each release into its own namespace. |
 | `leases.coordination.k8s.io is forbidden` in the operator log | `--leader-elect` is on the command line while the `leases` RBAC rule is absent. **The chart cannot produce this**: both are gated on `leaderElection.enabled`, so it means the Deployment was patched out of band or the binary runs outside this chart. | Put the setting back under the Helm value, or add the `coordination.k8s.io/leases` rule to whatever role the process runs with. |
+| `CrashLoopBackOff`; log is the single line `invalid value "warn" for LOGLEVEL: invalid log level "warn"` | `logging.level` (or a `LOGLEVEL` set by hand) is not one of `debug`, `info`, `error`, `panic` or an integer above 0. Nothing validates it before the rollout. | Set one of those. There is no `warn` level ([above](#the-log-level)). |
 | `CrashLoopBackOff`; log ends with `invalid CLONE_JOB_RESOURCES JSON` | `clone.resources` is the one Helm value that reaches the process as JSON in an environment variable, and it did not unmarshal into pod resource requirements. | Fix the block so it is a valid `resources:` mapping (`requests`/`limits` with quantity strings); see [cloning.md](cloning.md). |
 | An environment variable you set in the pod has no effect | The chart renders the matching flag unconditionally, and a flag beats its environment default. | Set the Helm value instead. |
 
