@@ -51,8 +51,12 @@ new kind of write is added to the pass:
 | `isolation policy written` | The live policy differed from the desired document and was rewritten ([ADR 0003](0003-workloads-are-isolated-by-an-explicit-deny-policy.md) D8) |
 | `workload credentials issued` | An access key was minted and the Secret written — first provisioning, a lost Secret, or a requested rotation ([ADR 0007](0007-a-workload-credential-lives-in-its-secret-and-rotates-only-on-request.md)) |
 | `clone completed` | The copy finished in this pass ([ADR 0011](0011-a-clone-runs-once-as-a-job-in-the-operator-namespace.md)) |
+| `recovered to Ready` | The `Bucket` entered the pass held through a provider outage, reported `Failed`, or reported with its bucket missing, and the pass ended that state ([ADR 0012](0012-ready-describes-the-last-verified-state.md), [ADR 0013](0013-a-provider-outage-is-held-fleet-wide.md), [ADR 0015](0015-a-provisioned-bucket-is-never-re-created-implicitly.md)) |
 
 A status write on its own is not a change: every successful pass writes status.
+The recovery above is the one case where the state a status records *is* the
+change — such a pass frequently writes nothing at the provider, and reporting it
+as unchanged would make the end of an outage the quietest moment of it.
 
 **D3 — The first successful pass a process completes for a `Bucket` is reported at `Info` even when
 it changed nothing.** The line is `bucket verified after operator start`; it raises no event, because

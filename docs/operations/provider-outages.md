@@ -328,6 +328,12 @@ Work down this list; each step distinguishes a case the one above cannot.
    fleet-wide rate limit of 1 requeue per second applies to *failed* reconciles
    only, so it does not pace the recovery pass.
 
+   Each recovering `Bucket` reports itself: a `bucket provisioned` line at `Info`
+   and a `Provisioned` event, both carrying `recovered to Ready`
+   ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md) D2). The
+   fleet is back when those stop arriving, which is cheaper to watch than polling
+   the conditions of every `Bucket`.
+
 ## When a Bucket falls to Failed after the grace
 
 The grace elapsed, so the operator has stopped vouching for a state it cannot

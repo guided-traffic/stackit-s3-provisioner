@@ -353,6 +353,8 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	// tell a pass that changed something from one that only verified.
 	var changes passChanges
 	changes.note(b.Status.ObservedGeneration != b.Generation, fmt.Sprintf("spec generation %d observed", b.Generation))
+	// Read before markProvisioning, which overwrites the phase this looks at.
+	changes.note(recovering(b), "recovered to Ready")
 
 	r.markProvisioning(ctx, b)
 
@@ -1851,6 +1853,18 @@ func (r *BucketReconciler) holdsReadyThrough(b *s3v1.Bucket, err error) bool {
 // The condition is removed rather than set to True so that a Bucket which never
 // degraded and one which recovered look identical, and so an operator upgrade
 // writes nothing to Buckets that are simply healthy.
+// recovering reports whether this Bucket is currently in a state a successful
+// pass ends: held through a provider outage, reported Failed, or reported with
+// its bucket missing. Such a pass often writes nothing at the provider, so
+// without this note it would be reported as unchanged — yet the recovery is
+// exactly what somebody watching an outage is waiting for.
+func recovering(b *s3v1.Bucket) bool {
+	return b.Status.Phase == s3v1.PhaseFailed ||
+		b.Status.DegradedSince != nil ||
+		meta.FindStatusCondition(b.Status.Conditions, s3v1.ConditionProviderReachable) != nil ||
+		meta.FindStatusCondition(b.Status.Conditions, s3v1.ConditionBucketPresent) != nil
+}
+
 func clearDegraded(b *s3v1.Bucket) {
 	b.Status.DegradedSince = nil
 	meta.RemoveStatusCondition(&b.Status.Conditions, s3v1.ConditionProviderReachable)
