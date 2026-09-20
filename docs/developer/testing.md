@@ -46,7 +46,7 @@ generated DeepCopy code.
 | [api/v1/bucket_types_test.go](../../api/v1/bucket_types_test.go) | Name composition and validation, `EffectiveBucketName`, the Secret data map and its key overrides, the key-collision refusal, the rotation trigger, the `cloneFrom` accessors |
 | [api/v1/bucket_usage_test.go](../../api/v1/bucket_usage_test.go) | The three-state `spec.usage` accessors (`Enabled`, `IncludeVersions`, `Interval`) against a cluster default |
 | [api/v1/deepcopy_test.go](../../api/v1/deepcopy_test.go) | The generated DeepCopy over a fully populated object, so an added field without `make generate-all` is caught |
-| [cmd/main_test.go](../../cmd/main_test.go) | The environment-variable fallbacks for the flags, including that `"0"` survives `envDurationOrDefault` rather than reading as unset — for the key reload it is the documented off switch — and that `setupSAKeyReload` adds nothing to the manager in skeleton mode or at an interval of `0` (it is handed a **nil** manager, which is the cheapest possible proof that neither case reaches one) |
+| [cmd/main_test.go](../../cmd/main_test.go) | The environment-variable fallbacks for the flags, including that `"0"` survives `envDurationOrDefault` rather than reading as unset — for the key reload it is the documented off switch; that `LOGLEVEL` becomes the level through the flag's own parser, is ignored when `--zap-log-level` is given explicitly, and fails with the parser's wording when invalid; and that `setupSAKeyReload` adds nothing to the manager in skeleton mode or at an interval of `0` (it is handed a **nil** manager, which is the cheapest possible proof that neither case reaches one) |
 | [stackit/client_test.go](../../stackit/client_test.go) | Service-account key parsing, and that the two key files name two different projects |
 | [stackit/newclient_test.go](../../stackit/newclient_test.go) | Client construction against a throwaway generated RSA key — parsing and JWT-signer setup only, never a call |
 | [stackit/errors_test.go](../../stackit/errors_test.go) | `ProviderRefused` and `isServiceNotEnabled`, against error bodies captured verbatim from the live API on 2026-08-25, plus the proof that `oapierror.Model` is not a usable discriminator |
@@ -85,6 +85,7 @@ beyond localhost.
 | [reconciler_degraded_test.go](../../internal/controller/reconciler_degraded_test.go) | Sticky readiness: held through transient failures, recovery, grace expiry, and every case in the exception list except the vanished bucket, which is the row below |
 | [reconciler_missing_bucket_test.go](../../internal/controller/reconciler_missing_bucket_test.go) | The vanished-bucket guard: reported rather than re-created, the refusal holding over five further passes, recovery when the bucket comes back, a never-provisioned Bucket still provisioning, the `spec.allowRecreate` rebuild and its report, a completed clone not re-run by one, the five unreachable-provider shapes that must *not* trip it, the breaker staying shut, a teardown that completes without the bucket, and the three rollout cases — an upgrade touching nothing on healthy Buckets, a Bucket provisioned before `status.resolvedBucketName` existed being adopted rather than re-created, and a naming policy changed between operator versions still being checked under the frozen name |
 | [reconciler_circuit_test.go](../../internal/controller/reconciler_circuit_test.go) | The breaker inside a reconcile: trip, hold without churn, grace still expiring, recovery, an isolated broken bucket not tripping it, deferred teardown |
+| [reconciler_report_test.go](../../internal/controller/reconciler_report_test.go) | How a successful pass is reported ([ADR 0017](../adr/0017-a-reconcile-that-changes-nothing-is-silent.md)): the three outcomes of `reportPass` against a captured zap log — `Info` plus event on a change, `Info` without event on the first pass since start, verbosity 1 otherwise — and, end to end against the fake, that unchanged resyncs raise no further `Provisioned` event while `status.lastVerifiedTime` advances, that a re-asserted policy and a re-issued Secret are named in the event |
 | [reconciler_clone_test.go](../../internal/controller/reconciler_clone_test.go) | The clone Job, the staging Secret, rc progress, failure retry, the guards, teardown of the artifacts, and the Job-name label budget |
 | [reconciler_usage_test.go](../../internal/controller/reconciler_usage_test.go) | Measurement: the two switches, the interval floor, the object cap, versions, the failure path, and every skip condition |
 | [stackit/client_fake_test.go](../../stackit/client_fake_test.go) | The control-plane wrapper against the fake: service enablement, bucket lifecycle, groups and keys, and `TestBucketExistsOnlyTrustsAStructuredAnswer` — the table-driven proof that `BucketExists` says "no" only for the API's own structured JSON `404` |
@@ -209,7 +210,9 @@ See [The cloud end-to-end run](#the-cloud-end-to-end-run).
 
 [test/helm/render_test.go](../../test/helm/render_test.go) shells out to
 `helm template` and asserts on the rendered user-facing ClusterRoles and on the
-manager container's arguments. It exists because the Kind install only ever
+manager container's arguments and environment — including that `logging.level`
+reaches the container as `LOGLEVEL` and never as a flag, and that an empty level
+fails the render. It exists because the Kind install only ever
 exercises the default values: the non-default combination
 (`bucketRoles.create=false`) and the exact rule shape are visible to nothing
 else.

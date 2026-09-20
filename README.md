@@ -289,6 +289,7 @@ Everything below is written by the operator. `spec` and labels never are.
 | `clone.totalBytes` / `clone.bytesCopied` | int64 | Denominator measured once before the copy; bytes transferred so far. |
 | `clone.progress` / `clone.rate` / `clone.eta` / `clone.message` | string | `2.0 GiB / 18.0 GiB (11%)`, `42.0 MiB/s`, `6m30s` — examples; `message` carries a failure reason. |
 | `lastRotationTrigger` / `lastRotationTime` | string, time | The annotation value last acted on, and when. |
+| `lastVerifiedTime` | time | When the last successful pass completed, changed or not — the per-object proof that the drift resync runs. |
 | `degradedSince` | time | When the hold on `Ready` began. Cleared on the next success. |
 | `operatorVersion` | string | Operator version that last reconciled. |
 | `usage.bytes` / `usage.objects` | int64 | Current objects and their size. |

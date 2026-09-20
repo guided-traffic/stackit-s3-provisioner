@@ -417,7 +417,6 @@ func parseUsagePrice(raw string) (float64, error) {
 	return v, nil
 }
 
-// envOrDefault returns the value of the environment variable key, or def when unset.
 // applyLogLevelEnv makes LOGLEVEL the fallback for --zap-log-level. The flag is
 // bound by controller-runtime, so unlike the operator's own flags it cannot read
 // the variable as its default; the value is fed through the flag's own parser
@@ -443,6 +442,7 @@ func applyLogLevelEnv(fs *flag.FlagSet) error {
 	return nil
 }
 
+// envOrDefault returns the value of the environment variable key, or def when unset.
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

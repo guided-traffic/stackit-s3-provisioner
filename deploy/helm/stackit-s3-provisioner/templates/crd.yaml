@@ -79,6 +79,11 @@ spec:
       name: Measured
       priority: 1
       type: date
+    - description: When the operator last verified this bucket against StackIT
+      jsonPath: .status.lastVerifiedTime
+      name: Verified
+      priority: 1
+      type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -565,6 +570,16 @@ spec:
                   operator last acted upon. A differing (non-empty) annotation value requests
                   a new rotation; recording it here makes the trigger level-based and
                   GitOps-safe (the operator never mutates the annotation itself).
+                type: string
+              lastVerifiedTime:
+                description: |-
+                  LastVerifiedTime is when the operator last completed a successful pass over
+                  this Bucket: bucket, credentials group, isolation policy and Secret found
+                  in, or brought to, their desired state. It advances on every successful
+                  pass whether or not the pass changed anything, and is the per-object proof
+                  that the drift resync is running — a pass that changes nothing is otherwise
+                  silent.
+                format: date-time
                 type: string
               message:
                 description: |-
