@@ -1,5 +1,8 @@
-# Build stage
-FROM golang:1.27.1-alpine AS builder
+# Build stage.
+# Pinned to BUILDPLATFORM so a multi-platform build runs this stage once, natively, and
+# reaches the other architectures through GOARCH below. Without it buildx would run the
+# whole stage — including go build — under QEMU for every non-native platform.
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS builder
 
 # Build arguments for metadata
 ARG BUILD_NUMBER
