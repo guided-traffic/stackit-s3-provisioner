@@ -730,6 +730,7 @@ jobs:
         run: echo "epoch=$(date +%s)" >> $GITHUB_OUTPUT
 
       - name: Build container for scanning
+        id: build
         uses: docker/build-push-action@v7
         with:
           file: Containerfile
@@ -754,8 +755,15 @@ jobs:
           severity: 'CRITICAL,HIGH'
           scanners: 'vuln,secret,misconfig'
 
+      # Runs whenever the image exists, so a scan that failed on a CRITICAL or HIGH finding still
+      # produces its SARIF report. Guarded on the build rather than always(), because without an
+      # image Trivy fails with "unable to find the specified image" and that error buries the real
+      # one in the job log. The !cancelled() is load-bearing: an if without a status check function
+      # carries an implicit success(), which would skip this step exactly when the scan above found
+      # something.
       - name: Run Trivy scan (SARIF output)
-        if: always()
+        id: sarif
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: stackit-s3-provisioner:scan-${{ github.sha }}
@@ -764,7 +772,7 @@ jobs:
           scanners: 'vuln,secret,misconfig'
 
       - name: Upload Trivy scan results
-        if: always()
+        if: ${{ !cancelled() && steps.sarif.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: trivy-container-report
