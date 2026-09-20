@@ -15,9 +15,14 @@
 // the secret lives in a Secret inside the cluster. Deleting the Kind cluster
 // therefore orphans a fully privileged, still-valid S3 key. -admin drains and
 // removes that group too. Do NOT pass -admin against a project that also hosts a
-// real operator deployment: it would invalidate that operator's admin key. (It
-// recovers on its own — ensureAdmin re-creates the group and mints a new key —
-// but it is a needless disruption.)
+// real operator deployment: it would invalidate that operator's admin key, and
+// that does NOT heal by itself. A running process keeps the dead credential for
+// its lifetime, and restarting does not help either — ensureAdmin re-bootstraps
+// only when the admin Secret is missing or incomplete, and a Secret still
+// holding the old access key id, secret and urn is neither. Repair is manual and
+// is a pair of acts, neither of which works alone: delete the admin Secret AND
+// restart the operator (ADR 0004 D9; the procedure is in
+// docs/operations/credentials.md).
 //
 // A leftover bucket usually still carries an isolation policy that denies every
 // principal except the admin group and the bucket's own workload group, so it
