@@ -237,6 +237,18 @@
       ]
     },
     {
+      "description": "Kubernetes ecosystem modules that carry no semver tag are versioned by the Kubernetes release line, not by themselves: every k8s.io/* release pins one pseudo-version of each, and only that combination is compiled upstream. Renovate sees pseudo-version updates as digests and would walk them to the newest master commit, which compiles against Kubernetes master alone - kube-openapi moved pkg/schemaconv to sigs.k8s.io/structured-merge-diff/v7 while k8s.io/apimachinery v0.37.0 still expects v6, and every build, test and scan job failed on the type mismatch. Because the group rule above matches them, one unbumpable module also blocks every other Kubernetes update in the same pull request. They now move only when a k8s.io/* release raises the minimum version and go mod tidy follows. Trade-off: a security fix in one of them no longer arrives on its own; govulncheck runs on every pull request and turns CI red if our code calls such a vulnerability, and the pin can then be raised by hand.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "k8s.io/kube-openapi",
+        "k8s.io/utils",
+        "sigs.k8s.io/json"
+      ],
+      "enabled": false
+    },
+    {
       "description": "Use 'fix' instead of 'chore' for dependency updates",
       "semanticCommitType": "fix",
       "matchUpdateTypes": [

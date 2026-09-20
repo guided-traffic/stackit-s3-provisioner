@@ -111,11 +111,40 @@ front page holds no Go literal to bump.
 Renovate additionally groups every `golang.org/x/*` module bump into the same pull request, so
 govulncheck sees a consistent set.
 
+### The untagged Kubernetes modules move with the release line, not on their own
+
+Three modules in [`go.mod`](../../go.mod) carry no semver tag and appear only as a pseudo-version:
+`k8s.io/kube-openapi`, `k8s.io/utils` and `sigs.k8s.io/json`. They have no release contract of their
+own. Every `k8s.io/*` release pins one commit of each, and only that combination is compiled
+upstream — `k8s.io/api`, `k8s.io/apimachinery`, `k8s.io/client-go` and `k8s.io/apiextensions-apiserver`
+at `v0.37.0` all name the same three pseudo-versions, and [`go.mod`](../../go.mod) carries exactly
+those.
+
+Renovate classifies a pseudo-version update as a digest and would otherwise walk each of them to the
+newest commit on master, where they compile against Kubernetes master alone. That is not a
+hypothetical: `kube-openapi` master moved `pkg/schemaconv` to `sigs.k8s.io/structured-merge-diff/v7`
+while `k8s.io/apimachinery v0.37.0` still constructs its type converter from
+`structured-merge-diff/v6`, so `go build` failed inside apimachinery and took lint, unit tests,
+envtest, govulncheck, the e2e image build and the container scan with it. The grouping rule matches
+these modules too, so one unbumpable module also blocks every other Kubernetes update sharing the
+pull request.
+
+A package rule in [`renovate.json`](../../renovate.json) therefore disables updates for those three
+module paths. They still move — `gomodTidy` raises them whenever a `k8s.io/*` bump lifts the minimum
+version — but only as a consequence of the release line, never ahead of it.
+
+**Security note.** Disabling the rule means a fix published in one of the three no longer arrives on
+its own. What catches it instead is the vulnerability job: `make vuln` runs govulncheck on every pull
+request and fails the pipeline if our code calls a known vulnerability, in a direct or an indirect
+module. The residual gap is a vulnerability that govulncheck does not report as called; raising the
+pin by hand is then the only route, and nothing prompts for it.
+
 The other pinned versions, none of which is a Go version:
 
 | Pin | Where | Bumped by |
 |---|---|---|
 | `ENVTEST_K8S_VERSION = 1.33.0` | [`Makefile`](../../Makefile) | by hand |
+| `k8s.io/kube-openapi`, `k8s.io/utils`, `sigs.k8s.io/json`, each a pseudo-version | [`go.mod`](../../go.mod) | `go mod tidy`, only when a `k8s.io/*` release raises the minimum — Renovate is switched off for these three module paths, for the reason above |
 | `KUBERNETES_VERSION: '1.33.4'` — the kubectl and Kind node image of the e2e job | [`release.yml`](../../.github/workflows/release.yml) | by hand |
 | `KUSTOMIZE_VERSION`, `CONTROLLER_GEN_VERSION`, `GOLANGCI_LINT_VERSION`, `GOCYCLO_VERSION`, `GOSEC_VERSION` | [`Makefile`](../../Makefile), each under a `# renovate:` comment | the Makefile custom regex manager; minor and patch automerge, major needs review |
 | `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the five above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
