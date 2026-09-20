@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -58,6 +59,15 @@ var (
 	bucketDegradedSinceDesc = prometheus.NewDesc(
 		"stackit_s3_provisioner_bucket_degraded_since_timestamp_seconds",
 		"Unix time at which this Bucket started degrading; absent for Buckets that are not degraded.",
+		bucketLabels, nil,
+	)
+	// The alarm surface for a vanished bucket. Conditions are not queryable in
+	// Prometheus, so ConditionBucketPresent needs a gauge to alert on; it is
+	// absent for every healthy Bucket, so `absent()` and a plain threshold both
+	// behave, exactly like the degraded pair above.
+	bucketProvisionedMissingDesc = prometheus.NewDesc(
+		"stackit_s3_provisioner_bucket_provisioned_missing",
+		"1 for a Bucket that was provisioned and whose bucket the provider now reports as gone; absent for every other Bucket.",
 		bucketLabels, nil,
 	)
 	bucketsWipeOnDeleteDesc = prometheus.NewDesc(
@@ -163,6 +173,17 @@ var (
 		Name: "stackit_s3_provisioner_usage_measurement_failures_total",
 		Help: "Total number of bucket size measurements that failed.",
 	})
+	// bucketRecreations counts vanished buckets that were rebuilt automatically
+	// because spec.allowRecreate authorised it. It cannot be derived from the
+	// Bucket cache: an authorised re-creation ends with the CR back in Ready and
+	// leaves no durable trace on it at all, so together with the Warning event
+	// this counter IS the record that the data was lost. It is a process
+	// counter, so it restarts at zero with the operator — alert on the rate, and
+	// read the event while it lives.
+	bucketRecreations = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "stackit_s3_provisioner_bucket_recreated_total",
+		Help: "Total number of vanished buckets re-created automatically because spec.allowRecreate authorised it.",
+	}, bucketLabels)
 	// usageMeasurementDuration records how long a listing pass took. It is the
 	// honest price of the configured interval: the number to look at before
 	// lowering it, and the one that shows a bucket outgrowing its cap.
@@ -198,7 +219,7 @@ func RegisterBucketMetrics(reader client.Reader, breaker *ProviderBreaker, skele
 		wipeGateEnabled:  wipeGateEnabled,
 		usageGateEnabled: usageGateEnabled,
 	})
-	ctrlmetrics.Registry.MustRegister(usageMeasurementFailures, usageMeasurementDuration)
+	ctrlmetrics.Registry.MustRegister(usageMeasurementFailures, usageMeasurementDuration, bucketRecreations)
 }
 
 func (c *bucketMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -206,6 +227,7 @@ func (c *bucketMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- bucketsCloneDesc
 	ch <- bucketsDegradedDesc
 	ch <- bucketDegradedSinceDesc
+	ch <- bucketProvisionedMissingDesc
 	ch <- bucketsWipeOnDeleteDesc
 	ch <- skeletonModeDesc
 	ch <- wipeGateDesc
@@ -268,28 +290,12 @@ func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		if b.Spec.WipeOnDelete {
 			wipeOnDelete++
 		}
-		// Both degraded metrics describe a hold that is actually in effect, so
-		// they require phase Ready as well. status.degradedSince deliberately
-		// survives into phase Failed once the grace elapses — it records when the
-		// trouble began — but at that point the Bucket is no longer being held
-		// and is covered by the Failed phase gauge instead. Counting it here too
-		// would report a hold that has already been given up.
-		if t := b.Status.DegradedSince; t != nil && phase == s3v1.PhaseReady {
+		held, hasUsage := collectBucket(ch, b, phase)
+		if held {
 			degraded++
-			// Per Bucket rather than one aggregate timestamp: alerting on how
-			// long a degradation has lasted is only actionable if it names the
-			// Bucket. Absent while healthy, so `time() - <series>` is the age of
-			// the hold wherever the series exists.
-			ch <- prometheus.MustNewConstMetric(bucketDegradedSinceDesc, prometheus.GaugeValue,
-				float64(t.Unix()), b.Namespace, b.Name)
 		}
-		if t := b.Status.LastRotationTime; t != nil {
-			ch <- prometheus.MustNewConstMetric(lastRotationDesc, prometheus.GaugeValue,
-				float64(t.Unix()), b.Namespace, b.Name)
-		}
-		if u := b.Status.Usage; u != nil && u.LastMeasurementTime != nil {
+		if hasUsage {
 			measured++
-			collectUsage(ch, b.Namespace, b.Name, u)
 		}
 	}
 
@@ -304,6 +310,45 @@ func (c *bucketMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(bucketsWipeOnDeleteDesc, prometheus.GaugeValue, float64(wipeOnDelete))
 	ch <- prometheus.MustNewConstMetric(bucketsDegradedDesc, prometheus.GaugeValue, float64(degraded))
 	ch <- prometheus.MustNewConstMetric(bucketsUsageEnabledDesc, prometheus.GaugeValue, float64(measured))
+}
+
+// collectBucket emits the per-Bucket series for one Bucket and reports whether it
+// counts toward the two fleet gauges that are derived from them. It exists apart
+// from Collect so that adding a per-Bucket series does not keep growing the
+// branch count of the scrape entry point.
+//
+// Every series here is ABSENT for a Bucket the condition does not apply to, which
+// is the design: `absent()` then separates "nothing to report" from a zero value,
+// and a plain threshold alert cannot fire on a stale series.
+func collectBucket(ch chan<- prometheus.Metric, b *s3v1.Bucket, phase s3v1.BucketPhase) (held, measured bool) {
+	// Both degraded metrics describe a hold that is actually in effect, so they
+	// require phase Ready as well. status.degradedSince deliberately survives into
+	// phase Failed once the grace elapses — it records when the trouble began —
+	// but at that point the Bucket is no longer being held and is covered by the
+	// Failed phase gauge instead. Counting it here too would report a hold that
+	// has already been given up.
+	if t := b.Status.DegradedSince; t != nil && phase == s3v1.PhaseReady {
+		held = true
+		// Per Bucket rather than one aggregate timestamp: alerting on how long a
+		// degradation has lasted is only actionable if it names the Bucket.
+		ch <- prometheus.MustNewConstMetric(bucketDegradedSinceDesc, prometheus.GaugeValue,
+			float64(t.Unix()), b.Namespace, b.Name)
+	}
+	// Derived from the condition rather than from the phase: a Bucket can be
+	// Failed for a dozen reasons, and only this one means the data is gone.
+	if meta.IsStatusConditionFalse(b.Status.Conditions, s3v1.ConditionBucketPresent) {
+		ch <- prometheus.MustNewConstMetric(bucketProvisionedMissingDesc, prometheus.GaugeValue,
+			1, b.Namespace, b.Name)
+	}
+	if t := b.Status.LastRotationTime; t != nil {
+		ch <- prometheus.MustNewConstMetric(lastRotationDesc, prometheus.GaugeValue,
+			float64(t.Unix()), b.Namespace, b.Name)
+	}
+	if u := b.Status.Usage; u != nil && u.LastMeasurementTime != nil {
+		measured = true
+		collectUsage(ch, b.Namespace, b.Name, u)
+	}
+	return held, measured
 }
 
 // collectUsage emits one Bucket's measured size and cost. It is only called for

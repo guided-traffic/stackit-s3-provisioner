@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -224,5 +225,57 @@ stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds 1.7e+09
 		"stackit_s3_provisioner_provider_circuit_open",
 		"stackit_s3_provisioner_provider_circuit_opened_timestamp_seconds"); err != nil {
 		t.Fatalf("recovered circuit: %v", err)
+	}
+}
+
+// TestBucketProvisionedMissingMetric pins the alarm surface for a vanished
+// bucket. Conditions are not queryable in Prometheus, so this gauge is what an
+// alert actually fires on — and it must be absent for every other Bucket,
+// including one that is Failed for an unrelated reason, so that a plain
+// threshold cannot be tripped by ordinary provisioning faults.
+func TestBucketProvisionedMissingMetric(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := s3v1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+
+	missing := newBucket("ns-a", "gone", "uid-1")
+	missing.Status.Phase = s3v1.PhaseFailed
+	meta.SetStatusCondition(&missing.Status.Conditions, metav1.Condition{
+		Type:   s3v1.ConditionBucketPresent,
+		Status: metav1.ConditionFalse,
+		Reason: s3v1.ReasonBucketMissing,
+	})
+
+	// Failed, but for an ordinary reason: no series.
+	otherFailure := newBucket("ns-a", "broken", "uid-2")
+	otherFailure.Status.Phase = s3v1.PhaseFailed
+
+	// Degraded: the provider is unreachable, which says nothing about the
+	// bucket. Conflating the two is the failure mode the guard exists to avoid.
+	degraded := newBucket("ns-b", "degraded", "uid-3")
+	degraded.Status.Phase = s3v1.PhaseReady
+	degraded.Status.DegradedSince = &metav1.Time{Time: time.Unix(1700000000, 0)}
+	meta.SetStatusCondition(&degraded.Status.Conditions, metav1.Condition{
+		Type:   s3v1.ConditionProviderReachable,
+		Status: metav1.ConditionFalse,
+		Reason: s3v1.ReasonProviderUnreachable,
+	})
+
+	healthy := newBucket("ns-b", "fine", "uid-4")
+	healthy.Status.Phase = s3v1.PhaseReady
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(missing, otherFailure, degraded, healthy).Build()
+	c := &bucketMetricsCollector{reader: cl}
+
+	expected := `
+# HELP stackit_s3_provisioner_bucket_provisioned_missing 1 for a Bucket that was provisioned and whose bucket the provider now reports as gone; absent for every other Bucket.
+# TYPE stackit_s3_provisioner_bucket_provisioned_missing gauge
+stackit_s3_provisioner_bucket_provisioned_missing{name="gone",namespace="ns-a"} 1
+`
+	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+		"stackit_s3_provisioner_bucket_provisioned_missing"); err != nil {
+		t.Fatalf("unexpected metrics: %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -43,6 +44,7 @@ func main() {
 	var probeAddr string
 	var enableLeaderElection bool
 	var saKeyPath string
+	var saKeyReloadInterval time.Duration
 	var region string
 	var adminSecretName string
 	var operatorNamespace string
@@ -73,6 +75,16 @@ func main() {
 	flag.StringVar(&saKeyPath, "stackit-sa-key-path", os.Getenv("STACKIT_SERVICE_ACCOUNT_KEY_PATH"),
 		"Path to the StackIT service-account key JSON. Can also be set via STACKIT_SERVICE_ACCOUNT_KEY_PATH. "+
 			"When empty the operator runs in skeleton mode and does not provision.")
+	flag.DurationVar(&saKeyReloadInterval, "stackit-sa-key-reload-interval",
+		envDurationOrDefault("STACKIT_SERVICE_ACCOUNT_KEY_RELOAD_INTERVAL", 30*time.Second),
+		"How often the mounted service-account key file is re-read so a rotated key takes effect "+
+			"without restarting the operator. This is the only input the operator picks up at "+
+			"runtime; everything else takes effect at process start. A candidate key is put to work "+
+			"only after it parses, names the same StackIT project, and mints a token in one live "+
+			"call — a candidate that fails any of those is discarded and the running key is kept, "+
+			"which is what stops a truncated write or a revoked key from taking down a healthy "+
+			"operator. Can also be set via STACKIT_SERVICE_ACCOUNT_KEY_RELOAD_INTERVAL. Set to 0 to "+
+			"disable the reload, which restores the restart-only behaviour exactly.")
 	flag.StringVar(&region, "stackit-region", envOrDefault("STACKIT_REGION", stackit.RegionEU01),
 		"StackIT region the operator provisions in. Can also be set via STACKIT_REGION.")
 	flag.StringVar(&adminSecretName, "admin-credentials-secret-name",
@@ -186,9 +198,17 @@ func main() {
 		"Currency the cost estimate is labelled with. Display only; no conversion happens. "+
 			"Can also be set via BUCKET_USAGE_CURRENCY.")
 
+	// Development mode picks the console encoder and a debug default level. The
+	// Helm chart overrides the level through LOGLEVEL (logging.level, info by
+	// default); the encoder stays console either way.
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	if err := applyLogLevelEnv(flag.CommandLine); err != nil {
+		// The logger is not built yet, so this goes where a flag parse error goes.
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -231,6 +251,7 @@ func main() {
 		"providerDegradedGrace", providerDegradedGrace,
 		"providerCircuitThreshold", providerCircuitThreshold,
 		"providerCircuitMaxCooldown", providerCircuitMaxCooldown,
+		"saKeyReloadInterval", saKeyReloadInterval,
 		"bucketUsageEnabled", usageEnabled,
 		"bucketUsageDefaultEnabled", usageDefaultEnabled,
 		"bucketUsageInterval", usageInterval,
@@ -256,29 +277,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build the StackIT client when a service-account key is configured. Without
-	// it, the operator runs in skeleton mode (no cloud calls).
-	var stackitClient *stackit.Client
-	if saKeyPath != "" {
-		acc, err := stackit.LoadAccount(saKeyPath)
-		if err != nil {
-			setupLog.Error(err, "unable to load StackIT service-account key", "path", saKeyPath)
-			os.Exit(1)
-		}
-		stackitClient, err = stackit.NewClient(acc, region)
-		if err != nil {
-			setupLog.Error(err, "unable to build StackIT client")
-			os.Exit(1)
-		}
-		// Provisioning persists the bootstrap S3 admin credentials in a Secret in
-		// the operator's own namespace, so that namespace must be known.
-		if operatorNamespace == "" {
-			setupLog.Error(nil, "operator namespace unknown; set POD_NAMESPACE (or --operator-namespace) when a StackIT key is configured")
-			os.Exit(1)
-		}
-		setupLog.Info("StackIT client configured", "project", acc.ProjectID, "region", region)
-	} else {
-		setupLog.Info("no StackIT service-account key configured; running in skeleton mode")
+	stackitClient, err := newStackitClient(saKeyPath, region, operatorNamespace)
+	if err != nil {
+		setupLog.Error(err, "unable to configure the StackIT client", "path", saKeyPath)
+		os.Exit(1)
 	}
 
 	// Clone Job pod resources are passed as a JSON-encoded
@@ -293,6 +295,17 @@ func main() {
 	}
 
 	providerBreaker := controller.NewProviderBreaker(providerCircuitThreshold, providerCircuitMaxCooldown)
+
+	// The service-account key is the one input this operator re-reads at
+	// runtime (ADR 0016 D1), because it is the one an external rotation
+	// mechanism changes without anybody touching the deployment. Skeleton mode
+	// and an interval of 0 both leave the poller off, and then none of the
+	// sa_key series is exported at all — a mechanism that is not running must
+	// not report a reassuring zero.
+	if err := setupSAKeyReload(mgr, stackitClient, providerBreaker, saKeyPath, saKeyReloadInterval); err != nil {
+		setupLog.Error(err, "unable to set up service-account key reloading")
+		os.Exit(1)
+	}
 
 	if err = (&controller.BucketReconciler{
 		Client:                mgr.GetClient(),
@@ -343,6 +356,50 @@ func main() {
 	}
 }
 
+// newStackitClient builds the provider client when a service-account key is
+// configured. It returns a nil client and no error when none is: without a key
+// the operator runs in skeleton mode and makes no cloud call at all
+// (ADR 0005 D6). A key that is configured but unusable is a startup failure and
+// never a silent fall back to skeleton mode (ADR 0005 D7).
+func newStackitClient(saKeyPath, region, operatorNamespace string) (*stackit.Client, error) {
+	if saKeyPath == "" {
+		setupLog.Info("no StackIT service-account key configured; running in skeleton mode")
+		return nil, nil
+	}
+	// Provisioning persists the bootstrap S3 admin credentials in a Secret in
+	// the operator's own namespace, so that namespace must be known.
+	if operatorNamespace == "" {
+		return nil, errors.New("operator namespace unknown; set POD_NAMESPACE (or --operator-namespace) when a StackIT key is configured")
+	}
+	acc, err := stackit.LoadAccount(saKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load StackIT service-account key: %w", err)
+	}
+	client, err := stackit.NewClient(acc, region)
+	if err != nil {
+		return nil, fmt.Errorf("build StackIT client: %w", err)
+	}
+	setupLog.Info("StackIT client configured", "project", acc.ProjectID, "region", region)
+	return client, nil
+}
+
+// setupSAKeyReload registers the key poller with the manager, unless the
+// operator has no key at all or the reload is switched off.
+//
+// The poller reports NeedLeaderElection() false, so it runs on every replica: a
+// standby has to be holding a fresh client at the moment it takes the lease,
+// not start reloading then (ADR 0016 D13).
+func setupSAKeyReload(mgr ctrl.Manager, client *stackit.Client, breaker *controller.ProviderBreaker,
+	keyPath string, interval time.Duration) error {
+	if client == nil || interval <= 0 {
+		return nil
+	}
+	observer := controller.NewSAKeyReloadObserver(
+		ctrl.Log.WithName("sa-key-reload"), breaker, client.Account())
+	controller.RegisterSAKeyReloadMetrics(observer)
+	return mgr.Add(stackit.NewKeyReloader(client, keyPath, interval, observer.Observe))
+}
+
 // parseUsagePrice parses the configured price of one gigabyte for one hour. An
 // empty value means "no price configured" and disables the cost estimate; a
 // negative one is rejected rather than quietly producing negative costs.
@@ -361,6 +418,31 @@ func parseUsagePrice(raw string) (float64, error) {
 }
 
 // envOrDefault returns the value of the environment variable key, or def when unset.
+// applyLogLevelEnv makes LOGLEVEL the fallback for --zap-log-level. The flag is
+// bound by controller-runtime, so unlike the operator's own flags it cannot read
+// the variable as its default; the value is fed through the flag's own parser
+// instead, so both surfaces accept exactly the same levels. An explicit flag
+// wins, and the variable is then not even parsed.
+func applyLogLevelEnv(fs *flag.FlagSet) error {
+	v := os.Getenv("LOGLEVEL")
+	if v == "" {
+		return nil
+	}
+	explicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "zap-log-level" {
+			explicit = true
+		}
+	})
+	if explicit {
+		return nil
+	}
+	if err := fs.Set("zap-log-level", v); err != nil {
+		return fmt.Errorf("invalid value %q for LOGLEVEL: %w", v, err)
+	}
+	return nil
+}
+
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

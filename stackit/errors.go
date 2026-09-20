@@ -90,6 +90,20 @@ func ProviderRefused(err error) bool {
 	}
 }
 
+// isStructuredNotFound reports whether err is the API's own definitive "this
+// does not exist" — a structured JSON 404.
+//
+// It is the one shape that may be read as absence. A 404 carrying an HTML
+// gateway page, a 404 with an empty body, a 5xx and a transport error all leave
+// existence unknown, and unknown is never absence: every caller of this either
+// turns a failed read into a write (EnsureService) or into a statement about a
+// resource the operator provisioned (BucketExists), and both are damaging when
+// the provider never actually answered.
+func isStructuredNotFound(err error) bool {
+	status, ok := apiAnswer(err)
+	return ok && status == http.StatusNotFound
+}
+
 // isServiceNotEnabled reports whether err is the API's definitive answer that
 // Object Storage is not enabled for the project: a structured JSON 404.
 //
@@ -99,6 +113,5 @@ func ProviderRefused(err error) bool {
 // every Bucket, which is exactly how a two-minute provider blip on 2026-08-25
 // produced 342 reconcile errors.
 func isServiceNotEnabled(err error) bool {
-	status, ok := apiAnswer(err)
-	return ok && status == http.StatusNotFound
+	return isStructuredNotFound(err)
 }

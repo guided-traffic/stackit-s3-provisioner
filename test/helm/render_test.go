@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,6 +36,17 @@ type rule struct {
 	Verbs     []string `json:"verbs"`
 }
 
+type envVar struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type container struct {
+	Name string   `json:"name"`
+	Args []string `json:"args"`
+	Env  []envVar `json:"env"`
+}
+
 type object struct {
 	Kind     string `json:"kind"`
 	Metadata struct {
@@ -42,6 +54,15 @@ type object struct {
 		Labels map[string]string `json:"labels"`
 	} `json:"metadata"`
 	Rules []rule `json:"rules"`
+	// Spec reaches the Deployment's container args. Every other kind leaves it
+	// zero, which is what an absent field decodes to.
+	Spec struct {
+		Template struct {
+			Spec struct {
+				Containers []container `json:"containers"`
+			} `json:"spec"`
+		} `json:"template"`
+	} `json:"spec"`
 }
 
 // render runs `helm template` with the given --set arguments and indexes the
@@ -87,6 +108,42 @@ func verbsFor(o object, resource string) []string {
 		verbs = append(verbs, r.Verbs...)
 	}
 	return verbs
+}
+
+// manager returns the operator container of the rendered Deployment.
+func manager(t *testing.T, objs map[string]object) container {
+	t.Helper()
+	dep, ok := objs["Deployment/"+fullname]
+	require.True(t, ok, "Deployment must be rendered")
+	require.Len(t, dep.Spec.Template.Spec.Containers, 1, "expected exactly one container")
+	return dep.Spec.Template.Spec.Containers[0]
+}
+
+// managerArgs returns the args of the operator container in the rendered
+// Deployment.
+func managerArgs(t *testing.T, objs map[string]object) []string {
+	t.Helper()
+	return manager(t, objs).Args
+}
+
+// envValue returns the literal value of the named variable, or "" if absent.
+func envValue(env []envVar, name string) string {
+	for _, e := range env {
+		if e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
+}
+
+// hasArgPrefix reports whether any arg starts with prefix.
+func hasArgPrefix(args []string, prefix string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(list []string, want string) bool {
@@ -148,4 +205,47 @@ func requireOperatorRole(t *testing.T, objs map[string]object) {
 		verbsFor(op, "buckets"))
 	assert.ElementsMatch(t, []string{"get", "patch", "update"}, verbsFor(op, "buckets/status"))
 	assert.ElementsMatch(t, []string{"update"}, verbsFor(op, "buckets/finalizers"))
+}
+
+// TestServiceAccountKeyArgsRenderTogether pins the two args behind the
+// secretName guard. Nothing else renders them: the CI Kind install runs in
+// skeleton mode, so without this the whole branch — including the reload
+// interval that has to reach the operator for a rotation to be picked up —
+// ships untested.
+func TestServiceAccountKeyArgsRenderTogether(t *testing.T) {
+	withKey := managerArgs(t, render(t,
+		"stackit.serviceAccountKey.secretName=my-key",
+		"stackit.serviceAccountKey.reloadInterval=2m",
+	))
+	assert.Contains(t, withKey, "--stackit-sa-key-path=/etc/stackit/sa-key.json")
+	assert.Contains(t, withKey, "--stackit-sa-key-reload-interval=2m")
+
+	byDefault := managerArgs(t, render(t, "stackit.serviceAccountKey.secretName=my-key"))
+	assert.Contains(t, byDefault, "--stackit-sa-key-reload-interval=30s",
+		"the shipped default must reach the operator unchanged")
+
+	// Skeleton mode: no key, therefore nothing to reload and no interval arg.
+	skeleton := managerArgs(t, render(t))
+	assert.False(t, hasArgPrefix(skeleton, "--stackit-sa-key-path="),
+		"skeleton mode must render no key path")
+	assert.False(t, hasArgPrefix(skeleton, "--stackit-sa-key-reload-interval="),
+		"a reload interval without a key is meaningless and must not be rendered")
+}
+
+// TestLogLevelRendersAsEnvOnly pins that logging.level reaches the operator as
+// LOGLEVEL, that the shipped default is info, and that the chart renders NO
+// --zap-log-level flag: a rendered flag beats the variable, which would make
+// `kubectl set env LOGLEVEL=debug` a silent no-op. Without either the binary
+// falls back to its own development default, debug, which is exactly what
+// this key exists to override.
+func TestLogLevelRendersAsEnvOnly(t *testing.T) {
+	byDefault := manager(t, render(t))
+	assert.Equal(t, "info", envValue(byDefault.Env, "LOGLEVEL"),
+		"the shipped default must reach the operator unchanged")
+	assert.False(t, hasArgPrefix(byDefault.Args, "--zap-log-level"),
+		"a rendered flag would override LOGLEVEL")
+
+	overridden := manager(t, render(t, "logging.level=debug"))
+	assert.Equal(t, "debug", envValue(overridden.Env, "LOGLEVEL"))
+	assert.False(t, hasArgPrefix(overridden.Args, "--zap-log-level"))
 }

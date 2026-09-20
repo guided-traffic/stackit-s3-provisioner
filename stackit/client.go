@@ -19,7 +19,7 @@ import (
 	"github.com/stackitcloud/stackit-sdk-go/services/objectstorage"
 )
 
-// RegionEU01 is the only region used in v1 (see INIT-SETUP.md §0).
+// RegionEU01 is the only region used in v1 (ADR 0005 D2).
 const RegionEU01 = "eu01"
 
 // Account is the minimal view of a STACKIT service-account key file we need:
@@ -29,6 +29,23 @@ type Account struct {
 	ProjectID string
 	Issuer    string
 	KeyPath   string
+	// ValidUntil is the key's own expiry, as the provider stamped it into the
+	// file. It is nil when the file carries no validUntil — a real shape, not an
+	// error: the provider omits it for some key types, and the operator then
+	// simply has nothing to report about this key's lifetime (ADR 0016 D10).
+	ValidUntil *time.Time
+}
+
+// keyDoc is the part of a service-account key file this operator parses itself.
+// The SDK parses the rest (and the RSA material); these three fields are the
+// ones no SDK type exposes — projectId is not even part of the SDK's own key
+// struct.
+type keyDoc struct {
+	ProjectID   string     `json:"projectId"`
+	ValidUntil  *time.Time `json:"validUntil"`
+	Credentials struct {
+		Iss string `json:"iss"`
+	} `json:"credentials"`
 }
 
 // LoadAccount reads a STACKIT SA key JSON file and extracts the projectId.
@@ -41,12 +58,17 @@ func LoadAccount(keyPath string) (Account, error) {
 	if err != nil {
 		return Account{}, fmt.Errorf("read key file: %w", err)
 	}
-	var doc struct {
-		ProjectID   string `json:"projectId"`
-		Credentials struct {
-			Iss string `json:"iss"`
-		} `json:"credentials"`
+	return parseAccount(raw, keyPath)
+}
+
+// parseAccount derives an Account from the raw bytes of a key file. It takes
+// bytes rather than a path so that a reload can hash, parse and hand the SDK
+// one single read of a file that may be being rewritten underneath it.
+func parseAccount(raw []byte, keyPath string) (Account, error) {
+	if len(raw) == 0 {
+		return Account{}, fmt.Errorf("key file %s is empty", keyPath)
 	}
+	var doc keyDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return Account{}, fmt.Errorf("parse key file %s: %w", keyPath, err)
 	}
@@ -54,29 +76,66 @@ func LoadAccount(keyPath string) (Account, error) {
 		return Account{}, fmt.Errorf("key file %s has no projectId field", keyPath)
 	}
 	return Account{
-		ProjectID: doc.ProjectID,
-		Issuer:    doc.Credentials.Iss,
-		KeyPath:   keyPath,
+		ProjectID:  doc.ProjectID,
+		Issuer:     doc.Credentials.Iss,
+		KeyPath:    keyPath,
+		ValidUntil: doc.ValidUntil,
 	}, nil
 }
 
-// Client wraps the Object Storage API client bound to one service account.
-type Client struct {
+// clientState is everything about a Client that the service-account key
+// decides: the authenticated API client, the account the key names, the
+// connection pool underneath it, and the hash of the bytes it was all built
+// from. A reload replaces the whole value at once, so no call can ever observe
+// a half-swapped client (ADR 0016 D5).
+type clientState struct {
 	api     *objectstorage.APIClient
 	account Account
-	region  string
+	// transport is the pool underneath api, kept so a retired state can be
+	// drained. The http.Client is not enough: objectstorage.NewAPIClient
+	// replaces its Transport with the key flow's round tripper, and
+	// http.Client.CloseIdleConnections forwards to nothing after that.
+	transport *retryTransport
+	// keyHash is the hex SHA-256 of the key file bytes this state was built
+	// from, or "" for a client that was not built from a key file.
+	keyHash string
+}
+
+// Client wraps the Object Storage API client bound to one service account.
+//
+// Everything the key decides lives behind state, which a reload replaces
+// atomically; everything the install decides — the region, and the endpoint
+// override the offline suite uses — is immutable for the life of the process
+// (ADR 0016 D5). Every method loads state once on entry and passes it down, so
+// a multi-call operation cannot be split across two keys.
+type Client struct {
+	state  atomic.Pointer[clientState]
+	region string
+	// endpoint overrides the region-derived API host for every client built
+	// here, including the candidate of a reload. Only NewClientWithEndpoint
+	// sets it, which is what lets the offline suite drive validate-and-swap
+	// against the in-memory fake; in production it is always empty.
+	endpoint string
 
 	// serviceReady caches a verified "Object Storage is enabled" answer for the
 	// lifetime of the process. Without it EnsureService queries the API once per
 	// Bucket per reconcile, which is both pure overhead and a needless exposure
 	// to provider blips: the project cannot be un-enabled underneath a running
 	// operator without every other call failing too, and a restart re-verifies.
+	//
+	// A key reload deliberately does NOT clear it: the answer is project-scoped
+	// and a reload may not change the project (ADR 0016 D11).
 	serviceReady atomic.Bool
 }
 
-// NewClient builds an Object Storage client authenticated with the account's SA
-// key file. Auth uses the key flow; the RSA private key is embedded in the file,
-// so no separate key path is required.
+// newKeyFlowAPIClient builds an Object Storage client authenticated with the
+// key flow, from key material already in memory.
+//
+// The content is passed with config.WithServiceAccountKey and the path is
+// deliberately NOT passed alongside it: the SDK short-circuits on a non-empty
+// in-memory key, but would fall back to re-reading the path if the content were
+// ever empty — a second read of a file that may be mid-rewrite, which is the
+// whole thing reading once was meant to avoid.
 //
 // The supplied http.Client installs retryTransport underneath authentication:
 // auth.SetupAuth adopts HTTPClient.Transport as the key flow's inner transport
@@ -89,16 +148,46 @@ type Client struct {
 // reconcile — which the requeue and the degraded-Ready hold already cover, and
 // which is preferable to carving a per-endpoint exception into the rule that no
 // write is ever repeated.
-func NewClient(acc Account, region string) (*Client, error) {
-	api, err := objectstorage.NewAPIClient(
-		config.WithServiceAccountKeyPath(acc.KeyPath),
-		config.WithRegion(region),
-		config.WithHTTPClient(retryingHTTPClient()),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("init object storage client for %s: %w", acc.Issuer, err)
+func (c *Client) newKeyFlowAPIClient(content []byte) (*objectstorage.APIClient, *retryTransport, error) {
+	httpClient, transport := retryingHTTPClient()
+	opts := []config.ConfigurationOption{
+		config.WithServiceAccountKey(string(content)),
+		config.WithRegion(c.region),
+		config.WithHTTPClient(httpClient),
 	}
-	return &Client{api: api, account: acc, region: region}, nil
+	if c.endpoint != "" {
+		opts = append(opts, config.WithEndpoint(c.endpoint))
+	}
+	api, err := objectstorage.NewAPIClient(opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return api, transport, nil
+}
+
+// NewClient builds an Object Storage client authenticated with the account's SA
+// key file.
+//
+// The account is re-derived from the very bytes the SDK client is built from,
+// rather than trusted from acc, so the parsed account, the content hash and the
+// live credential can never disagree — the same invariant a reload relies on.
+// acc supplies the path and nothing else.
+func NewClient(acc Account, region string) (*Client, error) {
+	c := &Client{region: region}
+	raw, hash, err := readKeyFile(acc.KeyPath)
+	if err != nil {
+		return nil, err
+	}
+	loaded, err := parseAccount(raw, acc.KeyPath)
+	if err != nil {
+		return nil, err
+	}
+	api, transport, err := c.newKeyFlowAPIClient(raw)
+	if err != nil {
+		return nil, fmt.Errorf("init object storage client for %s: %w", loaded.Issuer, err)
+	}
+	c.state.Store(&clientState{api: api, account: loaded, transport: transport, keyHash: hash})
+	return c, nil
 }
 
 // NewClientWithEndpoint builds a client against a custom API base endpoint with
@@ -110,6 +199,9 @@ func NewClient(acc Account, region string) (*Client, error) {
 // stackitfake.FailNext, which arms a single failure; retrying would consume the
 // injection and let the call succeed, quietly turning error-path tests into
 // happy-path tests. retryTransport is covered directly in retry_test.go instead.
+//
+// The endpoint is remembered on the Client, so a candidate built by a reload
+// reaches the same fake. That is the only reason the field exists.
 func NewClientWithEndpoint(projectID, region, endpoint string) (*Client, error) {
 	api, err := objectstorage.NewAPIClient(
 		config.WithEndpoint(endpoint),
@@ -119,11 +211,17 @@ func NewClientWithEndpoint(projectID, region, endpoint string) (*Client, error) 
 	if err != nil {
 		return nil, fmt.Errorf("init object storage client for endpoint %s: %w", endpoint, err)
 	}
-	return &Client{api: api, account: Account{ProjectID: projectID}, region: region}, nil
+	c := &Client{region: region, endpoint: endpoint}
+	c.state.Store(&clientState{api: api, account: Account{ProjectID: projectID}})
+	return c, nil
 }
 
-// ProjectID returns the project this client is bound to.
-func (c *Client) ProjectID() string { return c.account.ProjectID }
+// ProjectID returns the project this client is bound to. A reload may not
+// change it (ADR 0016 D4), so it is stable for the life of the process.
+func (c *Client) ProjectID() string { return c.state.Load().account.ProjectID }
+
+// Account returns the service account the client is currently authenticated as.
+func (c *Client) Account() Account { return c.state.Load().account }
 
 // Region returns the region this client operates in.
 func (c *Client) Region() string { return c.region }
@@ -141,28 +239,29 @@ func (c *Client) EnsureService(ctx context.Context) error {
 	if c.serviceReady.Load() {
 		return nil
 	}
-	_, err := c.api.GetServiceStatus(ctx, c.account.ProjectID, c.region).Execute()
+	st := c.state.Load()
+	_, err := st.api.GetServiceStatus(ctx, st.account.ProjectID, c.region).Execute()
 	switch {
 	case err == nil:
 		c.serviceReady.Store(true)
 		return nil
 	case !isServiceNotEnabled(err):
-		return fmt.Errorf("check object storage status in project %s: %w", c.account.ProjectID, err)
+		return fmt.Errorf("check object storage status in project %s: %w", st.account.ProjectID, err)
 	}
-	if _, err := c.api.EnableService(ctx, c.account.ProjectID, c.region).Execute(); err != nil {
-		return fmt.Errorf("enable object storage in project %s: %w", c.account.ProjectID, err)
+	if _, err := st.api.EnableService(ctx, st.account.ProjectID, c.region).Execute(); err != nil {
+		return fmt.Errorf("enable object storage in project %s: %w", st.account.ProjectID, err)
 	}
 	// Wait until the service reports ready. Any error is treated as "not ready
 	// yet" here, unlike above: the service was just enabled, so errors during
 	// propagation are expected and the deadline bounds the wait.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if _, err := c.api.GetServiceStatus(ctx, c.account.ProjectID, c.region).Execute(); err == nil {
+		if _, err := st.api.GetServiceStatus(ctx, st.account.ProjectID, c.region).Execute(); err == nil {
 			c.serviceReady.Store(true)
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("object storage in project %s not ready within timeout", c.account.ProjectID)
+			return fmt.Errorf("object storage in project %s not ready within timeout", st.account.ProjectID)
 		}
 		if !sleepCtx(ctx, 2*time.Second) {
 			return ctx.Err()
@@ -170,19 +269,33 @@ func (c *Client) EnsureService(ctx context.Context) error {
 	}
 }
 
+// probe makes one cheap authenticated read with the given state. It is what
+// proves a candidate key can actually mint a token, which nothing short of a
+// real call can (ADR 0016 D3).
+//
+// It deliberately does not go through EnsureService: that short-circuits on the
+// cached serviceReady flag and would return success without making any call at
+// all — a probe that proves nothing.
+func (c *Client) probe(ctx context.Context, st *clientState) error {
+	_, err := st.api.GetServiceStatus(ctx, st.account.ProjectID, c.region).Execute()
+	return err
+}
+
 // CreateBucket creates a bucket in the client's own project.
 func (c *Client) CreateBucket(ctx context.Context, name string) error {
-	if _, err := c.api.CreateBucket(ctx, c.account.ProjectID, c.region, name).Execute(); err != nil {
-		return fmt.Errorf("create bucket %q in project %s: %w", name, c.account.ProjectID, err)
+	st := c.state.Load()
+	if _, err := st.api.CreateBucket(ctx, st.account.ProjectID, c.region, name).Execute(); err != nil {
+		return fmt.Errorf("create bucket %q in project %s: %w", name, st.account.ProjectID, err)
 	}
 	return nil
 }
 
 // DeleteBucket deletes a bucket from the client's own project. The bucket must
-// be empty (STACKIT lösch-semantics, INIT-SETUP.md §0).
+// be empty (STACKIT delete semantics, ADR 0006 D2).
 func (c *Client) DeleteBucket(ctx context.Context, name string) error {
-	if _, err := c.api.DeleteBucket(ctx, c.account.ProjectID, c.region, name).Execute(); err != nil {
-		return fmt.Errorf("delete bucket %q in project %s: %w", name, c.account.ProjectID, err)
+	st := c.state.Load()
+	if _, err := st.api.DeleteBucket(ctx, st.account.ProjectID, c.region, name).Execute(); err != nil {
+		return fmt.Errorf("delete bucket %q in project %s: %w", name, st.account.ProjectID, err)
 	}
 	return nil
 }
@@ -191,7 +304,11 @@ func (c *Client) DeleteBucket(ctx context.Context, name string) error {
 // purpose: passing a foreign project's ID is exactly how cross-project isolation
 // is probed — a correctly isolated SA token yields an HTTP error, not data.
 func (c *Client) ListBucketNames(ctx context.Context, projectID string) ([]string, error) {
-	resp, err := c.api.ListBuckets(ctx, projectID, c.region).Execute()
+	return c.listBucketNames(ctx, c.state.Load(), projectID)
+}
+
+func (c *Client) listBucketNames(ctx context.Context, st *clientState, projectID string) ([]string, error) {
+	resp, err := st.api.ListBuckets(ctx, projectID, c.region).Execute()
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +322,11 @@ func (c *Client) ListBucketNames(ctx context.Context, projectID string) ([]strin
 // HasBucket reports whether a bucket with the given name is visible to this
 // client in projectID.
 func (c *Client) HasBucket(ctx context.Context, projectID, name string) (bool, error) {
-	names, err := c.ListBucketNames(ctx, projectID)
+	return c.hasBucket(ctx, c.state.Load(), projectID, name)
+}
+
+func (c *Client) hasBucket(ctx context.Context, st *clientState, projectID, name string) (bool, error) {
+	names, err := c.listBucketNames(ctx, st, projectID)
 	if err != nil {
 		return false, err
 	}
@@ -217,12 +338,41 @@ func (c *Client) HasBucket(ctx context.Context, projectID, name string) (bool, e
 	return false, nil
 }
 
+// BucketExists reports whether the bucket exists in this client's own project,
+// asking the per-bucket control-plane read rather than scanning a project-wide
+// listing.
+//
+// Only the API's own structured JSON 404 counts as "no". Every other failure —
+// a transport error, a 5xx, a gateway or WAF page, a 404 with an empty body — is
+// returned as an error and therefore stays a failure to reach the provider,
+// never a statement about the bucket. The classification lives here rather than
+// at the call site so that conflating the two is structurally impossible: a
+// caller that acts on absence can only ever have been handed the provider's own
+// answer.
+//
+// This is deliberately not HasBucket. A listing scan answers "not in the list I
+// got", which is a weaker statement: ListBuckets takes no pagination parameters
+// in the SDK, and the listing is known to lag a create (see WaitBucketVisible).
+// That is good enough to decide whether to create a bucket; it is not good
+// enough to declare a bucket the operator provisioned to be gone.
+func (c *Client) BucketExists(ctx context.Context, name string) (bool, error) {
+	st := c.state.Load()
+	if _, err := st.api.GetBucket(ctx, st.account.ProjectID, c.region, name).Execute(); err != nil {
+		if isStructuredNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get bucket %q in project %s: %w", name, st.account.ProjectID, err)
+	}
+	return true, nil
+}
+
 // WaitBucketVisible polls until name appears in the client's own project listing
 // or the timeout elapses (bucket creation may be eventually consistent).
 func (c *Client) WaitBucketVisible(ctx context.Context, name string, timeout time.Duration) error {
+	st := c.state.Load()
 	deadline := time.Now().Add(timeout)
 	for {
-		ok, err := c.HasBucket(ctx, c.account.ProjectID, name)
+		ok, err := c.hasBucket(ctx, st, st.account.ProjectID, name)
 		if err != nil {
 			return err
 		}
@@ -230,7 +380,7 @@ func (c *Client) WaitBucketVisible(ctx context.Context, name string, timeout tim
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("bucket %q not visible in project %s within %s", name, c.account.ProjectID, timeout)
+			return fmt.Errorf("bucket %q not visible in project %s within %s", name, st.account.ProjectID, timeout)
 		}
 		if !sleepCtx(ctx, 2*time.Second) {
 			return ctx.Err()
@@ -249,8 +399,12 @@ type AccessKey struct {
 // CreateCredentialsGroup creates a credentials group ("workload account") and
 // returns its id (for management) and urn (used as the bucket-policy principal).
 func (c *Client) CreateCredentialsGroup(ctx context.Context, displayName string) (id, urn string, err error) {
+	return c.createCredentialsGroup(ctx, c.state.Load(), displayName)
+}
+
+func (c *Client) createCredentialsGroup(ctx context.Context, st *clientState, displayName string) (id, urn string, err error) {
 	payload := objectstorage.NewCreateCredentialsGroupPayload(displayName)
-	resp, err := c.api.CreateCredentialsGroup(ctx, c.account.ProjectID, c.region).
+	resp, err := st.api.CreateCredentialsGroup(ctx, st.account.ProjectID, c.region).
 		CreateCredentialsGroupPayload(*payload).Execute()
 	if err != nil {
 		return "", "", fmt.Errorf("create credentials group %q: %w", displayName, err)
@@ -262,16 +416,18 @@ func (c *Client) CreateCredentialsGroup(ctx context.Context, displayName string)
 // DeleteCredentialsGroup removes a credentials group (its access keys must be
 // deleted first).
 func (c *Client) DeleteCredentialsGroup(ctx context.Context, groupID string) error {
-	if _, err := c.api.DeleteCredentialsGroup(ctx, c.account.ProjectID, c.region, groupID).Execute(); err != nil {
+	st := c.state.Load()
+	if _, err := st.api.DeleteCredentialsGroup(ctx, st.account.ProjectID, c.region, groupID).Execute(); err != nil {
 		return fmt.Errorf("delete credentials group %s: %w", groupID, err)
 	}
 	return nil
 }
 
 // CreateAccessKey creates an S3 access key inside the given credentials group.
-// No expiry is set (INIT-SETUP.md §0).
+// No expiry is set (ADR 0007 D3).
 func (c *Client) CreateAccessKey(ctx context.Context, groupID string) (AccessKey, error) {
-	resp, err := c.api.CreateAccessKey(ctx, c.account.ProjectID, c.region).
+	st := c.state.Load()
+	resp, err := st.api.CreateAccessKey(ctx, st.account.ProjectID, c.region).
 		CredentialsGroup(groupID).
 		CreateAccessKeyPayload(*objectstorage.NewCreateAccessKeyPayload()).
 		Execute()
@@ -288,7 +444,11 @@ func (c *Client) CreateAccessKey(ctx context.Context, groupID string) (AccessKey
 // DeleteAccessKey removes an access key. The owning group id is required by the
 // API to locate the key.
 func (c *Client) DeleteAccessKey(ctx context.Context, groupID, keyID string) error {
-	if _, err := c.api.DeleteAccessKey(ctx, c.account.ProjectID, c.region, keyID).
+	return c.deleteAccessKey(ctx, c.state.Load(), groupID, keyID)
+}
+
+func (c *Client) deleteAccessKey(ctx context.Context, st *clientState, groupID, keyID string) error {
+	if _, err := st.api.DeleteAccessKey(ctx, st.account.ProjectID, c.region, keyID).
 		CredentialsGroup(groupID).Execute(); err != nil {
 		return fmt.Errorf("delete access key %s (group %s): %w", keyID, groupID, err)
 	}
@@ -307,7 +467,11 @@ type CredentialsGroupInfo struct {
 // Bucket CR lets a reconcile find a group it (or a crashed predecessor) already
 // created, instead of creating a duplicate.
 func (c *Client) FindCredentialsGroupByName(ctx context.Context, displayName string) (id, urn string, found bool, err error) {
-	groups, err := c.ListCredentialsGroups(ctx)
+	return c.findCredentialsGroupByName(ctx, c.state.Load(), displayName)
+}
+
+func (c *Client) findCredentialsGroupByName(ctx context.Context, st *clientState, displayName string) (id, urn string, found bool, err error) {
+	groups, err := c.listCredentialsGroups(ctx, st)
 	if err != nil {
 		return "", "", false, err
 	}
@@ -323,14 +487,17 @@ func (c *Client) FindCredentialsGroupByName(ctx context.Context, displayName str
 // name, creating it if absent. It is idempotent across reconciles and crashes as
 // long as displayName is deterministic for the desired resource.
 func (c *Client) EnsureCredentialsGroup(ctx context.Context, displayName string) (id, urn string, err error) {
-	id, urn, found, err := c.FindCredentialsGroupByName(ctx, displayName)
+	// One state for the whole operation: a look-up that missed under the old
+	// key must not be answered by a create under a new one.
+	st := c.state.Load()
+	id, urn, found, err := c.findCredentialsGroupByName(ctx, st, displayName)
 	if err != nil {
 		return "", "", err
 	}
 	if found {
 		return id, urn, nil
 	}
-	return c.CreateCredentialsGroup(ctx, displayName)
+	return c.createCredentialsGroup(ctx, st, displayName)
 }
 
 // DeleteAllAccessKeys removes every access key in a credentials group. It is
@@ -339,7 +506,10 @@ func (c *Client) EnsureCredentialsGroup(ctx context.Context, displayName string)
 // create time, so a key whose secret was lost is worthless and must be replaced.
 // A missing group is treated as already drained.
 func (c *Client) DeleteAllAccessKeys(ctx context.Context, groupID string) error {
-	ids, err := c.ListAccessKeyIDs(ctx, groupID)
+	// One state for the whole drain: listing under one key and deleting under
+	// another would leave keys the list never saw.
+	st := c.state.Load()
+	ids, err := c.listAccessKeyIDs(ctx, st, groupID)
 	if err != nil {
 		if StatusCode(err) == 404 {
 			return nil
@@ -347,7 +517,7 @@ func (c *Client) DeleteAllAccessKeys(ctx context.Context, groupID string) error 
 		return err
 	}
 	for _, id := range ids {
-		if err := c.DeleteAccessKey(ctx, groupID, id); err != nil {
+		if err := c.deleteAccessKey(ctx, st, groupID, id); err != nil {
 			if StatusCode(err) == 404 {
 				continue
 			}
@@ -359,7 +529,11 @@ func (c *Client) DeleteAllAccessKeys(ctx context.Context, groupID string) error 
 
 // ListCredentialsGroups lists the credentials groups in the client's project.
 func (c *Client) ListCredentialsGroups(ctx context.Context) ([]CredentialsGroupInfo, error) {
-	resp, err := c.api.ListCredentialsGroups(ctx, c.account.ProjectID, c.region).Execute()
+	return c.listCredentialsGroups(ctx, c.state.Load())
+}
+
+func (c *Client) listCredentialsGroups(ctx context.Context, st *clientState) ([]CredentialsGroupInfo, error) {
+	resp, err := st.api.ListCredentialsGroups(ctx, st.account.ProjectID, c.region).Execute()
 	if err != nil {
 		return nil, fmt.Errorf("list credentials groups: %w", err)
 	}
@@ -373,7 +547,11 @@ func (c *Client) ListCredentialsGroups(ctx context.Context) ([]CredentialsGroupI
 
 // ListAccessKeyIDs lists the key ids of a credentials group.
 func (c *Client) ListAccessKeyIDs(ctx context.Context, groupID string) ([]string, error) {
-	resp, err := c.api.ListAccessKeys(ctx, c.account.ProjectID, c.region).
+	return c.listAccessKeyIDs(ctx, c.state.Load(), groupID)
+}
+
+func (c *Client) listAccessKeyIDs(ctx context.Context, st *clientState, groupID string) ([]string, error) {
+	resp, err := st.api.ListAccessKeys(ctx, st.account.ProjectID, c.region).
 		CredentialsGroup(groupID).Execute()
 	if err != nil {
 		return nil, fmt.Errorf("list access keys (group %s): %w", groupID, err)
@@ -392,7 +570,8 @@ func (c *Client) ListAccessKeyIDs(ctx context.Context, groupID string) ([]string
 // credentials Secret. Both are derived from the bucket's path-style URL rather
 // than hardcoded.
 func (c *Client) BucketConnInfo(ctx context.Context, name string) (host, pathStyleURL string, err error) {
-	resp, err := c.api.GetBucket(ctx, c.account.ProjectID, c.region, name).Execute()
+	st := c.state.Load()
+	resp, err := st.api.GetBucket(ctx, st.account.ProjectID, c.region, name).Execute()
 	if err != nil {
 		return "", "", fmt.Errorf("get bucket %q: %w", name, err)
 	}

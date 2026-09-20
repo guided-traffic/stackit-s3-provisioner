@@ -1,2 +1,0 @@
-kubernetes-objekte-storage-operator
-

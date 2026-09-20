@@ -1,374 +1,101 @@
-# CLAUDE.md — StackIT S3 Operator
+# CLAUDE.md — agent instructions
 
-Kubernetes-Operator (Go), der über die **StackIT Object Storage API** Buckets,
-Workload-Zugangsdaten und Bucket-Policies provisioniert. Ein Operator-Deployment
-pro Cluster, jeweils gebunden an **ein StackIT-Projekt** via Service-Account-Key.
+**This file is a router, not a home.** It says where a statement goes and what each home's
+contract is; it never becomes a sixth home. There is no configuration table here, no threat
+model, no subsystem description and no work list. If a paragraph here is the *only* place
+something is written down, it is in the wrong file — move it to the home below and leave a link.
 
-**Phase:** Machbarkeit verifiziert (echte API-Tests grün). **Operator-Skelett + CI stehen**
-(kubebuilder-Layout, `Bucket`-CRD, controller-runtime Manager, Helm-Chart, GitHub-Pages-Release,
-Renovate, semantic-release — alle Checks grün). **Reconciler produktiv implementiert** (§8-Flow:
-Admin-Bootstrap → Bucket → Credentials-Group → AccessKey+Secret → Deny-Policy; Finalizer-Teardown
-nur wenn Bucket leer). Idempotent via Bucket-Tags (Ownership + Group-Zuordnung, ADR 0001/0002; kein Leak über Crashes), Secret ist
-Source-of-Truth fürs Live-Credential, Policy self-heilend bei Drift. **Ohne SA-Key = Skeleton-Mode**
-(`Ready=NotImplemented`, kein Cloud-Call — envtest deckt das ab). Detaillierte Findings:
-**`INIT-SETUP.md`** (Quelle der Wahrheit). Go-Modul: `github.com/guided-traffic/stackit-s3-provisioner`.
+`stackit-s3-provisioner` is a Kubernetes operator written in Go, module
+`github.com/guided-traffic/stackit-s3-provisioner` (`go.mod` is the authority for that path). What
+it does and how to run it is [README.md](README.md); why it is built that way is
+[docs/adr/README.md](docs/adr/README.md); the repository layout, the build, the test suites and the
+release process are [docs/developer/](docs/developer/README.md).
 
-## Architecture Decision Records — das Grundgesetz dieses Repos
+## Documentation has five homes, and a statement goes to exactly one
 
-[`docs/adr/`](docs/adr/README.md) ist das Grundgesetz, mit dem in diesem Repo gebaut wird. Jede
-dauerhafte Architekturentscheidung steht dort als ADR; Format und Index in
-[`docs/adr/README.md`](docs/adr/README.md). Die ADRs sind bindend, nicht historisch: Code,
-Helm-Chart und Doku sind Ausdruck der ADRs, nicht umgekehrt. CLAUDE.md beschreibt die ADRs
-**nicht einzeln** — was gilt, steht im Index und in den ADRs selbst.
+| Kind of statement | Home |
+|---|---|
+| A decision — what the product does, why, what was rejected, what it costs | an [ADR](docs/adr/README.md), carrying no references into the code |
+| How a subsystem works, an invariant, a hard-won detail | [docs/developer/](docs/developer/README.md) |
+| What somebody running or integrating the operator needs — prerequisites, install, configuration, reading a `Bucket`, deletion, outages, monitoring | [docs/operations/](docs/operations/README.md) |
+| The threat model, each mechanism and the gap it leaves | [docs/security/](docs/security/README.md) — one page per perspective, each closing with what it does not cover. Reporting a vulnerability is [SECURITY.md](SECURITY.md) |
+| Work still outstanding | a ticket in [docs/tickets/](docs/tickets/), archived when the work lands |
 
-Verfahren fuer jede Arbeit in diesem Repo:
+When two homes fit, **split the sentence, do not copy it** — the decision to the ADR, its
+operator-visible consequence to `docs/operations/`, which links back. The test: each page still
+reads correctly with the other deleted.
 
-1. **Vor der Umsetzung gegen die ADRs pruefen.** Eine Funktion, ein Fix oder ein Umbau muss mit
-   allen ADRs im Einklang stehen. Steht eine Anforderung im Widerspruch zu einem ADR, wird
-   **nicht implementiert**, sondern der Konflikt benannt (welcher ADR, welche Regel `Dn`, was
-   genau kollidiert) und eine **explizite Freigabe des Nutzers** zum Umschreiben des ADRs
-   eingeholt. Erst mit der Freigabe wird der ADR geaendert — Amendment mit Datum in `Status`,
-   neue Regel in `Decision`, alte Regel markiert statt geloescht — und dann der Code, im selben
-   Change.
-2. **Neue Architekturentscheidungen fuehren zu neuen ADRs, immer mit dem Nutzer abgestimmt.**
-   Eine Entscheidung ist architektonisch, wenn sie kuenftige Aenderungen bindet: Trust-Boundary,
-   Form der API/CRD, Loesch-, Fehler- oder Rotationssemantik, Betriebs- und Privilegienmodell,
-   Migrationspfade. Wer beim Bauen auf so eine Entscheidung stoesst, entscheidet nicht still im
-   Code, sondern stimmt Entscheidung und ADR-Text mit dem Nutzer ab und legt den ADR mit
-   derselben Aenderung an.
-3. **Vor einer Verhaltensaenderung den passenden ADR lesen**; das ist Teil der Aufgabe, nicht
-   optional. Aeltere Entscheidungen (vor 2026-09-03) stehen in `INIT-SETUP.md` §0 und sind nicht
-   als ADR nachgetragen.
+## Decisions are ADRs, and the ADR is written in the same session as the decision
 
-## Repo-Layout
+[`docs/adr/`](docs/adr/README.md) is binding, not historical — the code, the Helm chart and the
+documentation are expressions of the ADRs, not the other way round. **Write the record in the
+session the decision is taken, not when the work finishes**; an ADR written afterwards becomes a
+description of what was built, and the alternatives — the expensive part — are already gone.
+Format, ground rules and the index are in [docs/adr/README.md](docs/adr/README.md); this file never
+describes an individual ADR, and of those ground rules restates only the code-reference contract, as
+the table below. Three obligations hold for every change here:
 
-```
-stackit/client.go                        API-Wrapper (Auth, Bucket-/Group-/AccessKey-Ops, S3-Endpoint, Find/EnsureGroup)
-stackit/errors.go                        Fehler-Klassifikation: ProviderRefused / isServiceNotEnabled via json.Valid(Body)
-stackit/retry.go                         Retry-RoundTripper (nur GET/HEAD) unter der SDK-Auth
-stackit/s3.go                            Data-Plane: S3Admin (minio) Put/Get-Policy + BucketEmpty, BuildIsolationPolicy §4.1
-stackit/client_test.go                   Offline-Unit-Tests (Key-Parsing)
-stackit/s3_test.go                       Offline-Unit-Tests (Policy-Builder + Drift-Vergleich)
-stackit/integration_test.go              //go:build integration — Layer-1 (Cross-Projekt-Isolation)
-stackit/credentials_integration_test.go  //go:build integration — Layer-2 (Workload-Creds + echtes S3)
-stackit/client_fake_test.go              Offline-Tests Control-Plane-Wrapper (gegen stackitfake)
-stackit/s3_fake_test.go                  Offline-Tests Data-Plane inkl. WipeBucket (gegen stackitfake)
-api/v1/bucket_types.go                    CRD `Bucket` (stackit-bucket.gtrfc.com/v1) + Helper, +kubebuilder-Marker
-cmd/main.go                              controller-runtime Manager (stackit.Client + Admin-Secret-Name/-Namespace)
-internal/controller/bucket_controller.go Reconciler (VOLL: §8-Provisioning + Admin-Bootstrap + Finalizer-Teardown)
-internal/controller/breaker.go           Fleetweiter Provider-Circuit-Breaker (§8.4) + Workqueue-RateLimiter-Gegenstueck
-internal/controller/clone.go             Bucket-Clone (spec.cloneFrom): rclone-Job, Staging-Secret, rc-Progress-Polling
-internal/controller/bucket_usage_controller.go Groessen-Messung (spec.usage): eigener Controller, Merge-Patch auf status.usage
-internal/controller/usage_config.go      Mess-Policy (Gate/Default/Intervall-Floor/Cap) + Kostenformel (720h, angefangene GB)
-internal/controller/reconciler_grants_test.go Offline-Tests Read-Grants (spec.grantReadAccess) + Watch-Mapping
-internal/controller/reconciler_degraded_test.go Offline-Tests Sticky-Ready (Halten, Grace-Ablauf, Auth-Ausnahme, Teardown)
-internal/controller/reconciler_circuit_test.go Offline-Tests Circuit-Breaker (Trip, Hold ohne Churn, Grace, Recovery, Teardown)
-internal/controller/breaker_test.go      Unit-Tests Breaker (Threshold, Reset, Probe-Backoff, Disabled)
-internal/controller/reconciler_usage_test.go   Offline-Tests Groessen-Messung (Gate, Clamp, Cap, Versionen, Fehlerpfad)
-internal/controller/reconciler_attribution_test.go Offline-Tests Group-Zuordnung (ADR 0002: Kollision, Migration, Restore, Teardown, Grants)
-internal/controller/attribution_integration_test.go //go:build integration — Legacy-Bucket-Migration gegen die ECHTE API (nichts loeschen/neu anlegen)
-internal/controller/reconciler_*_test.go Offline-Reconciler-Tests (fake k8s-Client + stackitfake, inkl. Fehlerpfade)
-internal/stackitfake/                    In-Memory-Fake der StackIT-API (Control-Plane REST + S3-XML) für Offline-Tests
-config/                                  kustomize: generierte CRD (crd/bases) + RBAC + Manager
-deploy/helm/stackit-s3-provisioner/      Helm-Chart (CRD via `make sync-helm-crd` synchronisiert)
-test/integration/                        //go:build integration — envtest gegen echten API-Server
-test/e2e/e2e_test.go                     //go:build e2e — Kind-Smoke Skeleton-Mode (Operator healthy + CR reconciled)
-test/e2e/cloud_test.go                   //go:build e2e — Kind gegen ECHTE API (E2E_STACKIT=1): Provisioning, Read-Grants, Groessen-Messung, Clone (echtes rclone)
-test/e2e/rbac_test.go                    //go:build e2e — Aggregation der User-Rollen in built-in view/edit (SubjectAccessReview)
-test/helm/render_test.go                 //go:build helm — `helm template`-Assertions auf -view/-edit/Operator-ClusterRole (make test-helm-render)
-hack/e2ecleanup/                         Sweep fuer Cloud-Reste eines abgebrochenen e2e-Laufs (inkl. verwaister Admin-Key)
-Makefile / Containerfile / renovate.json CI-Gerüst (an Valkey-Operator orientiert)
-.github/workflows/                       release.yml (Test+Release), build.yml (Docker+Helm), renovate.yml
-account-1.json / account-2.json          SA-Keys (ECHTE RSA-Private-Keys, .gitignore'd, NIE committen)
-INIT-SETUP.md                            Vollständige Findings, Policy-Templates, offene Fragen
-docs/adr/                                Architecture Decision Records (README.md = Format + Index)
-```
+1. **Check the work against the ADRs before implementing it.** A feature, a fix or a rebuild must
+   be consistent with every record. Where a requirement contradicts one, it is **not implemented**:
+   name the conflict (which ADR, which rule `Dn`, what exactly collides) and get **explicit
+   approval from the user** before the record is amended. Only then is the ADR changed — and the
+   code in the same change.
+2. **A new architectural decision is agreed with the user and its ADR is written in the same
+   change.** A decision is architectural when it binds future changes: a trust boundary, the shape
+   of the API or the CRD, deletion, error or rotation semantics, the operating and privilege
+   model, a migration path. Meeting one of these while building is not a reason to decide quietly
+   in code.
+3. **Read the relevant record before changing behaviour.** That is part of the task, not optional.
 
-## Build & Test
+## A ticket is a work list, and nothing outside `docs/tickets/` may cite one
 
-```bash
-go build ./...
-go vet -tags integration ./...
-go test ./stackit/ -run TestLoadAccount -v                                  # offline (kein Netz)
-go test -tags integration ./stackit/ -run Integration -v -timeout 15m       # echte API (legt Ressourcen an, räumt auf)
-go test -tags integration ./stackit/ -run IntegrationWorkloadCredentials -v  # nur Layer 2
+A ticket lives in [docs/tickets/](docs/tickets/), holds what has to be done, what was verified and
+how, and what was deliberately left out — nothing else, and only while work is outstanding.
 
-# Operator/CI (make):
-make help                       # alle Targets
-make generate-all               # CRD + DeepCopy regenerieren, Helm-Chart-CRD syncen (nach api/v1-Änderung!)
-make lint gosec vuln cyclo      # Linter + Security-Scans (wie CI)
-make test-unit-coverage         # Unit (offline), make test-integration-coverage = envtest
-make e2e-local                  # Kind hochziehen, via Helm installieren, e2e-Smoke (Skeleton, kein Cloud-Call)
-make test-helm-render           # helm template + Assertions auf die User-ClusterRoles (braucht helm)
-make e2e-stackit                # Kind + ECHTER SA-Key: legt reale Buckets/Groups/Keys an, raeumt garantiert ab
-make e2e-stackit-sweep-dry      # zeigt Cloud-Reste eines abgebrochenen Laufs (nur Report)
-make e2e-stackit-sweep          # loescht diese Reste inkl. verwaister operator-admin-Group
-```
+**The extraction is the close, not the move.** Before a ticket goes to
+[docs/tickets/archive/](docs/tickets/archive/): the decision moves into an ADR, the user-facing
+consequence into `docs/operations/`, `README.md` or `docs/security/`, the subsystem knowledge into
+`docs/developer/`; then `git grep` the ticket number and clear what is left. An archived file is
+history and is never the source of a current rule.
 
-Integration-Tests treffen die **echte** StackIT-API (Projekte `ebc9d379…` und `5ad5e488…`,
-Region `eu01`), erzeugen + löschen reale Buckets/Groups/Keys. Skippen automatisch ohne SA-Key-Dateien.
+**Nothing outside `docs/tickets/` may reference a ticket** — not `README.md`, not a security or
+developer page, not this file, not a code comment, not a commit message, not a pull request. Cite
+the ADR instead; ADRs may be cited from anywhere.
 
-## Architektur (Kern)
+## Code references per home
 
-Zwei Ebenen:
-- **Control Plane** (`stackit-sdk-go/services/objectstorage`, Bearer-Token): Bucket / CredentialsGroup /
-  AccessKey anlegen+löschen, Service aktivieren. Ruft der **Operator**.
-- **Data Plane** (S3 / `minio-go`, Access-Key+Secret): Objekte put/get, **Bucket-Policy setzen**
-  (`PutBucketPolicy` — nicht im SDK!). Ruft Operator (admin-Key) **und** Workloads.
+| Home | May it name files, functions, line numbers? | Why |
+|---|---|---|
+| [docs/adr/](docs/adr/README.md) | **No — never** | A decision must stay true when the tree moves, and be actionable without the repository. The product's own vocabulary — CRD field paths, annotation and bucket-tag keys, Helm values keys, flags, metric names, event reasons — is not a code reference and is named exactly |
+| [docs/developer/](docs/developer/README.md) | **Yes, and should** | That is the point of the page; it goes stale on purpose and is updated in the same change |
+| [docs/operations/](docs/operations/README.md) | Yes, where it makes an instruction executable | Same staleness contract |
+| [docs/security/](docs/security/README.md) | Yes, where it makes a claim checkable | Same staleness contract |
+| [docs/tickets/](docs/tickets/) | Yes | A work list points at the work |
+| [README.md](README.md) | Links to documents and example manifests, **not into the source tree** | The front page is read by people who have not cloned the repository |
 
-**Isolations-Layer:**
-- **Layer 1 (Cross-Projekt):** strukturell garantiert — SA-Token hat nur Rollen im eigenen Projekt.
-  Fremdprojekt-Zugriff → **403**. Nicht vom Operator-Code abhängig. ✅ verifiziert.
-- **Layer 2 (Workload↔Workload im Projekt):** nur via Bucket-Policy. StackIT-Default ist **offen**,
-  daher **explizite Deny-Policy** nötig (Template in `INIT-SETUP.md` §4.1). ✅ verifiziert.
+## Read the page for a subsystem before you change it, and update it in the same change
 
-## Sicherheits-Invarianten (nicht verletzen)
+[docs/developer/](docs/developer/README.md) points at files and functions deliberately, so it rots
+when the tree moves. Whoever moves the tree updates the page in the same change; whoever changes a
+subsystem reads its page first. Nothing enforces either — they hold by review, or not at all.
 
-1. **SA-Rollen nur auf Projekt-Ebene** zuweisen — eine kaskadierende Org-Rolle bricht Layer 1.
-2. `account-*.json` **niemals committen** (echte Private-Keys; `.gitignore` schützt).
-3. Bucket-Policy braucht **2 Deny-Statements**: `Deny NotPrincipal [admin, workload]` (Outsider raus)
-   + `Deny Principal workload NotAction [object-ops]` (kein Bucket-Management). Reines `Allow` isoliert NICHT.
-4. **Admin-Group immer in `NotPrincipal`** lassen → sonst Lockout (StorageGRID kann Account-Root aussperren).
-5. `secretAccessKey` nur **1× bei Create** verfügbar → sofort sichern.
-6. **Ein `Bucket` wirkt nur auf seinen eigenen Namespace** — Regeln und Konsequenzen stehen in
-   [ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md).
-7. **Credentials-Group nie per Anzeigename suchen, adoptieren oder loeschen.** Zuordnung nur ueber
-   die Bucket-Tags `credentials-group-id`/`-urn` bzw. die eigene Policy des Buckets; Existenz per
-   Keys-Endpoint geprueft, nie per Listing; kein Neu-Anlegen, solange die im Status notierte Gruppe
-   noch existiert ([ADR 0002](docs/adr/0002-a-credentials-group-is-attributed-through-its-bucket.md) D8).
+## The reference table lives in `README.md` and nowhere else
 
-## SDK-Fallstricke (verifiziert)
+[README.md](README.md) carries the complete public surface — every `Bucket` CRD field and every
+Helm chart value, each marked `# default` or `# example`. A page under `docs/operations/`
+*explains* a setting and links to that table; it never restates the list. **A key added anywhere
+else is a duplicate**, and two lists drift invisibly.
 
-- Auth: `config.WithServiceAccountKeyPath(file)` — RSA-Key im JSON eingebettet, Key-Flow automatisch.
-  Token-Flow ist tot (seit 2025-12-17).
-- Control-Plane-Calls sind region-skopiert: `(ctx, projectId, region, …)`.
-- Fehler-Status: `*oapierror.GenericOpenAPIError` → `.GetStatusCode()` (via `errors.As`).
-- `CreateAccessKey` braucht leeren Payload (`NewCreateAccessKeyPayload()`), sonst Fehler.
-- `DeleteAccessKey` braucht `credentials-group`-Param (Group-ID), sonst **500**. Group erst löschbar,
-  wenn ihre Keys weg sind (sonst 422). Cleanup-Reihenfolge: Buckets → Keys → Groups.
-- AccessKey-Response: `accessKey`=S3-Key-ID, `secretAccessKey`=Secret, `keyId`=interne Lösch-ID.
-- S3-Endpoint eu01: `object.storage.eu01.onstackit.cloud`, **Path-Style**, **SigV4**
-  (Host aus `Bucket.urlPathStyle` ableitbar).
-- `config.WithMaxRetries` ist seit core v0.26.0 ein **No-Op** (`func WithMaxRetries(_ int)`) — SDK retryt nicht.
-  `config.WithHTTPClient` wird von `auth.SetupAuth` als *innerer* Transport uebernommen (auth.go:222),
-  ein RoundTripper dort deckt API-Requests **und** Token-Fetches ab und laeuft unter der Auth.
-- **Entzogener SA-Key = Token-Endpoint 400 `{"error":"invalid_grant"}`**, NICHT 401/403 der API — der
-  Key-Flow erreicht die API gar nicht. Der SDK stempelt Token-Endpoint-Status/Body in denselben
-  `GenericOpenAPIError`. Live verifiziert 2026-08-25.
-- **Fehler-Diskriminator ist `json.Valid(apiErr.Body)`, nicht der Statuscode.** Ein Gateway/WAF erzeugt
-  denselben `*oapierror.GenericOpenAPIError` mit HTML-Body. `oapierror.Model` taugt NICHT: der SDK
-  dekodiert jeden Body in `objectstorage.ErrorMessage` (nur `Detail`), fremdgeformtes JSON landet
-  fehlerfrei in einer leeren Struct. Live verifiziert 2026-08-25 (INIT-SETUP.md §8.2).
-- `GetServiceStatus`: 200 = aktiviert, strukturiertes **404** = nicht aktiviert, strukturiertes **403** =
-  nicht berechtigt. Nur beim 404 darf `EnableService` folgen.
-- `objectstorage`-Top-Level-Paket ist **deprecated ab 2026-09-30** → später aufs versionierte Subpaket migrieren.
+## Writing conventions for this repository
 
-## Credentials-Secret (Vertrag)
-
-Der Operator schreibt **Zugangsdaten + S3-Verbindungsparameter** ins referenzierte
-Secret (`spec.secretRef.name`), damit sich anbindende Workloads ohne Zusatzconfig
-verbinden können. Default-Keys sind **env-var-Style** (direkt via `envFrom` nutzbar):
-
-| Default-Key             | Wert                                    | Quelle                        |
-| ----------------------- | --------------------------------------- | ----------------------------- |
-| `AWS_ACCESS_KEY_ID`     | S3 Access-Key-ID                        | `SecretValues.AccessKeyID`    |
-| `AWS_SECRET_ACCESS_KEY` | S3 Secret                               | `SecretValues.SecretAccessKey`|
-| `S3_BUCKET`             | Bucket-Name                             | `spec.bucketName`             |
-| `S3_REGION`             | Region                                  | `GetRegion()` (Default eu01)  |
-| `S3_ENDPOINT`           | Endpoint-Host (ohne Scheme)             | `SecretValues.Endpoint` (opt.)|
-| `S3_BUCKET_URL`         | voller Path-Style-Bucket-URL            | `SecretValues.BucketURL` (opt.)|
-
-- **Jeder Key-Name** ist pro Bucket via `spec.secretRef.keys.<feld>` überschreibbar
-  (leeres Feld → Default). Logische Felder: `accessKeyID`, `secretAccessKey`,
-  `bucketName`, `region`, `endpoint`, `bucketURL`.
-- Helper in `api/v1/bucket_types.go` (Quelle der Wahrheit, vollständig unit-getestet):
-  - `SecretKeys.<X>Key()` — resolved Key-Name (mit Default).
-  - `Bucket.SecretData(SecretValues)` — baut die `map[string][]byte`-Secret-Data;
-    optionale Felder (`endpoint`, `bucketURL`) nur bei nicht-leerem Wert.
-  - `Bucket.ValidateSecretKeys()` — Fehler bei Key-Kollision (zwei Felder → selber Key,
-    sonst stiller Datenverlust). Reconciler muss das **vor** dem Secret-Write prüfen.
-- Default-Key-Konstanten: `Default*Key` in `api/v1/bucket_types.go`.
-- Secret liegt **immer** im Namespace des Bucket-CR, mit Controller-OwnerRef (GC mit dem CR).
-  `spec.secretRef.namespace` wurde 2026-09-03 entfernt ([ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md) D1/D4) — ein
-  Cross-Namespace-Ziel war ein Secret-Write/Delete-Primitiv (Sicherheits-Befund 2, behoben).
-
-## Konventionen
-
-- Integration-Tests hinter `//go:build integration`; Offline-Suite (`go test ./...`) bleibt netzfrei.
-- Tests räumen erzeugte Cloud-Ressourcen via `t.Cleanup` ab (Control-Plane, unabhängig von Bucket-Policy).
-- Test-Bucket-Namen: `s3op-test-<proj8>-<rand>` (DNS-konform, lowercase).
-- Caveman-Mode im Chat aktiv; **Code/Commits/Docs normal** schreiben.
-
-## Offene Fragen (vor Operator-Bau klären)
-
-- **Q2:** Exakter Name der Minimal-Rolle (Object-Storage-Verwaltung, Projekt-Scope, nicht Owner).
-- **Q4:** Bucket-Namensraum pro Projekt oder pro Region geteilt? (→ Präfix-Schema nötig?)
-- Entschieden: Region `eu01`, Layer 1+2, Delete nur wenn leer, Keys ohne Ablauf (Details `INIT-SETUP.md` §0).
-
-## Reconciler-Design (implementiert)
-
-- **Admin-Bootstrap (`ensureAdmin`):** einmalige `operator-admin`-Credentials-Group + S3-Key,
-  persistiert im operator-eigenen Secret (`--admin-credentials-secret-name`, Default
-  `stackit-s3-provisioner-admin`, in `POD_NAMESPACE`). Deren URN steht in **jeder** Bucket-Policy
-  (`NotPrincipal`, Lockout-Schutz). Fehlt/unvollständig → Find-or-Create-Group + Keys-clear + neuer Key.
-- **Provisioning (`reconcileNormal`):** `ValidateSecretKeys` → Admin-Secret-Guard → Region-Guard →
-  `ensureAdmin` → `EnsureService` → Bucket (idempotent by name, Ownership-Tags) → `BucketConnInfo` →
-  Workload-Group (`resolveWorkloadGroup`, ADR 0002: Bucket-Tag `credentials-group-id` → sonst
-  Migration aus der eigenen Policy → sonst neu + Tag; **nie** per Anzeigename) → Grants → Policy →
-  AccessKey+Secret.
-- **AccessKey/Secret:** Secret ist Source-of-Truth. Hat Secret Creds **und** Group ≥1 Key → skip.
-  Sonst: **erst alle Group-Keys löschen, dann neuen Key + Secret schreiben** (leak-frei, da Clear
-  vor Create); scheitert Secret-Write → neuen Key sofort löschen (Secret unrecoverable).
-- **Key-Rotation (Annotation):** `stackit-bucket.gtrfc.com/rotate-credentials-at: "<RFC3339>"` —
-  Wert ≠ `status.lastRotationTrigger` → harte Rotation (Skip-Pfad übersteuert, alter Key sofort tot,
-  Workloads müssen Secret neu lesen). Handled-Wert + Zeit in Status (level-triggered, GitOps-safe:
-  Operator mutiert Annotation nie), Event `CredentialsRotated`.
-- **Policy (`ensureBucketPolicy`):** `BuildIsolationPolicy` (§4.1), nur bei Drift neu setzen
-  (`PoliciesEquivalent`). Self-healing gegen manuelle Änderungen.
-- **Read-Grants (`spec.grantReadAccess`, INIT-SETUP.md §4.1.1):** Producer-Seite — der
-  Daten-Bucket listet `Bucket`-CRs **seines Namespace**, deren Workload-Group nur-lesend
-  darf. Drittes Policy-Statement + Reader in Stmt-1-`NotPrincipal`; ohne Grant Dokument
-  byte-identisch zu vorher (kein Rewrite beim Upgrade). Reader-URN kommt **nie** aus
-  `status.credentialsGroupURN` (fälschbar via `buckets/status`), sondern ueber den
-  Grantee-Bucket: `EffectiveBucketName()` → Ownership-Tags muessen zum Grantee passen →
-  Tag `credentials-group-id` bzw. Policy (ADR 0002); `BuildIsolationPolicy` filtert
-  Admin- + Workload-URN zusätzlich raus (Lockout- bzw. Owner-Verengungs-Schutz).
-  Unauflösbarer Grant = Skip + Event `ReadGrantPending`, blockiert `Ready` nicht.
-  Anzeigenamen spielen keine Rolle mehr (Duplikate erlaubt, kein Ambiguitaets-Pfad).
-  **Während eines laufenden Clones bleiben Reader aus der Policy** (`holdSecretUntilCloned`
-  schützt nur den eigenen Workload; ein Reader hat schon Credentials) — nach Clone-Erfolg
-  wird die Policy im selben Pass mit Readern neu geschrieben.
-  Grantee publiziert `status.credentialsGroupURN` **sofort** nach Group-Create, nicht erst
-  bei Ready — sonst weckt ein selbst noch klonender Grantee seine Grantoren nie.
-  Zweiter Bucket-Watch (`granteeCredentialsPredicate`, nur Create/Delete/URN-Wechsel/
-  Deletion-Start) weckt Grantoren — sonst Hot-Loop über Status-Writes.
-  Status: `status.grantedReadTo`. Self-Grant per Root-CEL abgelehnt (envtest-verifiziert).
-- **Finalizer-Teardown:** Empty-Check **zuerst** (Admin-S3, Data-Loss-Guard) → dann Keys → Group →
-  Bucket → Secret. Geloescht wird nur die Group, die der Bucket selbst per Tag/Policy zuordnet
-  (`releaseWorkloadGroup`, ADR 0002 D4); Status-ID ist keine Loeschquelle, nicht zuordenbar =
-  stehen lassen + Event `CredentialsGroupNotAttributable`. Shared Admin-Group wird **nie** angefasst. Opt-in-Wipe: `spec.wipeOnDelete`
-  löscht vorher alle Objekte (inkl. Versions/Delete-Markers, `S3Admin.WipeBucket`) — nur wenn
-  Feature-Gate an (`--enable-wipe-on-delete` / Helm `wipeOnDelete.enabled`, Default aus) **und**
-  Ownership-Tags passen; sonst Degradierung auf Empty-Only + Warning-Event `WipeOnDeleteSkipped`.
-- **Provider-Circuit-Breaker (§8.4, implementiert 2026-09-02):** ein Provider-Ausfall ist
-  Eigenschaft des Providers, nicht eines Buckets. Nach `--provider-circuit-threshold` (3)
-  Reconciles, die **ohne dazwischenliegenden Erfolg** scheitern, ruft der Operator die API
-  gar nicht mehr, haelt alle Buckets und probet mit verdoppelndem Cooldown (60s → 5m Cap,
-  `--provider-circuit-max-cooldown`). Diskriminator ist bewusst **kein** Fehler-Parsing,
-  sondern das Ausbleiben eines Erfolgs — ein einzelner kaputter Bucket ist mit den Erfolgen
-  der Flotte verschraenkt und haelt niemanden auf. Offen: kein Provider-Call (auch nicht im
-  Teardown, Finalizer bleibt), Reconcile liefert `RequeueAfter` **ohne Fehler** (Log/Event/
-  `status.message` unveraendert), `degradedSince` einmal geschrieben statt pro Probe, Grace
-  laeuft weiter. `threshold: 0` = aus (Values-only-Rollback). Metriken
-  `..._provider_circuit_open` / `..._provider_circuit_opened_timestamp_seconds`.
-  Begleitend: Workqueue-RateLimiter (1s → 15min, fleetweit 1 qps/Burst 5 statt 5ms/10 qps),
-  `retryTransport` retryt **429 nicht mehr** (Rate-Limit erneut anfragen vertieft ihn),
-  `IdleConnTimeout` 30s gegen `connection reset by peer` auf gepoolten Verbindungen.
-- **Transiente Provider-Fehler (§8.2, implementiert 2026-08-25):** `Ready` beschreibt den zuletzt
-  **verifizierten** Zustand, nicht das Ergebnis des letzten Verifikationsversuchs. `fail` haelt `Ready`
-  eines provisionierten Buckets, `degrade` schreibt stattdessen `status.degradedSince` +
-  `ProviderReachable=False`; nach `--provider-degraded-grace` (Helm `providerDegradedGrace`, Default 30m,
-  `0` = aus) faellt der Bucket wie vorher auf `Failed`. Klassifikation **nach Herkunft**: `failNoRequeue`
-  = definitiv (Spec-Guards, Ownership-Collision, `validateCloneSource`), `fail` = nicht-definitiv.
-  Unbekannte Fehler sind per Konstruktion nicht-definitiv. **Ausnahmen** (fallen sofort):
-  `stackit.ProviderRefused` = strukturiertes **400/401/403** — 400 ist das Fehlerbild eines entzogenen
-  SA-Keys (Token-Endpoint `invalid_grant`, der Key-Flow erreicht die API nie; live verifiziert
-  2026-08-25); `errCredentialDestroyed` = Key geloescht, Ersatz nicht publiziert (lokale Gewissheit,
-  ueber Rotations-Annotation ohne Generations-Bump erreichbar); Teardown;
-  `ObservedGeneration != Generation`; nie-Ready. Fehler wird weiterhin zurueckgegeben, also feuert
-  `StackitS3ReconcileErrors` unveraendert; zusaetzlich `StackitS3BucketProviderDegraded`.
-- **Bucket-Groesse + Kosten (`spec.usage`, INIT-SETUP.md §8.3):** eigener
-  `BucketUsageReconciler` (eigene Workqueue, `bucketUsage.concurrency`), misst per
-  vollstaendigem S3-Listing mit dem Admin-Key und schreibt **nur** `status.usage`
-  per Merge-Patch. Faelligkeit kommt aus `status.usage.lastMeasurementTime`
-  (ueberlebt Restarts), naechster Lauf per `RequeueAfter` + deterministischem
-  Skew; Watch ist generation/annotation-gefiltert (sonst Hot-Loop durch eigene
-  Status-Writes). Zwei Helm-Schalter: `bucketUsage.enabled` = harter Gate,
-  `bucketUsage.defaultEnabled` = Default fuer CRs ohne eigene Angabe (aus).
-  Guards sind **Zeit**-Guards, nicht Geld: Messen kostet bei StackIT nichts
-  (Abrechnung nur per angefangenem GB/h, keine Request-Position — verifiziert
-  gegen Preisliste v1.0.43 + Leistungsschein v1.2), aber ~1 Request je 1000 Keys.
-  Daher `minInterval` (60m, CR-Wunsch wird hochgeklemmt) und `maxObjects` (2 Mio,
-  danach `truncated` → alle Werte sind untere Schranken, `>=`-Praefix).
-  Kosten = `ceil(bytes/1e9)` × `pricing.perGBHour` × 720h, auf Cent gerundet.
-  **Messfehler beruehren `Ready` nie** und geben keinen Reconcile-Error zurueck.
-- **Guards (produktionssicher):** CR darf `secretRef` **nicht** aufs Admin-Secret zeigen (sonst
-  Pollution + Admin-Lockout beim Delete); `spec.region` muss = Operator-Region sein (Single-Region v1).
-  Beides → `Ready=Failed` ohne Requeue-Hammer.
-- **Bucket-Clone (`spec.cloneFrom`, INIT-SETUP.md §8.1):** einmaliger Copy eines fremden S3-Buckets
-  via rclone-**Job** im Operator-NS (Image Helm `clone.image`). Quell-Creds aus User-Secret (nur
-  CR-Namespace, Keys via `secretRef.keys` konfigurierbar), Ziel = Admin-Key. Quelle default
-  path-style, `addressingStyle: virtual-hosted` für AWS-Stil (Ziel bleibt path-style). Default
-  `holdSecretUntilCloned: true`: Workload-Secret erst nach Clone-Erfolg (Flow: Bucket → Policy →
-  Clone → Key+Secret); `Ready` wartet immer auf den Clone. Fortschritt via rclone-rc (`--rc`,
-  Basic-Auth 32-Zeichen-Passwort im Staging-Secret `…-src`, Helm-NetworkPolicy auf Port 5572) →
-  `status.clone.progress` („2.0 GiB / 18.0 GiB (11%)“), Poll alle 15s. Clone-once (`Completed`
-  terminal), Failed-Job → Delete + Backoff-Retry (rclone resumed). **Bucket-Watch filtert auf
-  Generation/Annotation** (sonst Hot-Loop durch Progress-Writes) — Finalizer-Add requeued explizit.
-
-## Sicherheits-Befunde (verifiziert 2026-08-24, PRÄEXISTENT — nicht vom Grant-Feature eingeführt; beide behoben)
-
-1. **`workloadGroupName` kollidiert über Namespaces** — **BEHOBEN 2026-09-03**
-   ([ADR 0002](docs/adr/0002-a-credentials-group-is-attributed-through-its-bucket.md)).
-   Vorher: `("s3op-"+ns+"-"+name)[:23]` + 8-Hex-FNV-1a-32, empirisch reproduziert
-   `("gitlab","gitlab-artifacts")` == `("gitlab-gitlab","artifacts787ngo")` ==
-   `s3op-gitlab-gitlab-arti-70dbcfc2`; `EnsureCredentialsGroup` war Find-or-Create **ohne**
-   Ownership-Check → fremdes CR adoptierte die Gruppe, `ensureAccessKeyAndSecret` löschte den
-   Live-Key des Opfers und schrieb einen neuen ins eigene Secret. Fix: die Group wird ueber den
-   Bucket zugeordnet (Tag `credentials-group-id`, Admin-Key-only, hinter dem Ownership-Check),
-   Bestand wird aus der eigenen Policy migriert (Statement `workload-objects-only`) — keine
-   Umbenennung, kein Key-Wechsel, Name nur noch Anzeigename. Regressionstest
-   `TestGroupAttributionSurvivesNameCollision`; Migration gegen die echte API verifiziert
-   (`TestIntegrationGroupAttributionMigration`, 2026-09-03).
-2. **`spec.secretRef.namespace` ungeprüft** — **BEHOBEN 2026-09-03** ([ADR 0001](docs/adr/0001-a-bucket-only-affects-its-own-namespace.md)):
-   Feld aus der CRD entfernt, `SecretNamespace()` gelöscht, Secret liegt strukturell in
-   `b.Namespace` (immer mit Controller-OwnerRef), `bucketsForSecret` listet nur noch den
-   Namespace des Secrets. Vorher: `upsertSecret` merged in ein beliebiges Secret jedes
-   Namespace, `deleteSecret` löschte es beim CR-Delete → Cross-Namespace-Write/Delete-Primitiv
-   für jeden, der ein Bucket-CR anlegen darf. Migration: ein Bestands-CR mit gesetztem Feld
-   wird vom API-Server auf den eigenen Namespace gepruned → Operator rotiert den Key in ein
-   neues Secret im CR-Namespace, das alte Fremd-Secret verwaist mit totem Key (manuell löschen).
-
-Beide Befunde sind behoben; die Prämisse „Namespace = Trust-Boundary" gilt fuer Buckets und
-Credentials-Groups strukturell (ADR 0001 D2 + ADR 0002), nicht per RBAC-Konfiguration.
-
-## Nächster Schritt
-
-Reconciler steht, alle Offline/lint/gosec/envtest-Checks grün. **Erledigt:** End-to-End-Provisioning
-über den Reconciler gegen die echte StackIT-API (`make e2e-stackit`, Kind + echter SA-Key) inkl.
-Read-Grants; Layer-2-Policy-Enforcement mit 3 Statements direkt gegen StorageGRID
-(`go test -tags integration ./stackit/ -run IntegrationReadGrant`).
-**Erledigt (2026-08-25):** Transiente Provider-Fehler (INIT-SETUP.md §8.2) — EnsureService eskaliert
-keinen fehlgeschlagenen Read mehr zu einem Write + prozessweiter Cache, Retry-RoundTripper fuer GET/HEAD
-unter der SDK-Auth, Sticky-`Ready` mit begrenztem Grace. Ticket `local_s3-provisioner-transient-errors.md`.
-**Erledigt (2026-09-01):** Bucket-Groesse + Monatskosten-Schaetzung an der CR (`spec.usage`,
-INIT-SETUP.md §8.3) — eigener Mess-Controller, Helm-Gate + Cluster-Default, Intervall-Floor,
-Objekt-Cap, alle Werte als Metriken, zwei neue Alerts.
-**Erledigt (2026-09-02):** Provider-Circuit-Breaker + Alarm-Retune (INIT-SETUP.md §8.4).
-Befund read-only auf mgmt-p: 503-Storm des StackIT-Edge um 14:23 UTC, ab 14:34 zusaetzlich
-`429 rate limit on IP level exceeded` — der Operator hat sein eigenes IP-Limit vollgehaemmert
-(kein Workqueue-RateLimiter, `retryTransport` retryte 429 dreifach pro GET). 242 Reconcile-Fehler
-fuer **einen** selbstheilenden Ausfall, Alarmschwelle war `>3 / 15m` mit `for: 0`.
-`StackitS3ReconcileErrors` unterdrueckt jetzt Fenster mit offenem Circuit (`unless on()`,
-fail-open bei fehlender Metrik); `StackitS3BucketProviderDegraded` alarmiert auf das **Alter**
-des Haltens (`> holdForSeconds`, Default 1200s < Grace 30m) statt auf dessen Existenz.
-**Erledigt (2026-09-01):** e2e gegen die echte API nachgezogen (`make e2e-stackit`, neue SA-Keys,
-kompletter Lauf gruen in 658s, Sweep danach leer): `TestCloudBucketUsage` (Messung + Kosten +
-Clear beim Abschalten), `TestCloudBucketUsageWithVersions` (Versions-Listing auf einem
-nicht-versionierten Bucket — live verifiziert, dass StorageGRID das beantwortet und `IsLatest`
-korrekt setzt), `TestCloudClone` (echtes rclone-Image, Quelle ist ein zweites Bucket-CR:
-Hold-Invariante, byte-genauer Inhalt, Clone-once). rclone-Image wird im Make-Target aus dem
-gerenderten Chart gelesen und in Kind vorgeladen (kein dritter Pin, kein Registry-Pull im Test).
-**Erledigt (2026-09-03):** Sicherheits-Befund 1 (Group-Namenskollision) via ADR 0002 — Zuordnung der
-Credentials-Group ueber das Bucket-Tag `credentials-group-id`, Migration aus der Policy, ohne
-Umbenennung/Key-Wechsel; offline + gegen die echte API verifiziert
-(`go test -tags integration ./internal/controller/ -run IntegrationGroupAttribution -v`).
-**Erledigt (2026-09-03):** User-facing RBAC (`local_aggregation.md`): Chart liefert `<release>-view`/`-edit`
-als Aggregations-Fragmente fuer built-in `view`/`edit`/`admin` (`bucketRoles.create`), bewusst OHNE
-Standalone-`-edit` (Confused Deputy ueber `cloneFrom.secretRef` + Secret-Adoption; ADR 0001 Amendment).
-Render-Check `make test-helm-render` (`test/helm/`), e2e `TestBucketRBACAggregation` (SubjectAccessReview,
-gepollt, Deny erst nach Allow).
-**Offen:** Q2 (Minimal-Rolle), Q4 (Bucket-Namensraum).
-RBAC/Helm: Operator braucht Secret-CRUD im eigenen NS (Admin-Secret) — bereits von den cluster-weiten
-Secret-RBAC-Markern abgedeckt.
-</content>
+- **The chat is not the artefact.** Caveman mode, where active, compresses the conversation only;
+  code, comments, commit messages and every document are written as normal English prose,
+  whatever language the work is discussed in.
+- **Every claim is verified before it is written**, and what could not be verified says so in the
+  sentence that makes the claim. An assumption never travels as a fact.
+- **Dates are absolute**, enumerations of five or more parallel items are tables, links are
+  relative, and generated files are never hand-edited.
+- The remaining project conventions live with the mechanism they belong to: the commit format in
+  [docs/developer/build-and-release.md](docs/developer/build-and-release.md), the test-suite
+  contract in [docs/developer/testing.md](docs/developer/testing.md), credential custody in
+  [docs/security/credentials-and-secrets.md](docs/security/credentials-and-secrets.md).

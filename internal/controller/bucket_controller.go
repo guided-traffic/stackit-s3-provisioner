@@ -46,7 +46,7 @@ const (
 )
 
 // adminGroupName is the display name of the operator-wide bootstrap credentials
-// group whose access key sets bucket policies (INIT-SETUP.md §4.1). It is shared
+// group whose access key sets bucket policies (ADR 0004 D1). It is shared
 // across all Bucket CRs in the project and is never torn down per-bucket.
 const adminGroupName = "operator-admin"
 
@@ -71,7 +71,7 @@ type adminCreds struct {
 // BucketReconciler reconciles a Bucket object against StackIT Object Storage.
 //
 // One Bucket CR maps to a StackIT bucket, a dedicated credentials group, an
-// access key, an isolation policy (INIT-SETUP.md §4.1) and a workload
+// access key, an isolation policy (ADR 0003) and a workload
 // credentials Secret. The reconciler is idempotent and self-healing: cloud
 // resources are found again by the bucket's own tags (ownership and, per
 // ADR 0002, the credentials group it attributes), so a crash never leaks a
@@ -304,7 +304,7 @@ func (r *BucketReconciler) reconcileDelete(ctx context.Context, b *s3v1.Bucket) 
 	if err := r.teardown(ctx, b); err != nil {
 		logger.Error(err, "teardown failed; keeping finalizer", "bucket", b.EffectiveBucketName())
 		// Keep the finalizer and surface the reason; a non-empty bucket must not
-		// be deleted (data-loss guard, INIT-SETUP.md §0).
+		// be deleted (data-loss guard, ADR 0006 D2).
 		return r.fail(ctx, b, err)
 	}
 	r.Breaker.Success()
@@ -354,9 +354,20 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 		return r.fail(ctx, b, fmt.Errorf("enable object storage: %w", err))
 	}
 
+	// Before anything can create a bucket: a bucket this Bucket was already
+	// provisioned with and that the provider now says is gone is reported, never
+	// re-created behind the workload's back.
+	recreating, res, done, err := r.guardBucketPresent(ctx, b, name)
+	if !done {
+		return res, err
+	}
+
 	freshBucket, err := r.ensureBucket(ctx, b, name, admin)
 	if err != nil {
 		return r.failEnsureBucket(ctx, b, err)
+	}
+	if recreating && freshBucket {
+		r.reportAuthorizedRecreate(ctx, b, name)
 	}
 
 	host, bucketURL, err := r.Stackit.BucketConnInfo(ctx, name)
@@ -383,8 +394,12 @@ func (r *BucketReconciler) reconcileNormal(ctx context.Context, b *s3v1.Bucket) 
 	b.Status.Phase = s3v1.PhaseReady
 	b.Status.Message = fmt.Sprintf("bucket %q provisioned with isolated workload credentials", name)
 	// The provider answered for every step of this pass, so any held-over
-	// degradation is over.
+	// degradation is over. The bucket was verified present (or re-created) in
+	// this pass too, so a previous BucketMissing report is over as well — removed
+	// rather than set to True, so a Bucket that never lost its bucket and one
+	// that recovered look identical.
 	clearDegraded(b)
+	meta.RemoveStatusCondition(&b.Status.Conditions, s3v1.ConditionBucketPresent)
 	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{
 		Type:    s3v1.ConditionReady,
 		Status:  metav1.ConditionTrue,
@@ -550,6 +565,114 @@ func (r *BucketReconciler) provisionCredentialsAndClone(
 		}
 	}
 	return creds, true, ctrl.Result{}, nil
+}
+
+// guardBucketPresent refuses to re-create the bucket of a Bucket that has
+// already been provisioned once and whose bucket the provider now reports as
+// gone — deleted in the console, removed by a cleanup script, or simply never
+// present in the project the operator is currently authenticated against.
+//
+// Without it the reconcile reads "the bucket is not there" as "the bucket is not
+// there *yet*": it creates an empty bucket under the same name, and because a
+// freshly created bucket carries no credentials-group attribution, it then mints
+// a fresh group and key and overwrites the workload Secret. The Bucket goes
+// Ready and the workload keeps writing — into an empty bucket, with no event,
+// condition or metric anywhere saying that its data is gone. This is the one
+// place the operator must report rather than repair.
+//
+// "Already provisioned" is status.resolvedBucketName, which is written only on
+// the success path. The resolved-bucket-name annotation deliberately does not
+// count: it is stamped before any cloud resource exists, so it proves an intent,
+// not a completed provisioning round, and using it would block first
+// provisioning outright.
+//
+// "Gone" is Client.BucketExists — the provider's own structured answer for this
+// one bucket. A provider that is unreachable, a gateway page, a 5xx or a dropped
+// connection never reaches this decision: BucketExists returns those as errors,
+// and they take the ordinary degraded path of ADR 0012 instead, keeping a
+// provider outage distinguishable from a real absence.
+//
+// It returns recreate=true when the bucket is gone and spec.allowRecreate
+// authorises rebuilding it; done=false means the reconcile ends here with the
+// returned result and error.
+func (r *BucketReconciler) guardBucketPresent(
+	ctx context.Context, b *s3v1.Bucket, name string,
+) (recreate bool, res ctrl.Result, done bool, err error) {
+	if b.Status.ResolvedBucketName == "" {
+		// No completed provisioning round, so no workload ever received
+		// credentials for this bucket and there is no data to protect. A
+		// pre-existing bucket of somebody else's that happens to share the name
+		// is still refused by adoptOrCollide's ownership check.
+		return false, ctrl.Result{}, true, nil
+	}
+
+	exists, err := r.Stackit.BucketExists(ctx, name)
+	if err != nil {
+		// Not an answer about the bucket: hand it to the ordinary failure path,
+		// which holds Ready for an already-provisioned Bucket while the provider
+		// is unreachable.
+		res, rerr := r.fail(ctx, b, fmt.Errorf("verify bucket %q still exists: %w", name, err))
+		return false, res, false, rerr
+	}
+	if exists {
+		return false, ctrl.Result{}, true, nil
+	}
+
+	if b.Spec.AllowRecreate {
+		// A standing authorisation to rebuild regenerable content. It is still an
+		// incident and is still reported — see reportAuthorizedRecreate, which
+		// runs once the bucket has actually been re-created.
+		log.FromContext(ctx).Info("provisioned bucket is gone; spec.allowRecreate authorises re-creating it",
+			"bucket", name, "credentialsGroup", b.Status.CredentialsGroupID)
+		return true, ctrl.Result{}, true, nil
+	}
+
+	missing := fmt.Errorf(
+		"bucket %q was provisioned for this Bucket but the provider reports it as gone; refusing to re-create it, "+
+			"because that would hand the workload an empty bucket under the same name. Its contents are lost: "+
+			"delete and re-apply this Bucket to provision a fresh one, or set spec.allowRecreate if its content is regenerable",
+		name)
+	// The provider answered, so any held-over degradation is over. Clearing it
+	// is what lets a reader tell the two apart from the conditions alone:
+	// ProviderReachable absent and BucketPresent=False is a vanished bucket, not
+	// an outage.
+	clearDegraded(b)
+	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{
+		Type:    s3v1.ConditionBucketPresent,
+		Status:  metav1.ConditionFalse,
+		Reason:  s3v1.ReasonBucketMissing,
+		Message: missing.Error(),
+	})
+	r.markFailedReason(ctx, b, s3v1.ReasonBucketMissing, missing)
+
+	// Deliberately neither r.fail nor r.failNoRequeue. fail() would call
+	// Breaker.Failure(), and after a restart against the wrong project EVERY
+	// provisioned Bucket reads as absent — three of them would open the circuit
+	// fleet-wide and stop every provider call, teardowns included, over an answer
+	// the provider gave definitively (ADR 0013 D3: a definitive fault neither
+	// trips nor resets the breaker). failNoRequeue would never retry, and a
+	// restored bucket or a corrected key has to recover without human action.
+	// Returning the error requeues on the workqueue's own rate limiter
+	// (1s → 15min cap, bucketRateLimiter), which is exactly that retry.
+	return false, ctrl.Result{}, false, missing
+}
+
+// reportAuthorizedRecreate records that a vanished bucket was rebuilt under
+// spec.allowRecreate. Without this, opting in would restore precisely the silent
+// repair the guard exists to remove: the Bucket would go Ready again with no
+// trace that its data is gone. The Warning event and the counter are also what
+// tells somebody to restart the workload, which is still holding a key for the
+// now-orphaned credentials group and getting 403s until it re-reads its Secret.
+func (r *BucketReconciler) reportAuthorizedRecreate(ctx context.Context, b *s3v1.Bucket, name string) {
+	bucketRecreations.WithLabelValues(b.Namespace, b.Name).Inc()
+	note := fmt.Sprintf(
+		"bucket %q was gone and has been re-created empty because spec.allowRecreate is set; its previous contents are lost, "+
+			"the workload credentials Secret is being replaced (restart consumers so they re-read it) "+
+			"and the previous credentials group %s is left behind for manual cleanup",
+		name, b.Status.CredentialsGroupID)
+	log.FromContext(ctx).Info("vanished bucket re-created under spec.allowRecreate",
+		"bucket", name, "previousCredentialsGroup", b.Status.CredentialsGroupID)
+	r.event(b, corev1.EventTypeWarning, s3v1.ReasonBucketRecreated, note)
 }
 
 // ensureBucket makes the bucket exist, is idempotent, and enforces ownership.
@@ -1167,7 +1290,7 @@ func (r *BucketReconciler) resolveReadGrants(
 	return urns, granted, nil
 }
 
-// ensureBucketPolicy applies the isolation policy (INIT-SETUP.md §4.1) via the
+// ensureBucketPolicy applies the isolation policy (ADR 0003) via the
 // admin S3 key, re-writing it only when it drifts from the desired document.
 // readerURNs carries the resolved spec.grantReadAccess principals; nil keeps the
 // policy at its two original statements.
@@ -1203,7 +1326,7 @@ func (r *BucketReconciler) teardown(ctx context.Context, b *s3v1.Bucket) error {
 		return err
 	}
 
-	// Empty-only guard (INIT-SETUP.md §0), optionally preceded by a requested
+	// Empty-only guard (ADR 0006 D3), optionally preceded by a requested
 	// wipe: refuse deletion while the bucket holds data. Done first, before any
 	// credential is removed, so a blocked delete leaves the workload fully
 	// functional.
@@ -1671,17 +1794,27 @@ func clearDegraded(b *s3v1.Bucket) {
 }
 
 func (r *BucketReconciler) markFailed(ctx context.Context, b *s3v1.Bucket, err error) {
+	r.markFailedReason(ctx, b, s3v1.ReasonFailed, err)
+}
+
+// markFailedReason is markFailed with an explicit reason on the Ready condition.
+// Almost every failure is simply ReasonFailed; a vanished bucket carries
+// ReasonBucketMissing instead, so that the incident is distinguishable from an
+// ordinary reconcile failure without reading status.message.
+func (r *BucketReconciler) markFailedReason(ctx context.Context, b *s3v1.Bucket, reason string, err error) {
 	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{
 		Type:    s3v1.ConditionReady,
 		Status:  metav1.ConditionFalse,
-		Reason:  s3v1.ReasonFailed,
+		Reason:  reason,
 		Message: err.Error(),
 	})
 	b.Status.Phase = s3v1.PhaseFailed
 	b.Status.Message = err.Error()
 	b.Status.ObservedGeneration = b.Generation
 	b.Status.OperatorVersion = r.OperatorVersion
-	r.event(b, corev1.EventTypeWarning, s3v1.ReasonFailed, err.Error())
+	// The event carries the same reason as the condition, so a vanished bucket is
+	// greppable in the event stream and not lost among ordinary Failed events.
+	r.event(b, corev1.EventTypeWarning, reason, err.Error())
 	if uerr := r.Status().Update(ctx, b); uerr != nil {
 		log.FromContext(ctx).V(1).Info("status update after failure did not apply", "error", uerr.Error())
 	}
