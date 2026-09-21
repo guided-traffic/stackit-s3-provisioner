@@ -29,7 +29,7 @@ import (
 
 // DefaultCloneImage is the rclone image used for clone jobs when no
 // --clone-image is configured (Helm always sets one explicitly).
-const DefaultCloneImage = "rclone/rclone:1.75.0"
+const DefaultCloneImage = "rclone/rclone:1.75.1"
 
 const (
 	// cloneComponentValue marks clone job pods (app.kubernetes.io/component).
