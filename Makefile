@@ -154,7 +154,7 @@ generate-all: manifests generate sync-helm-crd ## Regenerate CRD, DeepCopy code,
 
 .PHONY: docker-build
 docker-build: generate-all ## Build docker image with the manager (regenerates CRD and DeepCopy first).
-	docker build -f Containerfile -t ${IMG} .
+	DOCKER_BUILDKIT=1 docker build -f Containerfile -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
