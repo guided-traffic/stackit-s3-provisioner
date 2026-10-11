@@ -97,13 +97,19 @@ managers emit `depName: golang` from the `golang-version` datasource, and a pack
 datasource into a single "Go version" pull request so they cannot drift apart. Verified on
 2026-09-19 by reading each file and the custom managers in [`renovate.json`](../../renovate.json).
 
-| File | Literal today | Form | Matched by |
+| File | Literal | Form | Matched by |
 |---|---|---|---|
-| [`go.mod`](../../go.mod) | `go 1.27.1` | full version | custom regex manager on `^go\.mod$` |
-| [`Containerfile`](../../Containerfile) | `FROM golang:1.27.1-alpine` | full version | custom regex manager on `^Containerfile$` / `^Dockerfile$` |
-| [`.github/workflows/release.yml`](../../.github/workflows/release.yml) | `GO_VERSION: '1.27.1'` | full version | custom regex manager on `^\.github/workflows/.*\.ya?ml$` |
-| [`.github/workflows/build.yml`](../../.github/workflows/build.yml) | `GO_VERSION: '1.27.1'` | full version | the same manager |
-| [`.github/release-template.hbs`](../../.github/release-template.hbs) | `go-1.26-blue` | major.minor only, via `extractVersionTemplate` | custom regex manager on that file, with `loose` versioning — it reads `1.26` today, one minor behind `go.mod` |
+| [`go.mod`](../../go.mod) | `go <version>` | full version | custom regex manager on `^go\.mod$` |
+| [`Containerfile`](../../Containerfile) | `FROM golang:<version>-alpine` | full version | custom regex manager on `^Containerfile$` / `^Dockerfile$` |
+| [`.github/workflows/release.yml`](../../.github/workflows/release.yml) | `GO_VERSION: '<version>'` | full version | custom regex manager on `^\.github/workflows/.*\.ya?ml$` |
+| [`.github/workflows/build.yml`](../../.github/workflows/build.yml) | `GO_VERSION: '<version>'` | full version | the same manager |
+| [`.github/release-template.hbs`](../../.github/release-template.hbs) | `go-<major>.<minor>-blue` | major.minor only, via `extractVersionTemplate` | custom regex manager on that file, with `loose` versioning |
+
+The table shows patterns, not values, because Renovate automerges Go patch releases and a literal
+here would be stale after the next one. The badge's manager needs `loose` versioning: `semver`
+rejects a two-part value such as `1.26` with `skipReason: invalid-value`, and until 2026-10-11 that
+left the badge at `1.26` while `go.mod` moved through `1.27.x`, without any pull request touching it.
+A local Renovate dry run with `loose` proposes `1.27` inside `renovate/go-version`.
 
 [README.md](../../README.md) is deliberately not in that table: verified on 2026-09-19 it carries
 four badges — build status, coverage, Go Report Card and licence — and no Go-version badge, so the
@@ -184,11 +190,6 @@ The other pinned versions, none of which is a Go version:
 
 - **A stale generated CRD merges green**, and the gate that catches it runs after the image is
   pushed — the two properties above, in one sentence.
-- **The release-notes badge lags a minor behind `go.mod`.** `release-template.hbs` says `1.26` while
-  `go.mod` says `1.27.1`. Until 2026-10-11 its manager used `semver` versioning, which rejects the
-  two-part `1.26` with `skipReason: invalid-value`, so no Go-version pull request ever touched the
-  badge. With `loose` versioning a local dry run proposes `1.27` inside `renovate/go-version`; the
-  badge moves with the next Go-version pull request opened after that change.
 - **No pull-request job exercises semantic-release.** Renovate automerges minor and patch bumps of
   [`package.json`](../../package.json) once the ten pull-request jobs pass, and none of them runs
   `npx semantic-release`. A bump that breaks the release step shows up only as a red Semantic
