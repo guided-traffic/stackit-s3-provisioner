@@ -47,7 +47,26 @@ list and what each one executes is [testing.md](testing.md#what-ci-runs).
 
 **[`build.yml`](../../.github/workflows/build.yml)** — "Release Docker & Helm" — runs **only** when a
 GitHub release is published, in two jobs. `build` builds and pushes the multi-tag image to Docker Hub
-with `provenance: true` and `sbom: true`, attaches an SBOM and runs Docker Scout.
+for `linux/amd64` and `linux/arm64` with `provenance: true` and `sbom: true`, attaches an SBOM and
+runs Docker Scout. What each tag resolves to is therefore an OCI index, not a single image; a node
+of either architecture pulls its own variant from the same tag and the chart needs no change.
+
+Two properties of that multi-platform build are worth knowing:
+
+- **Nothing is emulated.** [`Containerfile`](../../Containerfile) pins its builder stage to
+  `--platform=$BUILDPLATFORM`, so the stage runs once on the runner's own architecture and reaches
+  the other one through `GOARCH` — the cross-compile the `CGO_ENABLED=0` build already supported.
+  The final stage is `distroless/static`, which executes no command, so no `RUN` ever needs QEMU.
+  Dropping the `--platform` prefix would silently move `go build` under emulation for every
+  non-native platform. That prefix is also why `make docker-build` sets `DOCKER_BUILDKIT=1`: the
+  classic builder cannot parse it.
+- **Only the amd64 variant is scanned and catalogued.** The `container-malware-scan` job of
+  `release.yml` builds `linux/amd64` alone, because `load: true` cannot import an index into the
+  Docker daemon; the SBOM and the Docker Scout step in `build.yml` likewise resolve the tag to the
+  runner's architecture. Both variants are built from one source tree and one
+  `distroless/static-debian12` base, so the finding sets are expected to agree — but that is an
+  expectation, not something CI verifies.
+
 `release-helm-gh`, which needs `build`, checks the generated artefacts (below), rewrites the chart's
 `version`, `appVersion` and `image.tag` from the release tag with `sed`, packages the chart and
 force-pushes it to the `gh-pages` branch that serves the Helm repository. Those three values are
@@ -99,7 +118,7 @@ datasource into a single "Go version" pull request so they cannot drift apart. V
 | File | Literal today | Form | Matched by |
 |---|---|---|---|
 | [`go.mod`](../../go.mod) | `go 1.27.1` | full version | custom regex manager on `^go\.mod$` |
-| [`Containerfile`](../../Containerfile) | `FROM golang:1.27.1-alpine` | full version | custom regex manager on `^Containerfile$` / `^Dockerfile$` |
+| [`Containerfile`](../../Containerfile) | `FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine` | full version | custom regex manager on `^Containerfile$` / `^Dockerfile$`, whose pattern tolerates the optional `--platform` prefix |
 | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) | `GO_VERSION: '1.27.1'` | full version | custom regex manager on `^\.github/workflows/.*\.ya?ml$` |
 | [`.github/workflows/build.yml`](../../.github/workflows/build.yml) | `GO_VERSION: '1.27.1'` | full version | the same manager |
 | [`.github/release-template.hbs`](../../.github/release-template.hbs) | `go-1.26-blue` | major.minor only, via `extractVersionTemplate` | custom regex manager on that file — it reads `1.26` today, one minor behind `go.mod` |

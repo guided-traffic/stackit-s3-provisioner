@@ -297,7 +297,7 @@
         "/^Dockerfile$/"
       ],
       "matchStrings": [
-        "FROM\\s+golang:(?<currentValue>[\\d.]+)-alpine"
+        "FROM\\s+(?:--platform=\\S+\\s+)?golang:(?<currentValue>[\\d.]+)-alpine"
       ],
       "depNameTemplate": "golang",
       "datasourceTemplate": "golang-version",
