@@ -106,6 +106,17 @@ test-helm-render: ## Render the Helm chart and assert on the user-facing RBAC ob
 	@echo "Running Helm render tests..."
 	$(GOTEST) -v -tags=helm -count=1 ./test/helm/...
 
+##@ Release tooling
+
+# npm install, not npm ci: there is no lockfile, and the Semantic Release job
+# resolves package.json the same way, so this sees what a release would load.
+.PHONY: release-notes-check
+release-notes-check: ## Render release notes with the installed semantic-release plugins (needs node and npm).
+	@echo "Checking the release tooling..."
+	npm install --no-audit --no-fund --no-package-lock
+	npm audit signatures
+	node hack/release-notes-check.mjs
+
 ##@ Security
 
 # gosec is built from its own module in hack/tools rather than installed at a
