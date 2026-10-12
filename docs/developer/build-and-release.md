@@ -31,7 +31,7 @@ and `make test-unit` — are picked apart in that page's
 | `make lint` | `go vet ./...`, `gofmt -l .`, then golangci-lint v2 with the config in [`.golangci.yml`](../../.golangci.yml) | What the CI linter job runs |
 | `make lint-fix` | golangci-lint with `--fix` | Mechanical cleanups |
 | `make cyclo` | gocyclo, failing above `CYCLO_THRESHOLD ?= 15` `# default` | Before splitting a function you just grew |
-| `make gosec` | gosec over the whole tree | Same scan CI runs |
+| `make gosec` | builds gosec from [`hack/tools/`](../../hack/tools/go.mod), then runs it over the whole tree | Same scan CI runs |
 | `make vuln` | govulncheck over the whole tree | Same scan CI runs |
 | `make generate-all` | `manifests`, `generate`, `sync-helm-crd` | **After any change under `api/v1/`** — see the release gate below |
 
@@ -70,7 +70,8 @@ conventional-commit analysis, release notes, a GitHub release, and a
 [`.github/badges/coverage.json`](../../.github/badges/coverage.json) — the badge the combined-coverage
 job produced earlier in the same run. Publishing that release is what triggers `build.yml`.
 [`package.json`](../../package.json) exists only to pin those Node dev-dependencies; no JavaScript
-ships.
+ships. Renovate automerges their minor and patch bumps like every other ecosystem here, although no
+pull-request job runs semantic-release — see what is wrong today, below.
 
 `.github/badges/coverage.json` is therefore a generated file that lives in git: written by CI,
 committed by semantic-release, and never hand-edited.
@@ -96,20 +97,54 @@ managers emit `depName: golang` from the `golang-version` datasource, and a pack
 datasource into a single "Go version" pull request so they cannot drift apart. Verified on
 2026-09-19 by reading each file and the custom managers in [`renovate.json`](../../renovate.json).
 
-| File | Literal today | Form | Matched by |
+| File | Literal | Form | Matched by |
 |---|---|---|---|
-| [`go.mod`](../../go.mod) | `go 1.27.1` | full version | custom regex manager on `^go\.mod$` |
-| [`Containerfile`](../../Containerfile) | `FROM golang:1.27.1-alpine` | full version | custom regex manager on `^Containerfile$` / `^Dockerfile$` |
-| [`.github/workflows/release.yml`](../../.github/workflows/release.yml) | `GO_VERSION: '1.27.1'` | full version | custom regex manager on `^\.github/workflows/.*\.ya?ml$` |
-| [`.github/workflows/build.yml`](../../.github/workflows/build.yml) | `GO_VERSION: '1.27.1'` | full version | the same manager |
-| [`.github/release-template.hbs`](../../.github/release-template.hbs) | `go-1.26-blue` | major.minor only, via `extractVersionTemplate` | custom regex manager on that file — it reads `1.26` today, one minor behind `go.mod` |
+| [`go.mod`](../../go.mod) | `go <version>` | full version | custom regex manager on `^go\.mod$` |
+| [`Containerfile`](../../Containerfile) | `FROM golang:<version>-alpine` | full version | custom regex manager on `^Containerfile$` / `^Dockerfile$` |
+| [`.github/workflows/release.yml`](../../.github/workflows/release.yml) | `GO_VERSION: '<version>'` | full version | custom regex manager on `^\.github/workflows/.*\.ya?ml$` |
+| [`.github/workflows/build.yml`](../../.github/workflows/build.yml) | `GO_VERSION: '<version>'` | full version | the same manager |
+| [`.github/release-template.hbs`](../../.github/release-template.hbs) | `go-<major>.<minor>-blue` | major.minor only, via `extractVersionTemplate` | custom regex manager on that file, with `loose` versioning |
+
+The table shows patterns, not values, because Renovate automerges Go patch releases and a literal
+here would be stale after the next one. The badge's manager needs `loose` versioning: `semver`
+rejects a two-part value such as `1.26` with `skipReason: invalid-value`, and until 2026-10-11 that
+left the badge at `1.26` while `go.mod` moved through `1.27.x`, without any pull request touching it.
+A local Renovate dry run with `loose` proposes `1.27` inside `renovate/go-version`.
 
 [README.md](../../README.md) is deliberately not in that table: verified on 2026-09-19 it carries
 four badges — build status, coverage, Go Report Card and licence — and no Go-version badge, so the
 front page holds no Go literal to bump.
 
 Renovate additionally groups every `golang.org/x/*` module bump into the same pull request, so
-govulncheck sees a consistent set.
+govulncheck sees a consistent set — in [`go.mod`](../../go.mod) and in the gosec tool module alike,
+which is what the next section depends on.
+
+### gosec is built from a tool module
+
+gosec loads the packages it scans through `golang.org/x/tools`, and that importer has to read the
+export data the Go toolchain in use writes. A gosec release pins one `golang.org/x/tools`, and a
+gosec release can lag a Go release: gosec v2.29.0 carries `golang.org/x/tools v0.49.0`, which cannot
+decode what Go 1.27.2 writes — every package fails with `export data version 5 is greater than
+maximum supported version 4`. Reproduced on 2026-10-11 with `go install …/gosec@v2.29.0` under Go
+1.27.2. **gosec then prints `Issues : 0`**; only its non-zero exit code marks the scan as failed, so
+the summary line alone reads like a clean run.
+
+So `make gosec` does not `go install` a tag. It builds the scanner from
+[`hack/tools/go.mod`](../../hack/tools/go.mod), a module holding nothing but a `tool` directive for
+gosec, with `golang.org/x/tools` raised above what gosec itself requires, and it rebuilds on every
+run, so a gosec that happens to be on `PATH` is never used. Renovate treats that module as gosec's
+dependency graph, not ours: two package rules in [`renovate.json`](../../renovate.json) switch every
+entry in it off except gosec itself and `golang.org/x/*`, and the existing grouping rule puts the
+latter into the Go version pull request. A Go bump therefore arrives together with the newest
+`golang.org/x/tools`. Go records a tool's module as `// indirect`, so gosec is an indirect dependency
+in that file — the re-enabling rule names it explicitly, and carries no `matchUpdateTypes`, because
+Renovate decides `enabled` per dependency before it knows any update type. Both rules were checked on
+2026-10-11 with a local `renovate --platform=local` dry run of the version the workflow uses (44):
+`golang.org/x/tools` landed in `renovate/go-version`, gosec in a branch of its own, and every other
+entry of the file stayed disabled.
+
+The coupling cannot help when no `golang.org/x/tools` that reads the new export data exists yet; the
+Go version pull request then fails the GoSec job and waits until one is released.
 
 ### The untagged Kubernetes modules move with the release line, not on their own
 
@@ -146,17 +181,19 @@ The other pinned versions, none of which is a Go version:
 | `ENVTEST_K8S_VERSION = 1.33.0` | [`Makefile`](../../Makefile) | by hand |
 | `k8s.io/kube-openapi`, `k8s.io/utils`, `sigs.k8s.io/json`, each a pseudo-version | [`go.mod`](../../go.mod) | `go mod tidy`, only when a `k8s.io/*` release raises the minimum — Renovate is switched off for these three module paths, for the reason above |
 | `KUBERNETES_VERSION: '1.33.4'` — the kubectl and Kind node image of the e2e job | [`release.yml`](../../.github/workflows/release.yml) | by hand |
-| `KUSTOMIZE_VERSION`, `CONTROLLER_GEN_VERSION`, `GOLANGCI_LINT_VERSION`, `GOCYCLO_VERSION`, `GOSEC_VERSION` | [`Makefile`](../../Makefile), each under a `# renovate:` comment | the Makefile custom regex manager; minor and patch automerge, major needs review |
-| `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the five above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
+| `KUSTOMIZE_VERSION`, `CONTROLLER_GEN_VERSION`, `GOLANGCI_LINT_VERSION`, `GOCYCLO_VERSION` | [`Makefile`](../../Makefile), each under a `# renovate:` comment | the Makefile custom regex manager; minor and patch automerge, major needs review |
+| gosec, and the `golang.org/x/tools` it is built with | [`hack/tools/go.mod`](../../hack/tools/go.mod) | Renovate's gomod manager, restricted to those two by package rules: gosec in a pull request of its own, `golang.org/x/*` inside the Go version pull request; minor and patch automerge |
+| `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the four above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
 | The rclone image used by clone Jobs | the chart's [`values.yaml`](../../deploy/helm/stackit-s3-provisioner/values.yaml), and `DefaultCloneImage` in [`internal/controller/clone.go`](../../internal/controller/clone.go) as the fallback | Renovate, both of them: the chart value through the `helm-values` manager, `DefaultCloneImage` through a custom regex manager that exists to keep the fallback in step with the chart tag. The Makefile deliberately reads the image out of the rendered chart rather than pinning it a third time |
 
 ## What is wrong today
 
 - **A stale generated CRD merges green**, and the gate that catches it runs after the image is
   pushed — the two properties above, in one sentence.
-- **The release-notes badge lags a minor behind `go.mod`.** `release-template.hbs` says `1.26` while
-  `go.mod` says `1.27.1`. The manager is configured correctly; the badge simply moves only when
-  Renovate next opens a Go-version pull request.
+- **No pull-request job exercises semantic-release.** Renovate automerges minor and patch bumps of
+  [`package.json`](../../package.json) once the ten pull-request jobs pass, and none of them runs
+  `npx semantic-release`. A bump that breaks the release step shows up only as a red Semantic
+  Release job on `main`, after the merge, and holds back every release until it is fixed.
 - **Nothing type-checks the build-tagged suites**, because every lint and vet target is untagged.
   The consequence for a contributor is a manual `go vet -tags integration ./...`
   ([testing.md](testing.md#what-is-wrong-today-and-what-this-page-could-not-verify)).
