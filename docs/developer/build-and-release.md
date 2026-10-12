@@ -5,7 +5,7 @@ carries which pinned version. Read it before you push, before you cut a release,
 touches more than one file at once.
 
 Two neighbouring pages own the parts deliberately missing here. **Which suite exists, what each one
-proves, what it costs and which of the eleven CI jobs runs it** is
+proves, what it costs and which of the twelve CI jobs runs it** is
 [testing.md](testing.md#what-ci-runs) — this page never re-enumerates the jobs. **Which file is
 generated from which source, and the drift between `config/rbac/` and the chart** is
 [package-map.md](package-map.md#what-is-wrong-today). What a released setting *does* is
@@ -42,7 +42,7 @@ by hand is the only check that the real-API suites still build.
 ## What CI is
 
 **[`release.yml`](../../.github/workflows/release.yml)** — "Test and Release" — runs on every push
-and pull request to `main`, and on manual dispatch. Eleven jobs, all `runs-on: self-hosted`; the job
+and pull request to `main`, and on manual dispatch. Twelve jobs, all `runs-on: self-hosted`; the job
 list and what each one executes is [testing.md](testing.md#what-ci-runs).
 
 **[`build.yml`](../../.github/workflows/build.yml)** — "Release Docker & Helm" — runs **only** when a
@@ -58,20 +58,46 @@ therefore never bumped by hand ([package-map.md](package-map.md#the-tree)).
 
 ## How a version is cut
 
-**Commit messages decide the version**, because the eleventh job of `release.yml` is
+**Commit messages decide the version**, because the last job of `release.yml` is
 semantic-release. Conventional commits are therefore a correctness requirement, not a style
 preference: `fix:` cuts a patch, `feat:` a minor, a `BREAKING CHANGE:` footer a major, and a commit
 outside the convention cuts nothing at all.
 
-The **Semantic Release** job runs only on a push to `main` and only after every one of the other ten
-jobs has passed. It runs `npx semantic-release` with [`.releaserc.json`](../../.releaserc.json):
+The **Semantic Release** job runs only on a push to `main` and only after every one of the other
+eleven jobs has passed. It runs `npx semantic-release` with [`.releaserc.json`](../../.releaserc.json):
 conventional-commit analysis, release notes, a GitHub release, and a
 `chore(release): <version> [skip ci]` commit whose only asset is
 [`.github/badges/coverage.json`](../../.github/badges/coverage.json) — the badge the combined-coverage
 job produced earlier in the same run. Publishing that release is what triggers `build.yml`.
 [`package.json`](../../package.json) exists only to pin those Node dev-dependencies; no JavaScript
-ships. Renovate automerges their minor and patch bumps like every other ecosystem here, although no
-pull-request job runs semantic-release — see what is wrong today, below.
+ships.
+
+### The release tooling is checked before the merge
+
+Because the Semantic Release job runs only after the merge, a broken set of release plugins used to
+surface on `main` alone — and it did, in both possible ways. From 2026-07-10 to 2026-10-12,
+`conventional-changelog-conventionalcommits` 10.2.1 and then 10.3.0 rendered release notes without a
+single entry: every GitHub release from v1.5.3 to v1.19.15 carries a version header and nothing
+else, and the job stayed green throughout. On 2026-10-12, 10.4.1 failed the job outright with
+`Missing helper: "conventional-changelog-conventionalcommits requires conventional-changelog-writer@9
+or newer"`. Both have one cause: from 10.0.0 the preset needs `conventional-changelog-writer` 9,
+while `@semantic-release/release-notes-generator` 14.1.1, the newest on 2026-10-12, still depends on
+writer `^8`.
+
+So [`package.json`](../../package.json) holds the preset at 9.3.1, the version every release up to
+v1.5.2 used, and a package rule in [`renovate.json`](../../renovate.json) caps it below 10. That cap
+does not lift itself: it comes off by hand once release-notes-generator depends on writer 9.
+
+The **Release Tooling Check** job runs `make release-notes-check` on every pull request: an
+`npm install` and `npm audit signatures` exactly like the Semantic Release job, then
+[`hack/release-notes-check.mjs`](../../hack/release-notes-check.mjs), which loads the installed
+commit-analyzer and release-notes-generator with their configuration from
+[`.releaserc.json`](../../.releaserc.json), feeds them three synthetic commits and fails unless the
+release type is `minor` and both the feature and the fix appear in the notes. It asserts on the
+rendered entries rather than on exit status, because the empty-notes failure exits zero. It is a
+required status check on `main`, so Renovate's automerge of an npm bump waits for it. Verified on
+2026-10-12: the target fails with the preset at 10.3.0 (no entries) and at 10.4.1 (`Missing
+helper`) and passes at 9.3.1.
 
 `.github/badges/coverage.json` is therefore a generated file that lives in git: written by CI,
 committed by semantic-release, and never hand-edited.
@@ -159,7 +185,7 @@ Renovate classifies a pseudo-version update as a digest and would otherwise walk
 newest commit on master, where they compile against Kubernetes master alone. That is not a
 hypothetical: `kube-openapi` master moved `pkg/schemaconv` to `sigs.k8s.io/structured-merge-diff/v7`
 while `k8s.io/apimachinery v0.37.0` still constructs its type converter from
-`structured-merge-diff/v6`, so `go build` failed inside apimachinery itself. Six of the eleven CI
+`structured-merge-diff/v6`, so `go build` failed inside apimachinery itself. Six of the then eleven CI
 jobs ([testing.md](testing.md#what-ci-runs)) went red on that single error and two more were skipped
 behind them. The grouping rule matches these modules too, so one unbumpable module also blocks every
 other Kubernetes update sharing the pull request.
@@ -183,6 +209,7 @@ The other pinned versions, none of which is a Go version:
 | `KUBERNETES_VERSION: '1.33.4'` — the kubectl and Kind node image of the e2e job | [`release.yml`](../../.github/workflows/release.yml) | by hand |
 | `KUSTOMIZE_VERSION`, `CONTROLLER_GEN_VERSION`, `GOLANGCI_LINT_VERSION`, `GOCYCLO_VERSION` | [`Makefile`](../../Makefile), each under a `# renovate:` comment | the Makefile custom regex manager; minor and patch automerge, major needs review |
 | gosec, and the `golang.org/x/tools` it is built with | [`hack/tools/go.mod`](../../hack/tools/go.mod) | Renovate's gomod manager, restricted to those two by package rules: gosec in a pull request of its own, `golang.org/x/*` inside the Go version pull request; minor and patch automerge |
+| `conventional-changelog-conventionalcommits`, held below 10 | [`package.json`](../../package.json) | Renovate's npm manager, capped by `allowedVersions: "<10"` in [`renovate.json`](../../renovate.json); the cap comes off by hand, for the reason in [the release tooling section](#the-release-tooling-is-checked-before-the-merge) |
 | `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the four above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
 | The rclone image used by clone Jobs | the chart's [`values.yaml`](../../deploy/helm/stackit-s3-provisioner/values.yaml), and `DefaultCloneImage` in [`internal/controller/clone.go`](../../internal/controller/clone.go) as the fallback | Renovate, both of them: the chart value through the `helm-values` manager, `DefaultCloneImage` through a custom regex manager that exists to keep the fallback in step with the chart tag. The Makefile deliberately reads the image out of the rendered chart rather than pinning it a third time |
 
@@ -190,10 +217,12 @@ The other pinned versions, none of which is a Go version:
 
 - **A stale generated CRD merges green**, and the gate that catches it runs after the image is
   pushed — the two properties above, in one sentence.
-- **No pull-request job exercises semantic-release.** Renovate automerges minor and patch bumps of
-  [`package.json`](../../package.json) once the ten pull-request jobs pass, and none of them runs
-  `npx semantic-release`. A bump that breaks the release step shows up only as a red Semantic
-  Release job on `main`, after the merge, and holds back every release until it is fixed.
+- **The Release Tooling Check covers analysis and notes, not publishing.** It never calls
+  `@semantic-release/github` or `@semantic-release/git`, because both need a token with write access
+  and a real tag. A bump that breaks authentication, the GitHub release or the badge commit still
+  shows up only as a red Semantic Release job on `main`, after the merge.
+- **Releases v1.5.3 to v1.19.15 keep their empty notes.** The fix applies to the next release on;
+  nothing rewrites the notes of the 71 releases already published.
 - **Nothing type-checks the build-tagged suites**, because every lint and vet target is untagged.
   The consequence for a contributor is a manual `go vet -tags integration ./...`
   ([testing.md](testing.md#what-is-wrong-today-and-what-this-page-could-not-verify)).

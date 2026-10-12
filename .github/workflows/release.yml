@@ -303,6 +303,23 @@ jobs:
         if: always()
         run: kind delete cluster --name stackit-s3-provisioner-test || true
 
+  release-tooling-check:
+    name: Release Tooling Check
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Same Node line as the Semantic Release job, so both load the same plugins.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "lts/*"
+
+      - name: Render release notes with the installed release tooling
+        run: make release-notes-check
+
   linter:
     name: Code Linting
     runs-on: self-hosted
@@ -785,7 +802,7 @@ jobs:
 
   semantic-release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, unit-tests, integration-tests, e2e-tests, coverage-report]
+    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, unit-tests, integration-tests, e2e-tests, coverage-report, release-tooling-check]
     name: Semantic Release
     runs-on: self-hosted
     permissions:
