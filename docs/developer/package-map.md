@@ -97,6 +97,7 @@ deploy/helm/stackit-s3-provisioner/   the chart — the supported install path
   templates/servicemonitor.yaml serviceaccount.yaml clusterrolebinding.yaml _helpers.tpl
 
 hack/e2ecleanup/            sweep for cloud resources a crashed cloud e2e run left behind
+hack/tools/                 a separate Go module that only pins gosec for `make gosec`
 test/integration/           envtest, build tag `integration`
 test/e2e/                   Kind, build tag `e2e`
 test/helm/                  chart render assertions, build tag `helm`
@@ -312,6 +313,12 @@ e2e-stackit-sweep`. It finds buckets and credentials groups whose names carry th
 the bootstrap group and its key live in the cloud while the only copy of the secret lives in a Secret
 inside the Kind cluster, so deleting the cluster orphans a fully privileged, still-valid S3 key. Never
 point it with `-admin` at a project that also hosts a real operator deployment.
+
+[`hack/tools/go.mod`](../../hack/tools/go.mod) is a module of its own, not a package of this one: it
+holds no Go file, only a `tool` directive for gosec and gosec's dependency graph. `make gosec` builds
+the scanner from it, and a nested module is outside `./...`, so no build, lint or test target of the
+root module sees it. Why gosec is built this way rather than installed at a tag is
+[build-and-release.md](build-and-release.md#gosec-is-built-from-a-tool-module).
 
 The test tree, with the build tag each suite hides behind:
 

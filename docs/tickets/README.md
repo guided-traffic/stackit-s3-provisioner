@@ -26,12 +26,13 @@ its reasoning to.
 
 ## Open work
 
-Four live tickets, none approved for implementation. Three carry **2026-09-19** on the file itself,
-the date they were raised or last refined; 010 is older than its file — it was open question Q2 of the
+Five live tickets, none approved for implementation. Three carry **2026-09-19** on the file itself,
+the date they were raised or last refined; 011 carries **2026-09-21**, the day the incident behind it
+was investigated; 010 is older than its file — it was open question Q2 of the
 feasibility findings on **2026-06-30** and was given a file on 2026-09-19, because seven statements
 across five durable pages now say "unknown" in the place its answer belongs — two of them as an
 instruction to somebody standing in the provider's portal. States below are judged from each file's
-own answered and unanswered questions on 2026-09-19.
+own answered and unanswered questions on 2026-09-19, and for 011 on 2026-09-21.
 
 | Ticket | State | What it covers |
 | --- | --- | --- |
@@ -39,6 +40,7 @@ own answered and unanswered questions on 2026-09-19.
 | [008 — decide bucket existence with a per-bucket read](008-decide-bucket-existence-with-a-per-bucket-read.md) | Design complete: all three questions answered, not approved for implementation | Every existence question is answered today by listing all buckets of the project and scanning the result: one project-wide listing per question, unverified pagination, and an answer that cannot be definitive — a listing that came back short is indistinguishable from a real absence, which is exactly what teardown gates the data-loss guard on. The vanished-bucket guard ([ADR 0015](../adr/0015-a-provisioned-bucket-is-never-re-created-implicitly.md)) added the per-bucket read and uses it for itself only; this converts the remaining callers, and that record names the teardown case as still open. |
 | [009 — migrate off the deprecated `objectstorage` package](009-migrate-off-the-deprecated-objectstorage-package.md) | Survey complete and two behaviour changes measured; **five questions open (Q1–Q5)**, not approved for implementation | The provider marked the top-level `objectstorage` package of its Go SDK deprecated for removal after **2026-09-30** — the only forward-dated commitment in this repository that somebody else made. The pinned version keeps compiling past that date; what expires is the ability to *move*, because the first SDK update afterwards becomes a migration instead of a version bump. One file imports it and no SDK type crosses the package boundary, so the move itself is small — the cost sits in the target package's stricter behaviour: it rejects a configured region, and that failure is structurally invisible to the offline suite. |
 | [010 — name the minimal StackIT role for the operator](010-name-the-minimal-stackit-role-for-the-operator.md) | Nothing to design; **the answer is not in this repository** and four questions (Q1–Q4) wait on it. Not approved for implementation | The service-account key is the operator's entire authority over the provider, and only its *scope* is specified — project level, never organisation level ([ADR 0005 D5](../adr/0005-the-operator-serves-one-project-in-one-region.md)). Least privilege inside the project is unnamed, so an installation reaches for a role that obviously works, which in practice means project owner, and a leaked key is then authority over the whole project rather than over its object storage. The ticket enumerates the twelve control-plane operations a role has to cover and proves a candidate with a reduced service account; the catalogue it is matched against comes from the provider. |
+| [011 — the cold-start sweep stays under the provider rate limit](011-the-cold-start-sweep-stays-under-the-provider-rate-limit.md) | Evidence complete, four options designed and judged, **favourite named but the decision not taken**; three questions open (Q1–Q3), not approved for implementation | On 2026-09-21 the first reconcile sweep after an operator upgrade drew the provider's IP-level rate limit while the provider was healthy: three `Bucket`s failed, the circuit breaker held nine more, and all twelve reported recovery 63 seconds later. The sweep travels through no pacing — [ADR 0013](../adr/0013-a-provider-outage-is-held-fleet-wide.md) D9 paces retries and states an exemption for watch-driven reconciles that is in fact a framework property, not a choice. A pass costs nine control-plane requests, five of them the identical read of the same bucket. The ticket lays out four options from removing the duplicates to a token bucket in the client, and carries two latent defects it deliberately leaves to their own records. |
 
 ---
 

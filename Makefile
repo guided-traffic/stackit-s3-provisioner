@@ -108,11 +108,16 @@ test-helm-render: ## Render the Helm chart and assert on the user-facing RBAC ob
 
 ##@ Security
 
+# gosec is built from its own module in hack/tools rather than installed at a
+# release tag: its golang.org/x/tools must be able to read the export data of
+# the Go toolchain in use, and a gosec release can lag a Go release. The tool
+# module pins gosec and lets Renovate move golang.org/x/tools together with the
+# Go version. Rebuilt on every run, so a stale binary on PATH is never used.
 .PHONY: gosec
 gosec: ## Run gosec security scan.
 	@echo "Running gosec security scan..."
-	@which gosec > /dev/null || (echo "Installing gosec..." && go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION))
-	GOFLAGS="-buildvcs=false" gosec ./...
+	go -C hack/tools build -o $(GOSEC) github.com/securego/gosec/v2/cmd/gosec
+	GOFLAGS="-buildvcs=false" $(GOSEC) ./...
 
 .PHONY: vuln
 vuln: ## Check for vulnerabilities.
@@ -292,6 +297,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+GOSEC ?= $(LOCALBIN)/gosec
 
 ## Tool Versions
 # renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
@@ -304,8 +310,6 @@ ENVTEST_VERSION ?= release-0.24
 GOLANGCI_LINT_VERSION ?= v2.14.0
 # renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
-# renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
-GOSEC_VERSION ?= v2.29.0
 
 # Cyclomatic complexity threshold (recommended: 10-15)
 CYCLO_THRESHOLD ?= 15
