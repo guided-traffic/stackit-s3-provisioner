@@ -228,6 +228,16 @@
       "automerge": true
     },
     {
+      "description": "Hold conventional-changelog-conventionalcommits below 10. From 10.0.0 the preset needs conventional-changelog-writer 9, while @semantic-release/release-notes-generator 14.1.1 (the newest on 2026-10-12) still depends on writer ^8: with 10.2.1 and 10.3.0 every release from v1.5.3 to v1.19.15 shipped notes without a single entry, and 10.4.1 failed the release outright with 'Missing helper'. Lift this rule once release-notes-generator depends on writer 9; the Release Tooling Check job then proves the combination on the pull request",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "conventional-changelog-conventionalcommits"
+      ],
+      "allowedVersions": "<10"
+    },
+    {
       "description": "npm: require manual review for major updates",
       "matchManagers": [
         "npm"
