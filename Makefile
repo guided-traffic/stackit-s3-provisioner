@@ -314,7 +314,7 @@ GOSEC ?= $(LOCALBIN)/gosec
 # renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
 KUSTOMIZE_VERSION ?= v5.8.3
 # renovate: datasource=go depName=sigs.k8s.io/controller-tools/cmd/controller-gen
-CONTROLLER_GEN_VERSION ?= v0.21.0
+CONTROLLER_GEN_VERSION ?= v0.23.0
 # renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest
 ENVTEST_VERSION ?= release-0.24
 # renovate: datasource=go depName=github.com/golangci/golangci-lint/v2/cmd/golangci-lint
