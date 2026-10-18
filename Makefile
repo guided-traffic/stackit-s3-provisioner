@@ -318,7 +318,7 @@ CONTROLLER_GEN_VERSION ?= v0.23.0
 # renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest
 ENVTEST_VERSION ?= release-0.24
 # renovate: datasource=go depName=github.com/golangci/golangci-lint/v2/cmd/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.14.0
+GOLANGCI_LINT_VERSION ?= v2.15.0
 # renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
 
