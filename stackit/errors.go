@@ -36,9 +36,10 @@ import (
 // by status code alone.
 //
 // Note that oapierror.Model is NOT a usable discriminator. The SDK decodes error
-// bodies into objectstorage.ErrorMessage, which only has a Detail field, so the
-// authorization gateway's differently shaped JSON decodes "successfully" into an
-// empty struct. Only the raw body tells the two apart.
+// bodies into objectstorage.ErrorMessage, which requires a detail property, so
+// the authorization gateway's differently shaped JSON fails to decode and leaves
+// Model nil — exactly as an intermediary's HTML page does. Only the raw body
+// tells the two apart.
 
 // apiAnswer reports whether err carries an answer from the provider — a
 // GenericOpenAPIError whose body is valid JSON — and returns its status code.

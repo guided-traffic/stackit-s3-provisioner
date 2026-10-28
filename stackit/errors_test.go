@@ -1,10 +1,13 @@
 package stackit
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stackitcloud/stackit-sdk-go/core/oapierror"
@@ -106,10 +109,10 @@ func TestIsServiceNotEnabled(t *testing.T) {
 }
 
 // TestModelIsNotADiscriminator documents why errors.go keys off the raw body and
-// not oapierror.Model: the SDK decodes every error body into ErrorMessage, which
-// only knows a Detail field, so the authorization gateway's differently shaped
-// JSON decodes into an empty struct without failing. A Model-based check would
-// therefore misread a real 403 as unstructured.
+// not oapierror.Model: the SDK decodes error bodies into ErrorMessage, which
+// requires a detail property, so the authorization gateway's differently shaped
+// JSON fails to decode and leaves Model nil. A Model-based check would therefore
+// misread a real 403 as unstructured.
 func TestModelIsNotADiscriminator(t *testing.T) {
 	// Both are genuine API answers; only one populates Detail.
 	forbidden := apiErr(http.StatusForbidden, bodyForbidden)
@@ -129,5 +132,45 @@ func TestModelIsNotADiscriminator(t *testing.T) {
 	}
 	if !isServiceNotEnabled(notEnabled) {
 		t.Error("structured 404 must be the not-enabled answer")
+	}
+}
+
+// TestDecodeFailureIsNotARefusal pins down how a 200 the client cannot decode is
+// classified. The versioned SDK package validates required properties while
+// decoding, so a success body missing one becomes a GenericOpenAPIError with
+// status 200 and a valid JSON body. That is an answer from the provider, but not
+// a refusal: it must stay non-definitive (ADR 0012 D3), and EnsureService must
+// not escalate the failed read into an EnableService write.
+func TestDecodeFailureIsNotARefusal(t *testing.T) {
+	var writes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writes.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// GetServiceStatus without the required "scope" property.
+		_, _ = io.WriteString(w, `{"project":"p1"}`)
+	}))
+	defer srv.Close()
+
+	c, err := NewClientWithEndpoint("p1", RegionEU01, srv.URL)
+	if err != nil {
+		t.Fatalf("NewClientWithEndpoint: %v", err)
+	}
+	err = c.EnsureService(context.Background())
+	if err == nil {
+		t.Fatal("EnsureService decoded a body missing a required property")
+	}
+	if got := StatusCode(err); got != http.StatusOK {
+		t.Errorf("StatusCode = %d, want 200 (err: %v)", got, err)
+	}
+	if ProviderRefused(err) {
+		t.Errorf("a decode failure must not be a definitive refusal: %v", err)
+	}
+	if isServiceNotEnabled(err) {
+		t.Errorf("a decode failure must not read as service-not-enabled: %v", err)
+	}
+	if n := writes.Load(); n != 0 {
+		t.Errorf("EnsureService made %d write(s) after a failed read", n)
 	}
 }

@@ -53,14 +53,6 @@ linters:
         linters:
           - errcheck
           - goconst
-      # The StackIT objectstorage top-level package is deprecated until 2026-09-30;
-      # migration to the versioned sub-package is deliberately deferred (see CLAUDE.md
-      # SDK-Fallstricke). Suppress only this specific deprecation in the wrapper, so any
-      # other deprecation still surfaces. Remove this rule once the migration lands.
-      - path: stackit/client\.go
-        text: "SA1019"
-        linters:
-          - staticcheck
 
 formatters:
   enable:

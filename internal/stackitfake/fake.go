@@ -391,6 +391,7 @@ const (
 	fieldProject     = "project"
 	fieldDisplayName = "displayName"
 	fieldBucket      = "bucket"
+	fieldKeyID       = "keyId"
 )
 
 // --- control plane ---------------------------------------------------------
@@ -492,13 +493,13 @@ func (s *Server) handleService(w http.ResponseWriter, r *http.Request) {
 			apiError(w, http.StatusNotFound, "object storage not enabled")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID})
+		writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID, "scope": "PUBLIC"})
 	case http.MethodPost:
 		if s.cpFail(w, "EnableService") {
 			return
 		}
 		s.serviceEnabled = true
-		writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID})
+		writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID, "scope": "PUBLIC"})
 	default:
 		apiError(w, http.StatusMethodNotAllowed, r.Method)
 	}
@@ -609,7 +610,7 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	delete(s.groups, id)
-	writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID})
+	writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID, "credentialsGroupId": id})
 }
 
 func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
@@ -658,7 +659,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	g.Keys = append(g.Keys, ak)
 	writeJSON(w, http.StatusOK, map[string]any{
 		fieldProject:      s.ProjectID,
-		"keyId":           ak.KeyID,
+		fieldKeyID:        ak.KeyID,
 		"accessKey":       ak.AccessKeyID,
 		"secretAccessKey": ak.SecretAccessKey,
 		fieldDisplayName:  ak.AccessKeyID,
@@ -683,7 +684,7 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request, keyID s
 	for i, k := range g.Keys {
 		if k.KeyID == keyID {
 			g.Keys = append(g.Keys[:i], g.Keys[i+1:]...)
-			writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID})
+			writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID, fieldKeyID: keyID})
 			return
 		}
 	}
@@ -705,7 +706,7 @@ func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	list := make([]any, 0, len(g.Keys))
 	for _, k := range g.Keys {
-		list = append(list, map[string]any{"keyId": k.KeyID, fieldDisplayName: k.AccessKeyID, "expires": ""})
+		list = append(list, map[string]any{fieldKeyID: k.KeyID, fieldDisplayName: k.AccessKeyID, "expires": ""})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{fieldProject: s.ProjectID, "accessKeys": list})
 }
