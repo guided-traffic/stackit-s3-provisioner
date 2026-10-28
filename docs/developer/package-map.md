@@ -97,6 +97,8 @@ deploy/helm/stackit-s3-provisioner/   the chart — the supported install path
   templates/servicemonitor.yaml serviceaccount.yaml clusterrolebinding.yaml _helpers.tpl
 
 hack/e2ecleanup/            sweep for cloud resources a crashed cloud e2e run left behind
+hack/tools/                 a separate Go module that only pins gosec for `make gosec`
+hack/release-notes-check.mjs  renders release notes with the installed semantic-release plugins
 test/integration/           envtest, build tag `integration`
 test/e2e/                   Kind, build tag `e2e`
 test/helm/                  chart render assertions, build tag `helm`
@@ -133,7 +135,7 @@ The build and packaging files at the root, none of which any other section of th
 | [`.releaserc.json`](../../.releaserc.json), [`package.json`](../../package.json) | semantic-release: conventional-commit analysis on `main`, GitHub release, and a commit that carries the coverage badge JSON. The `package.json` exists only to pin those Node dev-dependencies; no JavaScript ships. |
 | [`LICENSE`](../../LICENSE) | Apache 2.0. |
 | [`Chart.yaml`](../../deploy/helm/stackit-s3-provisioner/Chart.yaml) | Chart metadata. `version` and `appVersion` are both `0.1.0` in git and are meant to stay that way: [`build.yml`](../../.github/workflows/build.yml) rewrites both from the release tag with `sed` before packaging, so bumping them by hand achieves nothing. |
-| [`.github/workflows/`](../../.github/workflows/) | `release.yml` runs on push and pull request to `main` — lint, gosec, vuln, cyclo, unit and envtest coverage, chart render, Kind e2e, and the semantic-release step. `build.yml` runs only when a GitHub release is published — image build, chart package and GitHub Pages publish, plus the generated-code drift check. `renovate.yml` runs the dependency bot. What each executes, in detail, is in [testing.md](testing.md#what-ci-runs); the triggers, the version cut and the pinned toolchain are in [build-and-release.md](build-and-release.md). |
+| [`.github/workflows/`](../../.github/workflows/) | `release.yml` runs on push and pull request to `main` — lint, gosec, vuln, cyclo, unit and envtest coverage, chart render, Kind e2e, a check of the release tooling, and the semantic-release step. `build.yml` runs only when a GitHub release is published — image build, chart package and GitHub Pages publish, plus the generated-code drift check. `renovate.yml` runs the dependency bot. What each executes, in detail, is in [testing.md](testing.md#what-ci-runs); the triggers, the version cut and the pinned toolchain are in [build-and-release.md](build-and-release.md). |
 
 ## `stackit/` — the provider client
 
@@ -312,6 +314,17 @@ e2e-stackit-sweep`. It finds buckets and credentials groups whose names carry th
 the bootstrap group and its key live in the cloud while the only copy of the secret lives in a Secret
 inside the Kind cluster, so deleting the cluster orphans a fully privileged, still-valid S3 key. Never
 point it with `-admin` at a project that also hosts a real operator deployment.
+
+[`hack/tools/go.mod`](../../hack/tools/go.mod) is a module of its own, not a package of this one: it
+holds no Go file, only a `tool` directive for gosec and gosec's dependency graph. `make gosec` builds
+the scanner from it, and a nested module is outside `./...`, so no build, lint or test target of the
+root module sees it. Why gosec is built this way rather than installed at a tag is
+[build-and-release.md](build-and-release.md#gosec-is-built-from-a-tool-module).
+
+[`hack/release-notes-check.mjs`](../../hack/release-notes-check.mjs) is the only JavaScript in the
+repository and ships nowhere: `make release-notes-check` runs it in CI to prove, before a merge, that
+the installed semantic-release plugins still render release notes
+([build-and-release.md](build-and-release.md#the-release-tooling-is-checked-before-the-merge)).
 
 The test tree, with the build tag each suite hides behind:
 

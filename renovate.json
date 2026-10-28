@@ -111,6 +111,24 @@
       ]
     },
     {
+      "description": "Tool module hack/tools exists only to build gosec, so its go.mod is gosec's own dependency graph and Renovate leaves it alone - except for the two entries in the next rule",
+      "matchFileNames": [
+        "hack/tools/go.mod"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Tool module hack/tools: track gosec itself, and golang.org/x/* so that the Go version group moves golang.org/x/tools with each Go release. gosec's importer comes from golang.org/x/tools and must read the export data of the Go toolchain CI uses; a gosec release can lag a Go release (Go 1.27.2 and gosec v2.29.0). go.mod marks a tool's module as indirect, so gosec is an indirect dependency here. No matchUpdateTypes: enabled is decided per dependency before any update is known, so a rule filtered by update type cannot re-enable one. Majors stay off through the indirect rule below",
+      "matchFileNames": [
+        "hack/tools/go.mod"
+      ],
+      "matchPackageNames": [
+        "github.com/securego/gosec/v2",
+        "/^golang\\.org\\/x\\//"
+      ],
+      "enabled": true
+    },
+    {
       "description": "Go modules: never open major PRs for indirect deps. Module-path bumps (/v2 -> /v3) cannot be auto-applied without a direct importer, so go mod tidy resets the indirect line to the MVS minimum and Renovate keeps re-opening the same downgrade PR. Major updates land via the parent direct dependency.",
       "matchManagers": [
         "gomod"
@@ -188,6 +206,41 @@
       "matchManagers": [
         "helm-values",
         "helmv3"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false,
+      "labels": [
+        "dependencies",
+        "major-update"
+      ]
+    },
+    {
+      "description": "npm (package.json, semantic-release and its plugins): automerge minor and patch updates. Without this rule every npm pull request waits for a manual merge, and because branchConcurrentLimit counts open branches, a few of them waiting is enough to hold back every other update",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Hold conventional-changelog-conventionalcommits below 10. From 10.0.0 the preset needs conventional-changelog-writer 9, while @semantic-release/release-notes-generator 14.1.1 (the newest on 2026-10-12) still depends on writer ^8: with 10.2.1 and 10.3.0 every release from v1.5.3 to v1.19.15 shipped notes without a single entry, and 10.4.1 failed the release outright with 'Missing helper'. Lift this rule once release-notes-generator depends on writer 9; the Release Tooling Check job then proves the combination on the pull request",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "conventional-changelog-conventionalcommits"
+      ],
+      "allowedVersions": "<10"
+    },
+    {
+      "description": "npm: require manual review for major updates",
+      "matchManagers": [
+        "npm"
       ],
       "matchUpdateTypes": [
         "major"
@@ -317,7 +370,7 @@
       "versioningTemplate": "semver"
     },
     {
-      "description": "Update Go version in release-template.hbs badge (major.minor only)",
+      "description": "Update Go version in release-template.hbs badge (major.minor only). Loose versioning, because semver rejects the two-part 1.26 as invalid-value and the badge was silently never updated",
       "customType": "regex",
       "managerFilePatterns": [
         "/^\\.github/release-template\\.hbs$/"
@@ -327,7 +380,7 @@
       ],
       "depNameTemplate": "golang",
       "datasourceTemplate": "golang-version",
-      "versioningTemplate": "semver",
+      "versioningTemplate": "loose",
       "extractVersionTemplate": "^(?<version>\\d+\\.\\d+)"
     },
     {

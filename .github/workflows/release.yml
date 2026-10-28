@@ -19,7 +19,7 @@ permissions:
   issues: write         # For issue comments
 
 env:
-  GO_VERSION: '1.27.1'
+  GO_VERSION: '1.27.3'
   KUBERNETES_VERSION: '1.33.4'
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -93,9 +93,9 @@ jobs:
 
       - name: Create Kind cluster
         id: kind-cluster
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@v1.15.1
         with:
-          version: v0.30.0
+          version: v0.33.0
           node_image: kindest/node:v${{ env.KUBERNETES_VERSION }}
           cluster_name: stackit-s3-provisioner-test
           wait: 300s
@@ -225,7 +225,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5
         with:
-          version: 'v4.2.4'
+          version: 'v4.3.1'
 
       - name: Render-check Helm chart
         run: make test-helm-render
@@ -302,6 +302,26 @@ jobs:
       - name: Cleanup Kind cluster
         if: always()
         run: kind delete cluster --name stackit-s3-provisioner-test || true
+
+  release-tooling-check:
+    name: Release Tooling Check
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Same Node line as the Semantic Release job, so both load the same plugins.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "lts/*"
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Render release notes with the installed release tooling
+        run: make release-notes-check
 
   linter:
     name: Code Linting
@@ -785,7 +805,7 @@ jobs:
 
   semantic-release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, unit-tests, integration-tests, e2e-tests, coverage-report]
+    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, unit-tests, integration-tests, e2e-tests, coverage-report, release-tooling-check]
     name: Semantic Release
     runs-on: self-hosted
     permissions:
@@ -794,11 +814,23 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
+      # GitHub App installation token (guided-traffic-automation), not
+      # GITHUB_TOKEN: a release created with GITHUB_TOKEN does not start the
+      # "Release Docker & Helm" workflow. Scoped to this repository; expires
+      # after 1 h and is revoked at the end of the job.
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write  # tag, release, @semantic-release/git commit
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          token: ${{ secrets.BOT_PAT }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Download coverage badge
         uses: actions/download-artifact@v8
@@ -829,5 +861,5 @@ jobs:
 
       - name: Release
         env:
-          GITHUB_TOKEN: ${{ secrets.BOT_PAT }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: npx semantic-release
