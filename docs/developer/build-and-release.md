@@ -68,7 +68,7 @@ Two properties of that multi-platform build are worth knowing:
   `release.yml` builds `linux/amd64` alone, because `load: true` cannot import an index into the
   Docker daemon; the SBOM and the Docker Scout step in `build.yml` likewise resolve the tag to the
   runner's architecture. Both variants are built from one source tree and one
-  `distroless/static-debian12` base, so the finding sets are expected to agree — but that is an
+  `distroless/static-debian13` base, so the finding sets are expected to agree — but that is an
   expectation, not something CI verifies.
 
 `release-helm-gh`, which needs `build`, checks the generated artefacts (below), rewrites the chart's
@@ -259,10 +259,14 @@ The other pinned versions, none of which is a Go version:
 | gosec, and the `golang.org/x/tools` it is built with | [`hack/tools/go.mod`](../../hack/tools/go.mod) | Renovate's gomod manager, restricted to those two by package rules: gosec in a pull request of its own, `golang.org/x/*` inside the Go version pull request; minor and patch automerge |
 | `conventional-changelog-conventionalcommits`, held below 10 | [`package.json`](../../package.json) | Renovate's npm manager, capped by `allowedVersions: "<10"` in [`renovate.json`](../../renovate.json); the cap comes off by hand, for the reason in [the release tooling section](#the-release-tooling-is-checked-before-the-merge) |
 | `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the five above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
+| The runtime base `gcr.io/distroless/static-debian13:nonroot` | [`Containerfile`](../../Containerfile) | nobody, in two ways. The `nonroot` tag floats, so each build takes whatever distroless last published for it, with no digest Renovate could move. And the `-debianNN` suffix moves by hand: distroless builds only the current Debian release and stopped building debian12 on 2026-08-11, after which `static-debian12:nonroot` still pulled without error but kept the package set it had then. Up to v1.20.1 every image shipped the outdated `ca-certificates` and `tzdata` that way (`DLA-4845-1`, `DLA-4792-1`, `DLA-4854-1`). Check the distroless README for the current release before relying on the suffix |
 | The rclone image used by clone Jobs | the chart's [`values.yaml`](../../deploy/helm/stackit-s3-provisioner/values.yaml), and `DefaultCloneImage` in [`internal/controller/clone.go`](../../internal/controller/clone.go) as the fallback | Renovate, both of them: the chart value through the `helm-values` manager, `DefaultCloneImage` through a custom regex manager that exists to keep the fallback in step with the chart tag. The Makefile deliberately reads the image out of the rendered chart rather than pinning it a third time |
 
 ## What is wrong today
 
+- **A fixed base image reaches users only with an unrelated release.** The base is not pinned to a
+  digest, so a distroless rebuild changes nothing in the tree. No pull request and no release follow
+  from it, and the fix ships only when some other `fix:` or `feat:` commit cuts the next release.
 - **The Release Tooling Check covers analysis and notes, not publishing.** It never calls
   `@semantic-release/github` or `@semantic-release/git`, because both need a token with write access
   and a real tag. A bump that breaks authentication, the GitHub release or the badge commit still
