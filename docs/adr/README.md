@@ -115,6 +115,12 @@ The **State** column is a coarse reading aid, last trued up on 2026-09-20. Each 
 |---|---|---|
 | [0017](0017-a-reconcile-that-changes-nothing-is-silent.md) | A reconcile that changes nothing is silent — no `Info` line, no event — and says so once after a process start; `status.lastVerifiedTime` is the per-object heartbeat | Implemented offline; not run against a live cluster |
 
+### Provider interface
+
+| ADR | Decision (one line) | State |
+|---|---|---|
+| [0018](0018-the-control-plane-speaks-api-version-2-and-an-undecodable-answer-is-held.md) | The control plane speaks the provider's Object Storage API version 2 with the region per call, and an answer the client cannot decode is a failure to verify, never a verdict | Implemented and verified live on 2026-10-28, except the answer to enabling the service, which the test project never needed |
+
 ## Related documents
 
 * [README.md](../../README.md) — the front page and the single reference table

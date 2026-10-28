@@ -258,7 +258,7 @@ from the bucket's own path-style URL rather than hardcoded, so it follows the re
 | Host | Used for | Where it comes from |
 | --- | --- | --- |
 | `accounts.stackit.cloud` | Token exchange for the key flow | `credentials.tokenEndpoint` in the key file |
-| `object-storage.api.stackit.cloud` | Every control-plane call | SDK default (`stackit-sdk-go/services/objectstorage` v1.9.1) |
+| `object-storage.api.stackit.cloud` | Every control-plane call | SDK default (`stackit-sdk-go/services/objectstorage/v2api`, v1.12.0) |
 | `object.storage.eu01.onstackit.cloud` &nbsp;`# example` | Every data-plane call: policies, tags, emptiness checks, size measurement | Parsed from the bucket's `urlPathStyle` (`BucketConnInfo` in [stackit/client.go](../../stackit/client.go)); the shown value is the eu01 one |
 
 A token fetch is a `POST` and is deliberately **not** retried by the operator's retry transport,

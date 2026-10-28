@@ -285,6 +285,19 @@ The full set of provider quirks, and which were verified when, is
 [stackit-api.md](stackit-api.md); the fake is one consumer of that list, not its
 home.
 
+**Every control-plane answer is a complete response model.** The SDK's `v2api`
+package checks the required properties of each response while decoding
+([stackit-api.md](stackit-api.md#pitfalls), pitfall 15), so a handler that omits
+one turns every call through it into an error carrying status `200` — the first
+symptom is usually every reconciler test failing at `EnsureService`. When you add
+or change a handler, take the property list from `requiredProperties` in the
+model's `UnmarshalJSON` in the SDK's `objectstorage/v2api` package, and echo
+identifiers back as the real API does (`keyId` on a key deletion,
+`credentialsGroupId` on a group deletion). Error bodies are exempt in practice:
+`apiError` writes `{"message": …}`, which fails to decode into `ErrorMessage`
+(it requires `detail`), but status and raw body are set before that point, and
+they are all the classification reads.
+
 ### The injection API
 
 | Helper | Use |
