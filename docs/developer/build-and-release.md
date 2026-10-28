@@ -59,7 +59,11 @@ Two properties of that multi-platform build are worth knowing:
   The final stage is `distroless/static`, which executes no command, so no `RUN` ever needs QEMU.
   Dropping the `--platform` prefix would silently move `go build` under emulation for every
   non-native platform. That prefix is also why `make docker-build` sets `DOCKER_BUILDKIT=1`: the
-  classic builder cannot parse it.
+  classic builder cannot parse it. BuildKit in turn needs the buildx CLI plugin, which the
+  self-hosted runner image does not ship, so the `E2E Tests` job of `release.yml` installs it with
+  `docker/setup-buildx-action` and the `docker` driver; that driver builds inside the daemon, where
+  the job's following `docker save` finds the image. A local `make docker-build` needs the plugin
+  as well.
 - **Only the amd64 variant is scanned and catalogued.** The `container-malware-scan` job of
   `release.yml` builds `linux/amd64` alone, because `load: true` cannot import an index into the
   Docker daemon; the SBOM and the Docker Scout step in `build.yml` likewise resolve the tag to the
