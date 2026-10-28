@@ -33,7 +33,7 @@ and `make test-unit` — are picked apart in that page's
 | `make cyclo` | gocyclo, failing above `CYCLO_THRESHOLD ?= 15` `# default` | Before splitting a function you just grew |
 | `make gosec` | builds gosec from [`hack/tools/`](../../hack/tools/go.mod), then runs it over the whole tree | Same scan CI runs |
 | `make vuln` | govulncheck over the whole tree | Same scan CI runs |
-| `make generate-all` | `manifests`, `generate`, `sync-helm-crd` | **After any change under `api/v1/`** — see the release gate below |
+| `make generate-all` | `manifests`, `generate`, `sync-helm-crd` | **After any change under `api/v1/`** — see the merge gate below |
 
 `make lint` and `make vet` are **untagged**, and [`.golangci.yml`](../../.golangci.yml) sets no
 `build-tags`, so neither ever compiles a suite behind a build tag. `go vet -tags integration ./...`
@@ -125,19 +125,26 @@ helper`) and passes at 9.3.1.
 `.github/badges/coverage.json` is therefore a generated file that lives in git: written by CI,
 committed by semantic-release, and never hand-edited.
 
-### `make generate-all` is a release gate
+### `make generate-all` is a merge gate
 
-The chart-publishing job runs `make generate-all` and then fails if the working tree is dirty:
+The `Code Linting` job of `release.yml` — a required check on `main` — runs `make generate-all` after
+`make lint` and fails if that changed a tracked file or added an untracked one:
 
-> `::error::Generated CRDs / DeepCopy / Helm chart CRD are out of sync with api/v1/.`
+> `::error::Generated CRDs / DeepCopy / Helm chart CRD are out of sync with the committed tree.`
 
 So **after any change under [`api/v1/`](../../api/v1/), run `make generate-all` and commit its
-output**, or the release fails. Two properties of that gate are worth knowing before you rely on it:
+output**, or the pull request stays red. Two things follow from that gate:
 
-- It is the **only** check for generated-code drift. `release.yml` has no generate or diff step at
-  all, so a pull request with a stale CRD stays green.
-- It runs **after** the image push, in the job that needs `build`. A release that trips it has
-  already published an image and a GitHub release, and is missing only the chart.
+- **A controller-gen bump from Renovate fails it too.** controller-gen stamps its own version into
+  every CRD it writes (`controller-gen.kubebuilder.io/version`), and the Renovate pull request
+  changes only the pin in the [`Makefile`](../../Makefile). It therefore cannot automerge: someone
+  runs `make generate-all` on its branch and pushes the regenerated CRD and its Helm copy. Before
+  the gate existed, the bump to v0.23.0 merged green on 2026-10-16 with only the Makefile line
+  changed, and every release from v1.19.20 to v1.20.0 then failed to publish its chart — seven
+  releases with an image and a GitHub release but no chart on `gh-pages`.
+- **The chart-publishing job of `build.yml` keeps its own copy of the check**, after the image
+  push. A tree that passed the merge gate should not trip it; it stays as the last line before a
+  chart is published.
 
 ## Toolchain and dependency pins
 
@@ -167,6 +174,24 @@ front page holds no Go literal to bump.
 Renovate additionally groups every `golang.org/x/*` module bump into the same pull request, so
 govulncheck sees a consistent set — in [`go.mod`](../../go.mod) and in the gosec tool module alike,
 which is what the next section depends on.
+
+### A tool binary is named after its pin and its toolchain
+
+The Makefile installs kustomize, controller-gen, setup-envtest, golangci-lint, gocyclo and
+govulncheck into `bin/` as `<tool>-<version>-<go version>`, for example
+`bin/controller-gen-v0.23.0-go1.27.3` (`# example`). A bump of the pin or of the Go toolchain
+changes that name, so the file is missing and
+the next target that needs the tool installs it; a binary from an older pin stays in `bin/`, but no
+target runs it any more. `rm -rf bin` clears the leftovers. The toolchain is part of the name because
+a tool built with an older Go can fail on code that targets a newer one — the gosec section below is
+such a case.
+
+Until 2026-10-28 the binaries had unversioned names and `go-install-tool` installed only when the
+file was absent, so a pin bump never reached a machine that already had the tool, while CI, on fresh
+runners, always used the pin. On a development machine that day controller-gen was v0.21.0 against a
+pin of v0.23.0, and golangci-lint v2.13.1 against v2.15.0. `make cyclo` ran whichever gocyclo was on
+`PATH`, and `make vuln` whichever govulncheck was on `PATH`, installing `@latest` when there was
+none — v1.8.0 on that machine, v1.9.0 on a fresh runner. Both now run the pinned binary from `bin/`.
 
 ### gosec is built from a tool module
 
@@ -230,16 +255,14 @@ The other pinned versions, none of which is a Go version:
 | `ENVTEST_K8S_VERSION = 1.33.0` | [`Makefile`](../../Makefile) | by hand |
 | `k8s.io/kube-openapi`, `k8s.io/utils`, `sigs.k8s.io/json`, each a pseudo-version | [`go.mod`](../../go.mod) | `go mod tidy`, only when a `k8s.io/*` release raises the minimum — Renovate is switched off for these three module paths, for the reason above |
 | `KUBERNETES_VERSION: '1.33.4'` — the kubectl and Kind node image of the e2e job | [`release.yml`](../../.github/workflows/release.yml) | by hand |
-| `KUSTOMIZE_VERSION`, `CONTROLLER_GEN_VERSION`, `GOLANGCI_LINT_VERSION`, `GOCYCLO_VERSION` | [`Makefile`](../../Makefile), each under a `# renovate:` comment | the Makefile custom regex manager; minor and patch automerge, major needs review |
+| `KUSTOMIZE_VERSION`, `CONTROLLER_GEN_VERSION`, `GOLANGCI_LINT_VERSION`, `GOCYCLO_VERSION`, `GOVULNCHECK_VERSION` | [`Makefile`](../../Makefile), each under a `# renovate:` comment | the Makefile custom regex manager; minor and patch automerge, major needs review. A controller-gen bump cannot automerge in practice: it fails the [merge gate](#make-generate-all-is-a-merge-gate) until it is regenerated |
 | gosec, and the `golang.org/x/tools` it is built with | [`hack/tools/go.mod`](../../hack/tools/go.mod) | Renovate's gomod manager, restricted to those two by package rules: gosec in a pull request of its own, `golang.org/x/*` inside the Go version pull request; minor and patch automerge |
 | `conventional-changelog-conventionalcommits`, held below 10 | [`package.json`](../../package.json) | Renovate's npm manager, capped by `allowedVersions: "<10"` in [`renovate.json`](../../renovate.json); the cap comes off by hand, for the reason in [the release tooling section](#the-release-tooling-is-checked-before-the-merge) |
-| `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the four above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
+| `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the five above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
 | The rclone image used by clone Jobs | the chart's [`values.yaml`](../../deploy/helm/stackit-s3-provisioner/values.yaml), and `DefaultCloneImage` in [`internal/controller/clone.go`](../../internal/controller/clone.go) as the fallback | Renovate, both of them: the chart value through the `helm-values` manager, `DefaultCloneImage` through a custom regex manager that exists to keep the fallback in step with the chart tag. The Makefile deliberately reads the image out of the rendered chart rather than pinning it a third time |
 
 ## What is wrong today
 
-- **A stale generated CRD merges green**, and the gate that catches it runs after the image is
-  pushed — the two properties above, in one sentence.
 - **The Release Tooling Check covers analysis and notes, not publishing.** It never calls
   `@semantic-release/github` or `@semantic-release/git`, because both need a token with write access
   and a real tag. A bump that breaks authentication, the GitHub release or the badge commit still

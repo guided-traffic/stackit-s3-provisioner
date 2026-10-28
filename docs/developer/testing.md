@@ -574,7 +574,7 @@ of them `runs-on: self-hosted`:
 | Unit Tests | `make test-unit-coverage` — layers 1 and 2 |
 | Integration Tests (envtest) | `make test-integration-coverage` — layer 3 |
 | E2E Tests | Kind, `make test-helm-render` (layer 8), then `make test-e2e` — layer 6, skeleton mode |
-| Code Linting | `make lint` |
+| Code Linting | `make lint`, then `make generate-all` and a check that it left the tree unchanged ([build-and-release.md](build-and-release.md#make-generate-all-is-a-merge-gate)) |
 | GoSec / Vulnerability Check / Cyclomatic Complexity | `make gosec`, `make vuln`, `make cyclo` (`CYCLO_THRESHOLD ?= 15` `# default`, in the [Makefile](../../Makefile)) |
 | Malware Scan | ClamAV over the source tree |
 | Container Malware Scan | Builds the image from the [Containerfile](../../Containerfile) without pushing it, runs Trivy twice (a table run that fails on `CRITICAL,HIGH` unfixed findings, then a SARIF run kept as an artefact for 30 days), and removes the image again |

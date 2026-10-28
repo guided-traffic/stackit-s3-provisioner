@@ -176,15 +176,11 @@ in two places — it is not:
 | `UsageSpec.UsageEnabled` / `UsageIncludeVersions` / `UsageInterval` | The per-CR measurement request, resolved against the cluster default |
 
 After changing anything in this directory run `make generate-all`, which regenerates the CRD and the
-deepcopy code and copies the CRD into the chart. **The pull-request pipeline will not catch you if
-you skip it.** Verified on 2026-09-19: the drift check — `make generate-all` followed by a failing
-`git diff --quiet` — exists only in
-[`.github/workflows/build.yml`](../../.github/workflows/build.yml), which triggers on
-`release: published`. [`release.yml`](../../.github/workflows/release.yml), the workflow that runs on
-push and pull request to `main`, runs no generate or diff step, and none of its targets (`lint`,
-`gosec`, `vuln`, `cyclo`, `test-unit-coverage`, `test-integration-coverage`, `test-helm-render`,
-`test-e2e`) depends on the generate targets. A stale generated CRD therefore merges green and breaks
-the release.
+deepcopy code and copies the CRD into the chart. **The pull request fails if you skip it**: the
+`Code Linting` job of [`release.yml`](../../.github/workflows/release.yml) runs `make generate-all`
+and fails on any difference to the committed tree, and the chart-publishing job of
+[`build.yml`](../../.github/workflows/build.yml) repeats the check before a chart is published
+([build-and-release.md](build-and-release.md#make-generate-all-is-a-merge-gate)).
 
 ## `cmd/` — the manager binary
 
@@ -441,11 +437,10 @@ so it ends up in `kubectl explain` on every cluster that installs the chart. Wri
 a cluster operator, not for a reviewer, and remember that changing one is a CRD change: it needs
 `make generate-all` and it ships a chart version.
 
-**A stale generated CRD merges green.** Nothing in the pull-request pipeline regenerates or diffs
-the artefacts above, and none of its make targets pulls a generate step in. Forgetting `make
-generate-all` after an `api/v1` change is caught by the release gate, which is to say by the person
-cutting the release rather than by the person who made the change
-([build-and-release.md](build-and-release.md#make-generate-all-is-a-release-gate)).
+**A stale generated CRD fails the pull request.** The `Code Linting` job regenerates the artefacts
+above and fails on any difference to the committed tree, so forgetting `make generate-all` after an
+`api/v1` change is caught by the person who made the change
+([build-and-release.md](build-and-release.md#make-generate-all-is-a-merge-gate)).
 
 **The kustomize path cannot provision.** [`config/manager/manager.yaml`](../../config/manager/manager.yaml)
 passes only `--metrics-bind-address` and `--health-probe-bind-address` and mounts no service-account
