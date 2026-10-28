@@ -55,15 +55,13 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes.
 	$(GOLANGCI_LINT) run --fix
 
 .PHONY: cyclo
-cyclo: ## Run cyclomatic complexity analysis.
+cyclo: gocyclo ## Run cyclomatic complexity analysis.
 	@echo "Running cyclomatic complexity analysis (threshold: $(CYCLO_THRESHOLD))..."
-	@which gocyclo > /dev/null || (echo "Installing gocyclo..." && go install github.com/fzipp/gocyclo/cmd/gocyclo@$(GOCYCLO_VERSION))
-	@gocyclo -over $(CYCLO_THRESHOLD) -ignore "_test.go|zz_generated" . && echo "✅ All functions are below complexity threshold $(CYCLO_THRESHOLD)" || (echo "❌ Functions above complexity threshold $(CYCLO_THRESHOLD) found!" && gocyclo -over $(CYCLO_THRESHOLD) -ignore "_test.go|zz_generated" . && exit 1)
+	@$(GOCYCLO) -over $(CYCLO_THRESHOLD) -ignore "_test.go|zz_generated" . && echo "✅ All functions are below complexity threshold $(CYCLO_THRESHOLD)" || (echo "❌ Functions above complexity threshold $(CYCLO_THRESHOLD) found!" && $(GOCYCLO) -over $(CYCLO_THRESHOLD) -ignore "_test.go|zz_generated" . && exit 1)
 
 .PHONY: cyclo-report
-cyclo-report: ## Show full cyclomatic complexity report (including tests).
-	@which gocyclo > /dev/null || (echo "Installing gocyclo..." && go install github.com/fzipp/gocyclo/cmd/gocyclo@$(GOCYCLO_VERSION))
-	@gocyclo -top 20 .
+cyclo-report: gocyclo ## Show full cyclomatic complexity report (including tests).
+	@$(GOCYCLO) -top 20 .
 
 .PHONY: test
 test: fmt vet envtest ## Run all tests.
@@ -131,10 +129,9 @@ gosec: ## Run gosec security scan.
 	GOFLAGS="-buildvcs=false" $(GOSEC) ./...
 
 .PHONY: vuln
-vuln: ## Check for vulnerabilities.
+vuln: govulncheck ## Check for vulnerabilities.
 	@echo "Checking for vulnerabilities..."
-	@which govulncheck > /dev/null || (echo "Installing govulncheck..." && go install golang.org/x/vuln/cmd/govulncheck@latest)
-	GOFLAGS="-buildvcs=false" govulncheck ./...
+	GOFLAGS="-buildvcs=false" $(GOVULNCHECK) ./...
 
 ##@ Code Generation
 
@@ -170,7 +167,7 @@ generate-all: manifests generate sync-helm-crd ## Regenerate CRD, DeepCopy code,
 
 .PHONY: docker-build
 docker-build: generate-all ## Build docker image with the manager (regenerates CRD and DeepCopy first).
-	docker build -f Containerfile -t ${IMG} .
+	DOCKER_BUILDKIT=1 docker build -f Containerfile -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -304,23 +301,31 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 ## Tool Binaries
-KUSTOMIZE ?= $(LOCALBIN)/kustomize
-CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
-ENVTEST ?= $(LOCALBIN)/setup-envtest
-GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+# Each installed binary carries its pinned version and the Go toolchain that built it in its file
+# name. A bump of either is then a missing file that make installs, and a binary left over from an
+# older pin is never run. gosec needs none of this: it is rebuilt from hack/tools/go.mod on every run.
+TOOLS_GO_VERSION := $(shell go env GOVERSION)
+KUSTOMIZE ?= $(LOCALBIN)/kustomize-$(KUSTOMIZE_VERSION)-$(TOOLS_GO_VERSION)
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_GEN_VERSION)-$(TOOLS_GO_VERSION)
+ENVTEST ?= $(LOCALBIN)/setup-envtest-$(ENVTEST_VERSION)-$(TOOLS_GO_VERSION)
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)-$(TOOLS_GO_VERSION)
+GOCYCLO ?= $(LOCALBIN)/gocyclo-$(GOCYCLO_VERSION)-$(TOOLS_GO_VERSION)
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck-$(GOVULNCHECK_VERSION)-$(TOOLS_GO_VERSION)
 GOSEC ?= $(LOCALBIN)/gosec
 
 ## Tool Versions
 # renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
 KUSTOMIZE_VERSION ?= v5.8.3
 # renovate: datasource=go depName=sigs.k8s.io/controller-tools/cmd/controller-gen
-CONTROLLER_GEN_VERSION ?= v0.21.0
+CONTROLLER_GEN_VERSION ?= v0.23.0
 # renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest
 ENVTEST_VERSION ?= release-0.24
 # renovate: datasource=go depName=github.com/golangci/golangci-lint/v2/cmd/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.14.0
+GOLANGCI_LINT_VERSION ?= v2.15.0
 # renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
+# renovate: datasource=go depName=golang.org/x/vuln/cmd/govulncheck
+GOVULNCHECK_VERSION ?= v1.9.0
 
 # Cyclomatic complexity threshold (recommended: 10-15)
 CYCLO_THRESHOLD ?= 15
@@ -354,12 +359,26 @@ golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
 
-# go-install-tool will 'go install' any package with custom target and target path
+.PHONY: gocyclo
+gocyclo: $(GOCYCLO) ## Download gocyclo locally if necessary.
+$(GOCYCLO): $(LOCALBIN)
+	$(call go-install-tool,$(GOCYCLO),github.com/fzipp/gocyclo/cmd/gocyclo,$(GOCYCLO_VERSION))
+
+.PHONY: govulncheck
+govulncheck: $(GOVULNCHECK) ## Download govulncheck locally if necessary.
+$(GOVULNCHECK): $(LOCALBIN)
+	$(call go-install-tool,$(GOVULNCHECK),golang.org/x/vuln/cmd/govulncheck,$(GOVULNCHECK_VERSION))
+
+# go-install-tool installs package $(2) at version $(3) as the binary $(1). go install names the
+# binary after the package, so it installs into a scratch GOBIN and the binary is moved to $(1).
 define go-install-tool
 @[ -f $(1) ] || { \
 set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
-GOBIN=$(LOCALBIN) go install $${package} ;\
+gobin=$$(mktemp -d) ;\
+GOBIN=$$gobin go install $${package} ;\
+mv $$gobin/* $(1) ;\
+rm -rf $$gobin ;\
 }
 endef

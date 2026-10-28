@@ -22,9 +22,8 @@ are about to take obvious rather than mechanical.
 2. Run `make generate-all`. It regenerates [`config/crd/bases/`](../../config/crd/bases/), the
    DeepCopy code, and syncs the CRD into
    [`deploy/helm/stackit-s3-provisioner/templates/crd.yaml`](../../deploy/helm/stackit-s3-provisioner/templates/crd.yaml).
-3. **Commit the generated output.** Nothing on a pull request checks this; the release does, and by
-   then the image is already pushed — see
-   [build-and-release.md](build-and-release.md#make-generate-all-is-a-release-gate).
+3. **Commit the generated output.** The `Code Linting` check fails a pull request that does not —
+   see [build-and-release.md](build-and-release.md#make-generate-all-is-a-merge-gate).
 4. Remember that the field's doc comment is published to every cluster that installs the chart:
    `controller-gen` copies it into the CRD and it surfaces in `kubectl explain`
    ([package-map.md](package-map.md#what-is-wrong-today)). Write it for a cluster operator.
@@ -165,5 +164,5 @@ follow-up ([ADR 0016 D10](../adr/0016-the-service-account-key-is-reloaded-only-a
 **Nothing enforces any of this.** There is no lint rule, no CI check and no hook that notices a
 missing README row, an alert outside the `or`, or a subsystem page that was not updated with the code
 it describes. These lists hold by review, or not at all — the one exception is the generated output
-of step 2 above, and that is caught at release time rather than at review time
-([build-and-release.md](build-and-release.md#make-generate-all-is-a-release-gate)).
+of step 2 above, which the `Code Linting` check catches on the pull request
+([build-and-release.md](build-and-release.md#make-generate-all-is-a-merge-gate)).

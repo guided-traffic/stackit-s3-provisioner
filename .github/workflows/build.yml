@@ -5,7 +5,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  GO_VERSION: '1.27.2'
+  GO_VERSION: '1.27.3'
 
 permissions:
   contents: write
@@ -83,7 +83,7 @@ jobs:
             BUILD_NUMBER=${{ steps.version.outputs.version }}
             GIT_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ steps.time.outputs.epoch }}
-          platforms: linux/amd64  # ,linux/arm64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tag_names.outputs.tags }}
           labels: ${{ steps.tag_names.outputs.labels }}
