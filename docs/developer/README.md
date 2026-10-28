@@ -33,7 +33,7 @@ first if you are here because something is behaving oddly.
 | [stackit-api.md](stackit-api.md) | You are calling the provider: the two planes, the resource model, how the process authenticates, and the SDK pitfalls that cost time |
 | [service-account-key-reload.md](service-account-key-reload.md) | You are touching how the operator picks up a rotated service-account key: the poll and its change detector, what a candidate has to pass before anything is swapped, the atomic swap and what survives it, and the two retry schedules behind a rejection |
 | [testing.md](testing.md) | You need to know which suite proves what, what each costs to run, and the conventions that stop a run from leaving real cloud resources behind |
-| [build-and-release.md](build-and-release.md) | You are pushing, cutting a release or bumping a pinned version: the build and lint targets, what the two workflows do, how semantic-release derives the version, the generated-code release gate, and which file carries which pin |
+| [build-and-release.md](build-and-release.md) | You are pushing, cutting a release or bumping a pinned version: the build and lint targets, what the two workflows do, how semantic-release derives the version, the generated-code merge gate, and which file carries which pin |
 | [extending.md](extending.md) | You are adding a CRD field, a control-plane call, a metric and its alert, a Helm value, or a documentation page — the ordered steps, including the ones nothing checks |
 
 ## What has no page here

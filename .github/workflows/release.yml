@@ -354,6 +354,20 @@ jobs:
       - name: Run linting
         run: make lint
 
+      # The check the chart-publishing job of build.yml runs, in front of the merge as well: a change
+      # under api/v1/ or a controller-gen bump that was not regenerated fails here, instead of after
+      # the next release has already pushed its image.
+      - name: Verify generated artifacts are committed
+        run: |
+          make generate-all
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Generated CRDs / DeepCopy / Helm chart CRD are out of sync with the committed tree."
+            echo "Run 'make generate-all' locally and commit the result."
+            git --no-pager status --short
+            git --no-pager diff
+            exit 1
+          fi
+
   gosec:
     name: GoSec Security Scan
     runs-on: self-hosted
