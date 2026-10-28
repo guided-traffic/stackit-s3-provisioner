@@ -33,8 +33,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     -ldflags="-w -s -X main.version=${BUILD_NUMBER:-dev} -X main.commit=${GIT_COMMIT:-unknown} -X main.buildTime=${BUILD_TIME:-unknown}" \
     -o manager ./cmd/main.go
 
-# Final stage - using distroless for minimal attack surface
-FROM gcr.io/distroless/static-debian12:nonroot
+# Final stage - using distroless for minimal attack surface.
+# distroless builds only the current Debian release. The tag of a dropped release stays pullable
+# but is never updated again, so the -debianNN suffix has to move by hand.
+FROM gcr.io/distroless/static-debian13:nonroot
 
 ARG BUILD_NUMBER
 ARG GIT_COMMIT
