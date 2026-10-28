@@ -168,6 +168,24 @@ Renovate additionally groups every `golang.org/x/*` module bump into the same pu
 govulncheck sees a consistent set — in [`go.mod`](../../go.mod) and in the gosec tool module alike,
 which is what the next section depends on.
 
+### A tool binary is named after its pin and its toolchain
+
+The Makefile installs kustomize, controller-gen, setup-envtest, golangci-lint, gocyclo and
+govulncheck into `bin/` as `<tool>-<version>-<go version>`, for example
+`bin/controller-gen-v0.23.0-go1.27.3` (`# example`). A bump of the pin or of the Go toolchain
+changes that name, so the file is missing and
+the next target that needs the tool installs it; a binary from an older pin stays in `bin/`, but no
+target runs it any more. `rm -rf bin` clears the leftovers. The toolchain is part of the name because
+a tool built with an older Go can fail on code that targets a newer one — the gosec section below is
+such a case.
+
+Until 2026-10-28 the binaries had unversioned names and `go-install-tool` installed only when the
+file was absent, so a pin bump never reached a machine that already had the tool, while CI, on fresh
+runners, always used the pin. On a development machine that day controller-gen was v0.21.0 against a
+pin of v0.23.0, and golangci-lint v2.13.1 against v2.15.0. `make cyclo` ran whichever gocyclo was on
+`PATH`, and `make vuln` whichever govulncheck was on `PATH`, installing `@latest` when there was
+none — v1.8.0 on that machine, v1.9.0 on a fresh runner. Both now run the pinned binary from `bin/`.
+
 ### gosec is built from a tool module
 
 gosec loads the packages it scans through `golang.org/x/tools`, and that importer has to read the
@@ -230,10 +248,10 @@ The other pinned versions, none of which is a Go version:
 | `ENVTEST_K8S_VERSION = 1.33.0` | [`Makefile`](../../Makefile) | by hand |
 | `k8s.io/kube-openapi`, `k8s.io/utils`, `sigs.k8s.io/json`, each a pseudo-version | [`go.mod`](../../go.mod) | `go mod tidy`, only when a `k8s.io/*` release raises the minimum — Renovate is switched off for these three module paths, for the reason above |
 | `KUBERNETES_VERSION: '1.33.4'` — the kubectl and Kind node image of the e2e job | [`release.yml`](../../.github/workflows/release.yml) | by hand |
-| `KUSTOMIZE_VERSION`, `CONTROLLER_GEN_VERSION`, `GOLANGCI_LINT_VERSION`, `GOCYCLO_VERSION` | [`Makefile`](../../Makefile), each under a `# renovate:` comment | the Makefile custom regex manager; minor and patch automerge, major needs review |
+| `KUSTOMIZE_VERSION`, `CONTROLLER_GEN_VERSION`, `GOLANGCI_LINT_VERSION`, `GOCYCLO_VERSION`, `GOVULNCHECK_VERSION` | [`Makefile`](../../Makefile), each under a `# renovate:` comment | the Makefile custom regex manager; minor and patch automerge, major needs review |
 | gosec, and the `golang.org/x/tools` it is built with | [`hack/tools/go.mod`](../../hack/tools/go.mod) | Renovate's gomod manager, restricted to those two by package rules: gosec in a pull request of its own, `golang.org/x/*` inside the Go version pull request; minor and patch automerge |
 | `conventional-changelog-conventionalcommits`, held below 10 | [`package.json`](../../package.json) | Renovate's npm manager, capped by `allowedVersions: "<10"` in [`renovate.json`](../../renovate.json); the cap comes off by hand, for the reason in [the release tooling section](#the-release-tooling-is-checked-before-the-merge) |
-| `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the four above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
+| `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the five above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
 | The rclone image used by clone Jobs | the chart's [`values.yaml`](../../deploy/helm/stackit-s3-provisioner/values.yaml), and `DefaultCloneImage` in [`internal/controller/clone.go`](../../internal/controller/clone.go) as the fallback | Renovate, both of them: the chart value through the `helm-values` manager, `DefaultCloneImage` through a custom regex manager that exists to keep the fallback in step with the chart tag. The Makefile deliberately reads the image out of the rendered chart rather than pinning it a third time |
 
 ## What is wrong today
