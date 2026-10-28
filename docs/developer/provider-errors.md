@@ -29,7 +29,7 @@ the fact the whole page rests on:
 
 | Producer | Where | What it puts in the error |
 | --- | --- | --- |
-| The generated Object Storage client | `api_default.go` in the SDK's `objectstorage` package (`v1.9.1`, pinned in [`go.mod`](../../go.mod)) | `StatusCode` and the raw response `Body`; for a handful of enumerated statuses also a decoded `Model` |
+| The generated Object Storage client | `api_default.go` in the SDK's `objectstorage/v2api` package (`v1.12.0`, pinned in [`go.mod`](../../go.mod)) | `StatusCode` and the raw response `Body`; for a handful of enumerated statuses also a decoded `Model`. Since the move to `v2api` it also produces an error for a **success** status, see [A response the client cannot decode](#a-response-the-client-cannot-decode) |
 | The key flow's token fetch | `parseTokenResponse` in the SDK's `core/clients/auth_flow.go` (`core v0.26.0`) | `StatusCode` and the raw `Body` of the **token endpoint's** answer, nothing else |
 
 So an error carrying `403` may have come from the Object Storage API, from an intermediary in front
@@ -78,13 +78,15 @@ record and the readiness rule that came out of it are
 `oapierror.Model` is **not** a usable stand-in for the body test, and the reason is worth spelling
 out because it looks like the obvious solution:
 
-- The generated client decodes an error body into `objectstorage.ErrorMessage`, a struct with a
-  single field, `Detail`. A genuine `403` from the authorization layer — whose JSON carries
-  `timestamp`, `path`, `status`, `error`, `message` and no `detail` — unmarshals *successfully* into
-  an empty struct. The decoded value therefore says nothing.
+- The generated client decodes an error body into `objectstorage.ErrorMessage`, which requires a
+  `detail` property. A genuine `403` from the authorization layer — whose JSON carries `timestamp`,
+  `path`, `status`, `error`, `message` and no `detail` — therefore fails to decode, and the error
+  carries no `Model` at all, exactly like an intermediary's page. (Before the move to `v2api` it
+  unmarshalled *successfully* into an empty struct; the conclusion is the same either way: the
+  decoded value says nothing.)
 - The decode only happens at all for the statuses each generated operation enumerates — `401`, `403`,
-  `404`, `422` and `500` for `GetServiceStatus`, and only the first three plus `500` into
-  `ErrorMessage` — so anything else leaves `Model` nil regardless of the body. A token-endpoint
+  `404`, `422`, `429` and `500` for `GetServiceStatus`, of which `401`, `403`, `404` and `500` decode
+  into `ErrorMessage` — so anything else leaves `Model` nil regardless of the body. A token-endpoint
   error never passes through the generated client and so never has a `Model` at all.
 - For an HTML body the decode fails on the content type, and the SDK replaces the error message with
   the literal `undefined response type` — which is exactly the string in the 2026-08-25 08:13 log
@@ -254,6 +256,34 @@ which are in
 [reconcile-pipeline.md](reconcile-pipeline.md#two-existence-questions-and-only-one-of-them-is-a-listing).
 The S3 data plane takes no part in this decision at all: it has its own error shapes, and the
 question is asked on the control plane only.
+
+## A response the client cannot decode
+
+The `v2api` package validates every response model's required properties while decoding
+([stackit-api.md](stackit-api.md#pitfalls), pitfall 15). A success body missing one comes back as a
+`*oapierror.GenericOpenAPIError` carrying the success status and the raw body:
+
+```text
+no value given for required property scope, status code 200, Body: {"project":"…"}
+```
+
+That is an answer from the provider — the body is valid JSON, so `apiAnswer` accepts it — but not a
+refusal: `ProviderRefused` matches `400`, `401` and `403` only, and `isStructuredNotFound` matches
+`404` only. A decode failure therefore lands where every unrecognised failure lands, as "could not
+verify" ([ADR 0012](../adr/0012-ready-describes-the-last-verified-state.md) D3), with no
+classification of its own — deliberately so,
+[ADR 0018](../adr/0018-the-control-plane-speaks-api-version-2-and-an-undecodable-answer-is-held.md)
+D2, which also records the cost: a field the provider stops sending fails every reconcile, counts
+toward the fleet-wide trip and reads as a provider outage, and only the error text names the missing
+property. `EnsureService` does not escalate such a failed read into `EnableService`, because only the
+structured `404` passes `isServiceNotEnabled`.
+
+`TestDecodeFailureIsNotARefusal` in [`stackit/errors_test.go`](../../stackit/errors_test.go) drives
+a real `v2api` client against a server that omits `scope` and pins all of it: status `200`, not a
+refusal, not "not enabled", no write. On 2026-10-28 the response of every control-plane operation
+the operator calls, except `EnableService`, carried its required properties against the real API
+(see [stackit-api.md](stackit-api.md#the-control-plane-package)); the failure mode is so far observed
+only offline.
 
 ## The retry round-tripper
 
@@ -435,6 +465,7 @@ the breaker
 | `TestProviderRefused` | [`stackit/errors_test.go`](../../stackit/errors_test.go) | The full truth table incl. the gateway page at `403` and `400`, empty bodies, the revoked key, and wrapped errors |
 | `TestIsServiceNotEnabled` | [`stackit/errors_test.go`](../../stackit/errors_test.go) | Only a structured `404` may lead to `EnableService` |
 | `TestModelIsNotADiscriminator` | [`stackit/errors_test.go`](../../stackit/errors_test.go) | Why the raw body and not `oapierror.Model` |
+| `TestDecodeFailureIsNotARefusal` | [`stackit/errors_test.go`](../../stackit/errors_test.go) | A `200` the client cannot decode is non-definitive and never escalates into `EnableService` |
 | `TestRetryTransportRecoversFromBlip` / `…GivesUp` | [`stackit/retry_test.go`](../../stackit/retry_test.go) | Retry on transport errors and 5xx, bounded by `retryAttempts` |
 | `TestRetryTransportDoesNotRetryDefiniteAnswers` | [`stackit/retry_test.go`](../../stackit/retry_test.go) | Exactly one request for `400`, `401`, `403`, `404`, `409`, `422` and `429` |
 | `TestRetryTransportLeavesWritesAlone` | [`stackit/retry_test.go`](../../stackit/retry_test.go) | `POST`/`PUT`/`PATCH`/`DELETE` get one try even on `503` |
@@ -479,6 +510,16 @@ data-plane client retries `429` up to ten times by its own defaults while the co
 to retry it even once, and the data plane is not gated by the breaker. The reasoning that the
 measurement interval floor keeps that volume small is
 [ADR 0014](../adr/0014-bucket-size-is-measured-by-a-separate-controller.md)'s, not a measurement.
+
+**A real `401`/`403` reads as a decode error in `status.message`.** Since the move to `v2api`, the
+authorization layer's refusal fails to decode into `ErrorMessage` (no `detail`), and the SDK puts the
+decode error where the HTTP status line used to be:
+`no value given for required property detail, status code 403, Body: {…}`. Classification is
+unaffected — status and body are intact and they are all `ProviderRefused` reads — but a human
+reading the condition sees a misleading prefix before the status code. Measured on 2026-10-28 with
+v1.12.0: a `ListBuckets` on a foreign project answered `403` with the body quoted
+[above](#the-measured-service-status-shapes), produced exactly that text, and `ProviderRefused`
+returned `true`.
 
 **`degrade` swallows its own status-update failure.** If the `Status().Update` inside `degrade`
 fails, it is logged at V(1) and the function still reports that it took ownership of the failure —

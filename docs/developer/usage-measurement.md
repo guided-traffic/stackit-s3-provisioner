@@ -162,8 +162,9 @@ rotated admin key takes effect on the next measurement with no invalidation logi
 
 `S3Admin.BucketStats` ([`stackit/s3.go:559`](../../stackit/s3.go)) is the whole measurement. There
 is no cheaper way: the Object Storage control-plane API has no usage, statistics or size endpoint
-(verified against `objectstorage` SDK v1.9.1, whose surface is buckets, credentials groups, access
-keys, service enablement, retention and compliance locks), so a size is the sum over one full
+(verified against the `objectstorage/v2api` SDK package at v1.12.0 on 2026-10-28, whose surface is
+buckets, credentials groups, access keys, service enablement and project labels, retention and
+compliance locks), so a size is the sum over one full
 listing. `BucketStats` sets no `MaxKeys`, and minio-go v7.3.0 only sends a `max-keys` parameter when
 `MaxKeys > 0`, so the request carries none and the **S3 protocol default of 1000 keys per page**
 applies — that, not a minio setting, is where "roughly one request per 1000 keys" comes from. Two

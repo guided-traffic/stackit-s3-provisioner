@@ -16,7 +16,7 @@ import (
 
 	"github.com/stackitcloud/stackit-sdk-go/core/config"
 	"github.com/stackitcloud/stackit-sdk-go/core/oapierror"
-	"github.com/stackitcloud/stackit-sdk-go/services/objectstorage"
+	objectstorage "github.com/stackitcloud/stackit-sdk-go/services/objectstorage/v2api"
 )
 
 // RegionEU01 is the only region used in v1 (ADR 0005 D2).
@@ -152,7 +152,6 @@ func (c *Client) newKeyFlowAPIClient(content []byte) (*objectstorage.APIClient, 
 	httpClient, transport := retryingHTTPClient()
 	opts := []config.ConfigurationOption{
 		config.WithServiceAccountKey(string(content)),
-		config.WithRegion(c.region),
 		config.WithHTTPClient(httpClient),
 	}
 	if c.endpoint != "" {
@@ -206,7 +205,6 @@ func NewClientWithEndpoint(projectID, region, endpoint string) (*Client, error) 
 	api, err := objectstorage.NewAPIClient(
 		config.WithEndpoint(endpoint),
 		config.WithToken("test-token"),
-		config.WithRegion(region),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("init object storage client for endpoint %s: %w", endpoint, err)
@@ -240,7 +238,7 @@ func (c *Client) EnsureService(ctx context.Context) error {
 		return nil
 	}
 	st := c.state.Load()
-	_, err := st.api.GetServiceStatus(ctx, st.account.ProjectID, c.region).Execute()
+	_, err := st.api.DefaultAPI.GetServiceStatus(ctx, st.account.ProjectID, c.region).Execute()
 	switch {
 	case err == nil:
 		c.serviceReady.Store(true)
@@ -248,7 +246,7 @@ func (c *Client) EnsureService(ctx context.Context) error {
 	case !isServiceNotEnabled(err):
 		return fmt.Errorf("check object storage status in project %s: %w", st.account.ProjectID, err)
 	}
-	if _, err := st.api.EnableService(ctx, st.account.ProjectID, c.region).Execute(); err != nil {
+	if _, err := st.api.DefaultAPI.EnableService(ctx, st.account.ProjectID, c.region).Execute(); err != nil {
 		return fmt.Errorf("enable object storage in project %s: %w", st.account.ProjectID, err)
 	}
 	// Wait until the service reports ready. Any error is treated as "not ready
@@ -256,7 +254,7 @@ func (c *Client) EnsureService(ctx context.Context) error {
 	// propagation are expected and the deadline bounds the wait.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if _, err := st.api.GetServiceStatus(ctx, st.account.ProjectID, c.region).Execute(); err == nil {
+		if _, err := st.api.DefaultAPI.GetServiceStatus(ctx, st.account.ProjectID, c.region).Execute(); err == nil {
 			c.serviceReady.Store(true)
 			return nil
 		}
@@ -277,14 +275,14 @@ func (c *Client) EnsureService(ctx context.Context) error {
 // cached serviceReady flag and would return success without making any call at
 // all — a probe that proves nothing.
 func (c *Client) probe(ctx context.Context, st *clientState) error {
-	_, err := st.api.GetServiceStatus(ctx, st.account.ProjectID, c.region).Execute()
+	_, err := st.api.DefaultAPI.GetServiceStatus(ctx, st.account.ProjectID, c.region).Execute()
 	return err
 }
 
 // CreateBucket creates a bucket in the client's own project.
 func (c *Client) CreateBucket(ctx context.Context, name string) error {
 	st := c.state.Load()
-	if _, err := st.api.CreateBucket(ctx, st.account.ProjectID, c.region, name).Execute(); err != nil {
+	if _, err := st.api.DefaultAPI.CreateBucket(ctx, st.account.ProjectID, c.region, name).Execute(); err != nil {
 		return fmt.Errorf("create bucket %q in project %s: %w", name, st.account.ProjectID, err)
 	}
 	return nil
@@ -294,7 +292,7 @@ func (c *Client) CreateBucket(ctx context.Context, name string) error {
 // be empty (STACKIT delete semantics, ADR 0006 D2).
 func (c *Client) DeleteBucket(ctx context.Context, name string) error {
 	st := c.state.Load()
-	if _, err := st.api.DeleteBucket(ctx, st.account.ProjectID, c.region, name).Execute(); err != nil {
+	if _, err := st.api.DefaultAPI.DeleteBucket(ctx, st.account.ProjectID, c.region, name).Execute(); err != nil {
 		return fmt.Errorf("delete bucket %q in project %s: %w", name, st.account.ProjectID, err)
 	}
 	return nil
@@ -308,7 +306,7 @@ func (c *Client) ListBucketNames(ctx context.Context, projectID string) ([]strin
 }
 
 func (c *Client) listBucketNames(ctx context.Context, st *clientState, projectID string) ([]string, error) {
-	resp, err := st.api.ListBuckets(ctx, projectID, c.region).Execute()
+	resp, err := st.api.DefaultAPI.ListBuckets(ctx, projectID, c.region).Execute()
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +355,7 @@ func (c *Client) hasBucket(ctx context.Context, st *clientState, projectID, name
 // enough to declare a bucket the operator provisioned to be gone.
 func (c *Client) BucketExists(ctx context.Context, name string) (bool, error) {
 	st := c.state.Load()
-	if _, err := st.api.GetBucket(ctx, st.account.ProjectID, c.region, name).Execute(); err != nil {
+	if _, err := st.api.DefaultAPI.GetBucket(ctx, st.account.ProjectID, c.region, name).Execute(); err != nil {
 		if isStructuredNotFound(err) {
 			return false, nil
 		}
@@ -404,7 +402,7 @@ func (c *Client) CreateCredentialsGroup(ctx context.Context, displayName string)
 
 func (c *Client) createCredentialsGroup(ctx context.Context, st *clientState, displayName string) (id, urn string, err error) {
 	payload := objectstorage.NewCreateCredentialsGroupPayload(displayName)
-	resp, err := st.api.CreateCredentialsGroup(ctx, st.account.ProjectID, c.region).
+	resp, err := st.api.DefaultAPI.CreateCredentialsGroup(ctx, st.account.ProjectID, c.region).
 		CreateCredentialsGroupPayload(*payload).Execute()
 	if err != nil {
 		return "", "", fmt.Errorf("create credentials group %q: %w", displayName, err)
@@ -417,7 +415,7 @@ func (c *Client) createCredentialsGroup(ctx context.Context, st *clientState, di
 // deleted first).
 func (c *Client) DeleteCredentialsGroup(ctx context.Context, groupID string) error {
 	st := c.state.Load()
-	if _, err := st.api.DeleteCredentialsGroup(ctx, st.account.ProjectID, c.region, groupID).Execute(); err != nil {
+	if _, err := st.api.DefaultAPI.DeleteCredentialsGroup(ctx, st.account.ProjectID, c.region, groupID).Execute(); err != nil {
 		return fmt.Errorf("delete credentials group %s: %w", groupID, err)
 	}
 	return nil
@@ -427,7 +425,7 @@ func (c *Client) DeleteCredentialsGroup(ctx context.Context, groupID string) err
 // No expiry is set (ADR 0007 D3).
 func (c *Client) CreateAccessKey(ctx context.Context, groupID string) (AccessKey, error) {
 	st := c.state.Load()
-	resp, err := st.api.CreateAccessKey(ctx, st.account.ProjectID, c.region).
+	resp, err := st.api.DefaultAPI.CreateAccessKey(ctx, st.account.ProjectID, c.region).
 		CredentialsGroup(groupID).
 		CreateAccessKeyPayload(*objectstorage.NewCreateAccessKeyPayload()).
 		Execute()
@@ -448,7 +446,7 @@ func (c *Client) DeleteAccessKey(ctx context.Context, groupID, keyID string) err
 }
 
 func (c *Client) deleteAccessKey(ctx context.Context, st *clientState, groupID, keyID string) error {
-	if _, err := st.api.DeleteAccessKey(ctx, st.account.ProjectID, c.region, keyID).
+	if _, err := st.api.DefaultAPI.DeleteAccessKey(ctx, st.account.ProjectID, c.region, keyID).
 		CredentialsGroup(groupID).Execute(); err != nil {
 		return fmt.Errorf("delete access key %s (group %s): %w", keyID, groupID, err)
 	}
@@ -533,7 +531,7 @@ func (c *Client) ListCredentialsGroups(ctx context.Context) ([]CredentialsGroupI
 }
 
 func (c *Client) listCredentialsGroups(ctx context.Context, st *clientState) ([]CredentialsGroupInfo, error) {
-	resp, err := st.api.ListCredentialsGroups(ctx, st.account.ProjectID, c.region).Execute()
+	resp, err := st.api.DefaultAPI.ListCredentialsGroups(ctx, st.account.ProjectID, c.region).Execute()
 	if err != nil {
 		return nil, fmt.Errorf("list credentials groups: %w", err)
 	}
@@ -551,7 +549,7 @@ func (c *Client) ListAccessKeyIDs(ctx context.Context, groupID string) ([]string
 }
 
 func (c *Client) listAccessKeyIDs(ctx context.Context, st *clientState, groupID string) ([]string, error) {
-	resp, err := st.api.ListAccessKeys(ctx, st.account.ProjectID, c.region).
+	resp, err := st.api.DefaultAPI.ListAccessKeys(ctx, st.account.ProjectID, c.region).
 		CredentialsGroup(groupID).Execute()
 	if err != nil {
 		return nil, fmt.Errorf("list access keys (group %s): %w", groupID, err)
@@ -571,7 +569,7 @@ func (c *Client) listAccessKeyIDs(ctx context.Context, st *clientState, groupID 
 // than hardcoded.
 func (c *Client) BucketConnInfo(ctx context.Context, name string) (host, pathStyleURL string, err error) {
 	st := c.state.Load()
-	resp, err := st.api.GetBucket(ctx, st.account.ProjectID, c.region, name).Execute()
+	resp, err := st.api.DefaultAPI.GetBucket(ctx, st.account.ProjectID, c.region, name).Execute()
 	if err != nil {
 		return "", "", fmt.Errorf("get bucket %q: %w", name, err)
 	}

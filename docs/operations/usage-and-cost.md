@@ -154,9 +154,9 @@ and that day-month order is not independently verified.
 
 **Time: one full listing per measured bucket per interval.** The control-plane
 API has no usage, statistics or size endpoint — verified against the Object
-Storage SDK the operator builds on (v1.9.1), whose entire surface is buckets,
-credentials groups, access keys, service enablement, retention and compliance
-locks. A size therefore exists only as the sum over a listing of the bucket,
+Storage SDK the operator builds on (v1.12.0), whose entire surface is buckets,
+credentials groups, access keys, service enablement and project labels,
+retention and compliance locks. A size therefore exists only as the sum over a listing of the bucket,
 which is roughly **one request per 1000 object keys**. A bucket with two million
 objects is about 2000 requests per pass, and the pass takes as long as the bucket
 is large.

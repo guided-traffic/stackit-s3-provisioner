@@ -7,7 +7,7 @@ require (
 	github.com/minio/minio-go/v7 v7.4.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/stackitcloud/stackit-sdk-go/core v0.27.1
-	github.com/stackitcloud/stackit-sdk-go/services/objectstorage v1.9.2
+	github.com/stackitcloud/stackit-sdk-go/services/objectstorage v1.12.0
 	github.com/stretchr/testify v1.12.1
 	go.uber.org/zap v1.28.0
 	golang.org/x/time v0.16.0

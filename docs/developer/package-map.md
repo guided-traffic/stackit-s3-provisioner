@@ -28,12 +28,12 @@ StackIT Object Storage is two separate surfaces, and the operator has to speak b
 | Code | [`stackit/client.go`](../../stackit/client.go), type `Client` | [`stackit/s3.go`](../../stackit/s3.go), type `S3Admin` |
 
 The split is forced, not stylistic: **a bucket policy is an S3 operation and the control-plane SDK
-has no call for it.** Verified against the pinned `services/objectstorage v1.9.1` (see
-[`go.mod`](../../go.mod)): its `APIClient` exposes exactly `CreateBucket`, `DeleteBucket`,
-`ListBuckets`, `GetBucket`, `CreateCredentialsGroup`, `DeleteCredentialsGroup`,
-`ListCredentialsGroups`, `GetCredentialsGroup`, `CreateAccessKey`, `DeleteAccessKey`,
-`ListAccessKeys`, `EnableService`, `DisableService`, `GetServiceStatus`, and the compliance-lock and
-default-retention calls. There is no policy operation in the package at all — the word "policy" does
+has no call for it.** Verified on 2026-10-28 against the pinned `services/objectstorage v1.12.0`
+(see [`go.mod`](../../go.mod)): the `DefaultAPI` of its `v2api` package exposes exactly
+`CreateBucket`, `DeleteBucket`, `ListBuckets`, `GetBucket`, `CreateCredentialsGroup`,
+`DeleteCredentialsGroup`, `ListCredentialsGroups`, `GetCredentialsGroup`, `CreateAccessKey`,
+`DeleteAccessKey`, `ListAccessKeys`, `EnableService`, `DisableService`, `GetServiceStatus`,
+`UpdateService` (project labels), and the compliance-lock and default-retention calls. There is no policy operation in the package at all — the word "policy" does
 not occur in it. Isolation between workloads is nevertheless only achievable through a bucket policy
 ([ADR 0003](../adr/0003-workloads-are-isolated-by-an-explicit-deny-policy.md)), so the operator must
 hold an S3 credential of its own to write one, which is the whole reason

@@ -9,7 +9,10 @@ document is [bucket-policy.md](bucket-policy.md), and which cloud object belongs
 is [bucket-identity.md](bucket-identity.md). Everything here is verified against
 `services/objectstorage v1.9.1` and `core v0.26.0` as pinned in [go.mod](../../go.mod) on
 2026-09-19; where a statement rests on a live measurement instead of on the code, the measurement
-and its date are named.
+and its date are named. The client moved to the versioned `objectstorage/v2api` package at
+`services/objectstorage v1.12.0` on 2026-10-28; [The control-plane package](#the-control-plane-package)
+and pitfalls 14 and 15 were verified against that version, the rest of the page was not re-read
+against it.
 
 ## The two planes
 
@@ -21,7 +24,7 @@ SDK: the SDK is one of the two planes and is silent about the other.
 | | Control plane | Data plane |
 |---|---|---|
 | Protocol | STACKIT Object Storage REST API | S3 |
-| Go client | [`stackit-sdk-go/services/objectstorage`](../../stackit/client.go) | [`minio-go/v7`](../../stackit/s3.go) |
+| Go client | [`stackit-sdk-go/services/objectstorage/v2api`](../../stackit/client.go) | [`minio-go/v7`](../../stackit/s3.go) |
 | Auth | Service-account key flow, bearer token | S3 access key + secret, SigV4 |
 | Base URL | `https://object-storage.api.stackit.cloud` &nbsp;`# default` (SDK server config) | Per bucket, from the bucket's `urlPathStyle` |
 | Who calls it | The operator only | The operator (admin credential) **and** every workload |
@@ -257,6 +260,8 @@ of this code, so they survive refactoring.
 | 11 | `config.WithMaxRetries` has been a no-op since `core v0.26.0` (`func WithMaxRetries(_ int)`), as have `WithWaitBetweenCalls` and `WithRetryTimeout` | The SDK retries nothing, silently; a single dropped connection is a failed reconcile | Own transport, see below |
 | 12 | `config.WithHTTPClient`'s transport becomes the **inner** transport of the auth flow | A round tripper installed there sees API requests *with* the `Authorization` header already attached, and sees token fetches too | `auth.KeyAuth` copies `cfg.HTTPClient.Transport` into `clients.KeyFlowConfig.HTTPTransport` (`core v0.26.0`, `auth/auth.go`); relied on by `retryingHTTPClient()` |
 | 13 | Bucket names are validated client-side to 3–63 characters | The error arrives from the SDK, not from the API, and looks nothing like a provider refusal | Name composition validates first ([ADR 0009](../adr/0009-the-physical-bucket-name-is-composed-and-then-frozen.md) D5) |
+| 14 | `v2api.NewAPIClient` calls `config.ConfigureRegion`, and the generated server config declares its `region` variable with default `global`, so a region set with `config.WithRegion` is rejected | `configuring region: this API does not support setting a region in the the client configuration, …` at construction — on every pod, at startup. Invisible to every fake-backed test: `ConfigureRegion` returns early when `config.WithEndpoint` is set | Neither constructor in [`stackit/client.go`](../../stackit/client.go) sets a region; it travels as the per-call argument. `TestNewClient` in [`newclient_test.go`](../../stackit/newclient_test.go) builds the production client from a generated key offline — the key flow fetches no token at construction (`KeyFlow.Init` only validates, `core v0.27.1`) |
+| 15 | Every `v2api` response model checks its required properties while decoding | A body missing one becomes `*oapierror.GenericOpenAPIError` with the **success** status: `no value given for required property scope, status code 200, Body: {"project":"…"}`. The same check runs on error bodies, so a `401`/`403` without `detail` surfaces as `no value given for required property detail, status code 403, …` | Classified non-definitive ([provider-errors.md](provider-errors.md#a-response-the-client-cannot-decode)); every offline-fake handler answers with the full model ([testing.md](testing.md#the-provider-fake)) |
 
 Pitfalls 2–5 are encoded as fidelity rules in the offline fake
 ([`internal/stackitfake/fake.go`](../../internal/stackitfake/fake.go)), which is where they are
@@ -266,7 +271,10 @@ is built, so no server, fake or real, ever sees it. Of pitfall 2 the fake mirror
 half, the `500` on a key deletion without the group parameter. Beyond this table the fake also
 mirrors the Layer-1 refusal — a foreign `projectId` answers `403` — which is a property of the
 isolation boundary rather than of the SDK. The fake's header comment is the canonical list of
-behaviours it mirrors.
+behaviours it mirrors. Pitfall 15 binds the fake from the other side: a handler that omits a
+required property breaks every call through it, which is how a fake answer that drifted from the
+model is caught offline. Pitfall 14 cannot be enforced by the fake at all, since a fake is only ever
+reached through a custom endpoint.
 
 ## The HTTP layer beneath the SDK
 
@@ -304,19 +312,39 @@ transport. The fake arms a single injected failure, and retrying would consume t
 quietly turn an error-path test into a happy-path test. `retryTransport` is covered directly in
 [`stackit/retry_test.go`](../../stackit/retry_test.go) instead.
 
-## The deprecated top-level package
+## The control-plane package
 
-Every symbol the operator imports from `services/objectstorage` carries
-`Deprecated: Will be removed after 2026-09-30. Move to the packages generated for each available
-API version instead`. The replacement packages ship in the same module and are already present at
-v1.9.1: `objectstorage/v1api` and `objectstorage/v2api`. The top-level package the operator uses
-today is generated from API version 2.0.1 and its request paths are already `/v2/...`, so the
-migration target is `v2api`.
+[`stackit/client.go`](../../stackit/client.go) is the only file that imports the SDK's service
+package, and it imports `services/objectstorage/v2api` under the alias `objectstorage`, so the
+symbols read `objectstorage.APIClient`, `objectstorage.NewAPIClient` across the code and these pages.
+The module ships two versioned packages, `v1api` and `v2api`; the top-level package the operator
+used until 2026-10-28 was removed in `services/objectstorage v1.12.0` (changelog: *"Removal of
+deprecated compatibility layer previously found in the root of the SDK module"*).
 
-Verified on 2026-09-19: [go.mod](../../go.mod) pins `services/objectstorage v1.9.1` and
-[`stackit/client.go`](../../stackit/client.go) imports the top-level package. Nothing in the tree
-imports `v1api` or `v2api`. The removal date is the provider's, stated in the package itself; what
-happens to the top-level package after it is the provider's call, not this repo's.
+**`v2api` and not `v1api`** is [ADR 0018](../adr/0018-the-control-plane-speaks-api-version-2-and-an-undecodable-answer-is-held.md)
+D1; the facts behind it, in code terms: `v2api` uses base URL `https://object-storage.api.stackit.cloud`
+and every request path is `/v2/project/{projectId}/regions/{region}/…` — the path set of the removed
+package at v1.9.2 and of `v2api` at v1.12.0 is identical, compared path by path, so the move changed
+nothing on the wire. `v1api` speaks `/v1/project/{projectId}/…`, drops the `region` parameter from
+every method signature (`CreateBucket(ctx, projectId, bucketName)`) and templates it into the host
+(`object-storage.api.{region}stackit.cloud`).
+
+What `v2api` does differently from the removed package, verified at v1.12.0:
+
+| Difference | Consequence here |
+|---|---|
+| Methods hang off the `DefaultAPI` interface field (`api.DefaultAPI.CreateBucket(…)`) | Every call site goes through it. The package also ships a generated mock of that interface; it is not a substitute for the wire-level fake, because error classification needs the raw body ([provider-errors.md](provider-errors.md)) |
+| `NewAPIClient` rejects a configured region | Pitfall 14 |
+| Response models validate required properties | Pitfall 15 |
+
+Verified against the real API on 2026-10-28 with `services/objectstorage v1.12.0`: the
+control-plane integration suites and `make e2e-stackit` passed, so the responses of every
+control-plane operation the operator calls — including both delete responses, which `v2api` requires
+to echo `keyId` and `credentialsGroupId` — carried the properties the models require. **Not
+verified: `EnableService`.** The test project has Object Storage enabled, so `EnsureService` never
+reached the enable call, and whether its answer carries the required `scope` is unknown
+([ADR 0018](../adr/0018-the-control-plane-speaks-api-version-2-and-an-undecodable-answer-is-held.md),
+*Residual risks*).
 
 ## What is wrong today
 
