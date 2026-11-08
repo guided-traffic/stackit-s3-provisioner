@@ -252,6 +252,31 @@
       ]
     },
     {
+      "description": "Node (.nvmrc, installed by the Release Tooling Check and Semantic Release jobs, and the major make release-notes-check expects locally): automerge minor and patch updates. The Release Tooling Check installs exactly this version and is a required check, so a Node release that breaks the release tooling, or no longer starts on the runner image, stays red instead of merging",
+      "matchManagers": [
+        "nvm"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Node: require manual review for major updates. Node 26 was the first line whose binary links libatomic.so.1, which the runner image does not ship; a major is where a change like that lands",
+      "matchManagers": [
+        "nvm"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false,
+      "labels": [
+        "dependencies",
+        "major-update"
+      ]
+    },
+    {
       "description": "Makefile-pinned Go tools (custom regex manager): automerge minor and patch updates",
       "matchManagers": [
         "custom.regex"
@@ -315,6 +340,13 @@
       "description": "GitHub Actions: use 'chore' instead of 'fix' for updates",
       "matchManagers": [
         "github-actions"
+      ],
+      "semanticCommitType": "chore"
+    },
+    {
+      "description": "Node in .nvmrc runs only in CI and in make release-notes-check, like the actions themselves: use 'chore', so a Node bump does not cut a release of an unchanged operator",
+      "matchManagers": [
+        "nvm"
       ],
       "semanticCommitType": "chore"
     }
