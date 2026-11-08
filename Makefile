@@ -108,9 +108,15 @@ test-helm-render: ## Render the Helm chart and assert on the user-facing RBAC ob
 
 # npm install, not npm ci: there is no lockfile, and the Semantic Release job
 # resolves package.json the same way, so this sees what a release would load.
+# CI installs exactly the version in .nvmrc; a local node only has to match its
+# major, because a system package manager cannot be pinned to a patch release.
 .PHONY: release-notes-check
 release-notes-check: ## Render release notes with the installed semantic-release plugins (needs node and npm).
 	@echo "Checking the release tooling..."
+	@want=$$(cut -d. -f1 .nvmrc); have=$$(node -p 'process.versions.node.split(".")[0]'); \
+	if [ "$$want" != "$$have" ]; then \
+		echo "node $$(node --version) is on PATH, but .nvmrc pins $$(cat .nvmrc): install Node $$want"; exit 1; \
+	fi
 	npm install --no-audit --no-fund --no-package-lock
 	npm audit signatures
 	node hack/release-notes-check.mjs

@@ -104,7 +104,7 @@ test/e2e/                   Kind, build tag `e2e`
 test/helm/                  chart render assertions, build tag `helm`
 
 docs/adr|developer|operations|security|tickets/
-Makefile Containerfile .golangci.yml renovate.json .releaserc.json package.json
+Makefile Containerfile .golangci.yml renovate.json .releaserc.json package.json .nvmrc
 .github/workflows/          release.yml, build.yml, renovate.yml
 account-1.json account-2.json   REAL service-account keys with embedded RSA private
                                 keys; developer machines only, held out of git by one
@@ -133,6 +133,7 @@ The build and packaging files at the root, none of which any other section of th
 | [`.golangci.yml`](../../.golangci.yml) | The linter set behind `make lint` — `errcheck`, `govet`, `staticcheck`, `revive` and others, in golangci-lint v2 configuration format. |
 | [`renovate.json`](../../renovate.json) | Dependency update policy for the Renovate workflow. |
 | [`.releaserc.json`](../../.releaserc.json), [`package.json`](../../package.json) | semantic-release: conventional-commit analysis on `main`, GitHub release, and a commit that carries the coverage badge JSON. The `package.json` exists only to pin those Node dev-dependencies; no JavaScript ships. |
+| [`.nvmrc`](../../.nvmrc) | The Node version both Node jobs of `release.yml` install; `make release-notes-check` checks the local major against it ([build-and-release.md](build-and-release.md#node-is-pinned-in-nvmrc)). |
 | [`LICENSE`](../../LICENSE) | Apache 2.0. |
 | [`Chart.yaml`](../../deploy/helm/stackit-s3-provisioner/Chart.yaml) | Chart metadata. `version` and `appVersion` are both `0.1.0` in git and are meant to stay that way: [`build.yml`](../../.github/workflows/build.yml) rewrites both from the release tag with `sed` before packaging, so bumping them by hand achieves nothing. |
 | [`.github/workflows/`](../../.github/workflows/) | `release.yml` runs on push and pull request to `main` — lint, gosec, vuln, cyclo, unit and envtest coverage, chart render, Kind e2e, a check of the release tooling, and the semantic-release step. `build.yml` runs only when a GitHub release is published — image build, chart package and GitHub Pages publish, plus the generated-code drift check. `renovate.yml` runs the dependency bot. What each executes, in detail, is in [testing.md](testing.md#what-ci-runs); the triggers, the version cut and the pinned toolchain are in [build-and-release.md](build-and-release.md). |

@@ -319,14 +319,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Same Node line as the Semantic Release job, so both load the same plugins.
+      # libatomic1 before setup-node: the Node 26 binary links libatomic.so.1, which the runner
+      # image does not ship, and setup-node's own version probe then fails with exit code 127.
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential libatomic1
+
+      # The same .nvmrc as the Semantic Release job, so both load the plugins on the same Node.
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "lts/*"
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential
+          node-version-file: .nvmrc
 
       - name: Render release notes with the installed release tooling
         run: make release-notes-check
@@ -786,9 +788,13 @@ jobs:
           load: true
           tags: stackit-s3-provisioner:scan-${{ github.sha }}
 
+      # version pins the Trivy binary, in both scans: the action's own default moves only with an
+      # action release, which lags Trivy by months. Renovate's github-actions manager reads this
+      # input of trivy-action and moves both literals in one pull request.
       - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
+          version: 'v0.76.2'
           image-ref: stackit-s3-provisioner:scan-${{ github.sha }}
           format: 'table'
           exit-code: '1'
@@ -806,8 +812,9 @@ jobs:
       - name: Run Trivy scan (SARIF output)
         id: sarif
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
+          version: 'v0.76.2'
           image-ref: stackit-s3-provisioner:scan-${{ github.sha }}
           format: 'sarif'
           output: 'trivy-results.sarif'
@@ -870,10 +877,14 @@ jobs:
             echo "⚠️ Coverage badge not found, using existing file"
           fi
 
+      # libatomic1 before setup-node, for the reason given in the Release Tooling Check job.
+      - name: Install Node runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libatomic1
+
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "lts/*"
+          node-version-file: .nvmrc
 
       - name: Install dependencies
         run: npm install

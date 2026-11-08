@@ -125,6 +125,27 @@ helper`) and passes at 9.3.1.
 `.github/badges/coverage.json` is therefore a generated file that lives in git: written by CI,
 committed by semantic-release, and never hand-edited.
 
+### Node is pinned in `.nvmrc`
+
+Both Node jobs of `release.yml` — the Release Tooling Check and Semantic Release — install the exact
+version in [`.nvmrc`](../../.nvmrc) through `node-version-file`, so the check proves the plugins on the
+Node the release will use. `make release-notes-check` refuses to start when the `node` on `PATH` has
+a different major than `.nvmrc`; locally only the major has to match, because a system package
+manager cannot be held at a patch release.
+
+Both jobs used `node-version: "lts/*"` until 2026-11-08, which resolves at job start. Node 26.13.0,
+released 2026-10-28, was the first LTS release of the 26 line: the pull request runs of 2026-11-01
+still resolved to 24, and from 2026-11-02 every pull request resolved to 26.13.0 and failed the
+required Release Tooling Check in `Setup Node.js`, whatever it changed — six Renovate pull requests
+stopped automerging on that alone. The Node 26 linux-x64 binary references `libatomic.so.1`, which
+the 24 binary does not (verified on 2026-11-08 by comparing the two binaries from
+`actions/node-versions`); the self-hosted runner image does not ship that library, so setup-node's
+version probe exits with code 127. Both jobs therefore install `libatomic1` before setup-node.
+
+Renovate moves `.nvmrc` through its nvm manager: minor and patch automerge behind the Release
+Tooling Check, a major waits for review, and both use the commit type `chore`, so a Node bump does
+not cut a release of an unchanged operator.
+
 ### `make generate-all` is a merge gate
 
 The `Code Linting` job of `release.yml` — a required check on `main` — runs `make generate-all` after
@@ -257,6 +278,8 @@ The other pinned versions, none of which is a Go version:
 | `KUBERNETES_VERSION: '1.33.4'` — the kubectl and Kind node image of the e2e job | [`release.yml`](../../.github/workflows/release.yml) | by hand |
 | `KUSTOMIZE_VERSION`, `CONTROLLER_GEN_VERSION`, `GOLANGCI_LINT_VERSION`, `GOCYCLO_VERSION`, `GOVULNCHECK_VERSION` | [`Makefile`](../../Makefile), each under a `# renovate:` comment | the Makefile custom regex manager; minor and patch automerge, major needs review. A controller-gen bump cannot automerge in practice: it fails the [merge gate](#make-generate-all-is-a-merge-gate) until it is regenerated |
 | gosec, and the `golang.org/x/tools` it is built with | [`hack/tools/go.mod`](../../hack/tools/go.mod) | Renovate's gomod manager, restricted to those two by package rules: gosec in a pull request of its own, `golang.org/x/*` inside the Go version pull request; minor and patch automerge |
+| Node, an exact version | [`.nvmrc`](../../.nvmrc), read by both Node jobs of [`release.yml`](../../.github/workflows/release.yml) and, as a major, by `make release-notes-check` | Renovate's nvm manager; minor and patch automerge, major needs review ([why it is pinned](#node-is-pinned-in-nvmrc)) |
+| Trivy, as the `version` input of both `aquasecurity/trivy-action` steps, and the action tag | the `container-malware-scan` job of [`release.yml`](../../.github/workflows/release.yml) | Renovate's github-actions manager, both: it reads trivy-action's `version` input as the dependency `aquasecurity/trivy` and moves the two literals in one pull request, and the action tag separately; minor, patch and major automerge, as for every action. Until 2026-11-08 the job used `trivy-action@master`, which Renovate cannot look up — the Dependency Dashboard listed it as a lookup failure — and which changed the scanner under every pull request without one. The binary is pinned apart from the action because the action's own default moves only with an action release: on 2026-11-08, `v0.36.0` (2026-04-22) defaulted to Trivy `v0.70.0`, while `master` and the newest Trivy were at `v0.76.2`. The input must stay a literal: the manager skips an expression such as `${{ env.X }}` as `invalid-value`, verified with a local Renovate dry run on 2026-11-08 |
 | `conventional-changelog-conventionalcommits`, held below 10 | [`package.json`](../../package.json) | Renovate's npm manager, capped by `allowedVersions: "<10"` in [`renovate.json`](../../renovate.json); the cap comes off by hand, for the reason in [the release tooling section](#the-release-tooling-is-checked-before-the-merge) |
 | `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the five above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
 | The runtime base `gcr.io/distroless/static-debian13:nonroot` | [`Containerfile`](../../Containerfile) | nobody, in two ways. The `nonroot` tag floats, so each build takes whatever distroless last published for it, with no digest Renovate could move. And the `-debianNN` suffix moves by hand: distroless builds only the current Debian release and stopped building debian12 on 2026-08-11, after which `static-debian12:nonroot` still pulled without error but kept the package set it had then. Up to v1.20.1 every image shipped the outdated `ca-certificates` and `tzdata` that way (`DLA-4845-1`, `DLA-4792-1`, `DLA-4854-1`). Check the distroless README for the current release before relying on the suffix |
