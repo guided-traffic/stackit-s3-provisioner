@@ -590,7 +590,7 @@ of them `runs-on: self-hosted`:
 | Code Linting | `make lint`, then `make generate-all` and a check that it left the tree unchanged ([build-and-release.md](build-and-release.md#make-generate-all-is-a-merge-gate)) |
 | GoSec / Vulnerability Check / Cyclomatic Complexity | `make gosec`, `make vuln`, `make cyclo` (`CYCLO_THRESHOLD ?= 15` `# default`, in the [Makefile](../../Makefile)) |
 | Malware Scan | ClamAV over the source tree |
-| Container Malware Scan | Builds the image from the [Containerfile](../../Containerfile) without pushing it, runs Trivy at the version pinned in the steps' `version` input twice (a table run that fails on `CRITICAL,HIGH` unfixed findings, then a SARIF run kept as an artefact for 30 days), and removes the image again |
+| Container Malware Scan | Builds the image from the [Containerfile](../../Containerfile) without pushing it, runs Trivy twice (a table run that fails on `CRITICAL,HIGH` unfixed findings, then a SARIF run kept as an artefact for 30 days), and removes the image again |
 | Combined Coverage Report | Merges `coverage/unit.out` and `coverage/integration.out`, writes `.github/badges/coverage.json` on a push to `main`, and comments the delta against `main` on a pull request |
 | Release Tooling Check | `make release-notes-check` on the Node version in [`.nvmrc`](../../.nvmrc) — `npm install`, `npm audit signatures`, then renders release notes from three synthetic commits with the installed semantic-release plugins and fails unless both entries appear ([build-and-release.md](build-and-release.md#the-release-tooling-is-checked-before-the-merge)) |
 | Semantic Release | Only on a push to `main`, and only after every other job; releases nothing on a pull request |

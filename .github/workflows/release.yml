@@ -788,13 +788,12 @@ jobs:
           load: true
           tags: stackit-s3-provisioner:scan-${{ github.sha }}
 
-      # version pins the Trivy binary, in both scans: the action's own default moves only with an
-      # action release, which lags Trivy by months. Renovate's github-actions manager reads this
-      # input of trivy-action and moves both literals in one pull request.
+      # trivy-action floats on master on purpose: the aquasecurity organization's IP allow list
+      # rejects the GitHub App token Renovate runs with, so a pinned tag or version here would never
+      # be moved. On master, the action and the Trivy version it installs stay current by themselves.
       - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@master
         with:
-          version: 'v0.76.2'
           image-ref: stackit-s3-provisioner:scan-${{ github.sha }}
           format: 'table'
           exit-code: '1'
@@ -812,9 +811,8 @@ jobs:
       - name: Run Trivy scan (SARIF output)
         id: sarif
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@master
         with:
-          version: 'v0.76.2'
           image-ref: stackit-s3-provisioner:scan-${{ github.sha }}
           format: 'sarif'
           output: 'trivy-results.sarif'
