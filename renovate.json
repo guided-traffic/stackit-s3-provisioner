@@ -17,7 +17,6 @@
   "prConcurrentLimit": 0,
   "prHourlyLimit": 0,
   "branchConcurrentLimit": 0,
-  "rebaseWhen": "conflicted",
   "postUpdateOptions": [
     "gomodTidy",
     "gomodUpdateImportPaths"
@@ -362,13 +361,16 @@
       "versioningTemplate": "semver"
     },
     {
-      "description": "Update the rclone clone-job image default pinned in Go code (kept in sync with the helm-values managed clone.image tag)",
+      "description": "Update the rclone clone-job image default pinned in Go code and quoted as the default in README.md and docs/operations/cloning.md (kept in sync with the helm-values managed clone.image tag, in the same branch)",
       "customType": "regex",
       "managerFilePatterns": [
-        "/^internal/controller/clone\\.go$/"
+        "/^internal/controller/clone\\.go$/",
+        "/^README\\.md$/",
+        "/^docs/operations/cloning\\.md$/"
       ],
       "matchStrings": [
-        "DefaultCloneImage = \"rclone/rclone:(?<currentValue>[\\d.]+)\""
+        "DefaultCloneImage = \"rclone/rclone:(?<currentValue>[\\d.]+)\"",
+        "repository: rclone/rclone\\s+# default\\n\\s+tag: \"(?<currentValue>[\\d.]+)\""
       ],
       "depNameTemplate": "rclone/rclone",
       "datasourceTemplate": "docker",

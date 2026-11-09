@@ -77,7 +77,9 @@ force-pushes it to the `gh-pages` branch that serves the Helm repository. Those 
 therefore never bumped by hand ([package-map.md](package-map.md#the-tree)).
 
 **[`renovate.yml`](../../.github/workflows/renovate.yml)** runs the dependency bot; its policy is
-[`renovate.json`](../../renovate.json) and the pins it reaches are the last section of this page.
+[`renovate.json`](../../renovate.json), and the pins it reaches and
+[how its pull requests reach `main`](#how-a-renovate-pull-request-reaches-main) are in the
+[pins section](#toolchain-and-dependency-pins) of this page.
 
 ## How a version is cut
 
@@ -283,10 +285,39 @@ The other pinned versions, none of which is a Go version:
 | `conventional-changelog-conventionalcommits`, held below 10 | [`package.json`](../../package.json) | Renovate's npm manager, capped by `allowedVersions: "<10"` in [`renovate.json`](../../renovate.json); the cap comes off by hand, for the reason in [the release tooling section](#the-release-tooling-is-checked-before-the-merge) |
 | `ENVTEST_VERSION = release-0.24` | [`Makefile`](../../Makefile), under a `# renovate:` comment like the five above | by hand — the manager's regex captures `v[\d.]+` only, so the `release-N.NN` form never matches and the comment above it has no effect |
 | The runtime base `gcr.io/distroless/static-debian13:nonroot` | [`Containerfile`](../../Containerfile) | nobody, in two ways. The `nonroot` tag floats, so each build takes whatever distroless last published for it, with no digest Renovate could move. And the `-debianNN` suffix moves by hand: distroless builds only the current Debian release and stopped building debian12 on 2026-08-11, after which `static-debian12:nonroot` still pulled without error but kept the package set it had then. Up to v1.20.1 every image shipped the outdated `ca-certificates` and `tzdata` that way (`DLA-4845-1`, `DLA-4792-1`, `DLA-4854-1`). Check the distroless README for the current release before relying on the suffix |
-| The rclone image used by clone Jobs | the chart's [`values.yaml`](../../deploy/helm/stackit-s3-provisioner/values.yaml), and `DefaultCloneImage` in [`internal/controller/clone.go`](../../internal/controller/clone.go) as the fallback | Renovate, both of them: the chart value through the `helm-values` manager, `DefaultCloneImage` through a custom regex manager that exists to keep the fallback in step with the chart tag. The Makefile deliberately reads the image out of the rendered chart rather than pinning it a third time |
+| The rclone image used by clone Jobs | the chart's [`values.yaml`](../../deploy/helm/stackit-s3-provisioner/values.yaml), and `DefaultCloneImage` in [`internal/controller/clone.go`](../../internal/controller/clone.go) as the fallback | Renovate, both of them: the chart value through the `helm-values` manager, `DefaultCloneImage` through a custom regex manager that exists to keep the fallback in step with the chart tag. The same manager moves the tag quoted as the default in the [README](../../README.md) reference and in [cloning.md](../operations/cloning.md), so all four land in one `renovate/rclone-rclone-1.x` pull request; until 2026-11-09 both pages were left on 1.75.0 after the bump to 1.76.0. The Makefile deliberately reads the image out of the rendered chart rather than pinning it a third time |
+
+### How a Renovate pull request reaches `main`
+
+[`renovate.yml`](../../.github/workflows/renovate.yml) runs every night at 02:00 UTC and on
+`workflow_dispatch`. A pull request whose rule sets `automerge` gets GitHub's auto-merge armed
+(`platformAutomerge`), so GitHub squashes it the moment the eleven required checks pass; the `main`
+ruleset does not require the branch to be up to date, so a green pull request never waits for a
+rebase.
+
+`rebaseWhen` is left at Renovate's default, `auto`. Read in Renovate 44's source, `auto` resolves
+per branch: to `behind-base-branch` when the branch automerges, to `conflicted` otherwise. It would
+also pick `behind-base-branch` for a base branch that must be up to date before merging, which the
+`main` ruleset does not require. The consequence:
+
+- An **automerge** pull request that is behind `main` is rebased on the next run, which reruns
+  every check. A pull request that went red on something transient — a runner that "lost
+  communication with the server", seen on 2026-11-05 — heals on the first run after `main` has moved.
+- A pull request that **needs review** (a major update of anything but a GitHub Action) is rebased
+  only when it conflicts, so it is not rebuilt every night while it waits.
+- **Renovate never reruns failed checks on an unchanged branch.** If `main` has not moved, a red
+  automerge pull request stays red; `gh run rerun --failed` or the rebase checkbox in the pull
+  request description restarts it.
+
+Until 2026-11-09 `renovate.json` set `rebaseWhen: "conflicted"`, so Renovate rebuilt a red automerge
+pull request only once it conflicted with `main`.
 
 ## What is wrong today
 
+- **Nobody is told when a Renovate pull request goes red.** A failed required check leaves the pull
+  request open with auto-merge armed, and no workflow in this repository reports it. From 2026-11-02
+  to 2026-11-08 all six open Renovate pull requests sat red on the same failing check, and that was
+  found by looking.
 - **The Container Malware Scan floats.** `trivy-action@master` changes the scanner under a pull
   request that changes nothing, in a required check — the failure mode that pinning Node removed from
   the Release Tooling Check. It stays that way because a pin cannot be maintained

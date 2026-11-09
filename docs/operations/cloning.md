@@ -347,7 +347,7 @@ are in [values.yaml](../../deploy/helm/stackit-s3-provisioner/values.yaml).
 clone:
   image:
     repository: rclone/rclone   # default
-    tag: "1.75.0"               # default; pinned in the chart, tracked by dependency updates
+    tag: "1.76.0"               # default; pinned in the chart, tracked by dependency updates
   # resources: the chart already ships requests and limits. Copying is
   #   network-bound, so raise the limits for a very large transfer; the numbers
   #   are in README.md and values.yaml. Never set an empty map here — that

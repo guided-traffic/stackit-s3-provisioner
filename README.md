@@ -354,7 +354,7 @@ wipeOnDelete:
 clone:
   image:
     repository: rclone/rclone            # default
-    tag: "1.75.0"                        # default; Renovate tracks it
+    tag: "1.76.0"                        # default; Renovate tracks it
   resources:
     requests: {cpu: 100m, memory: 128Mi} # default
     limits:   {cpu: "1", memory: 512Mi}  # default
