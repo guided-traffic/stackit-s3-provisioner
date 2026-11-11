@@ -153,6 +153,15 @@ CRD from `config/crd/bases`, and registers the `BucketReconciler` **without a
 cloud. `ENVTEST_K8S_VERSION` is `1.33.0` (`# default`, in the
 [Makefile](../../Makefile)).
 
+The make targets resolve the envtest binaries with setup-envtest before `go
+test` starts (`ENVTEST_ASSETS` in the [Makefile](../../Makefile)), and a failure
+there stops the target with setup-envtest's exit code and its own message, such
+as `unable to download requested version: … got status "504 Gateway Timeout"`.
+Until 2026-11-11 the targets resolved the path through `$(shell …)`, which
+swallowed that failure: the suite started with an empty `KUBEBUILDER_ASSETS` and
+failed about 30 seconds later on `exec: "etcd": executable file not found in
+$PATH`, with the cause only further up in the log.
+
 What only a real API server can prove, and therefore what belongs here:
 
 | Case | Proves |

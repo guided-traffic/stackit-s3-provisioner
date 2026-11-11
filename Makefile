@@ -4,6 +4,12 @@ IMG ?= guidedtraffic/stackit-s3-provisioner:latest
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.33.0
 
+# ENVTEST_ASSETS starts a recipe line that resolves the envtest binaries into $$assets and stops
+# the recipe with setup-envtest's own error when that fails (a download failure exits 2). Resolving
+# them through $(shell ...) instead swallowed the failure: the suite then started with an empty
+# KUBEBUILDER_ASSETS and died later on 'exec: "etcd": executable file not found in $PATH'.
+ENVTEST_ASSETS = assets="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" || exit $$?
+
 # Go commands
 GOCMD = go
 GOTEST = $(GOCMD) test
@@ -65,7 +71,8 @@ cyclo-report: gocyclo ## Show full cyclomatic complexity report (including tests
 
 .PHONY: test
 test: fmt vet envtest ## Run all tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./... -coverprofile cover.out
+	$(ENVTEST_ASSETS); \
+	KUBEBUILDER_ASSETS="$$assets" go test ./... -coverprofile cover.out
 
 .PHONY: test-unit
 test-unit: ## Run unit tests only.
@@ -81,13 +88,15 @@ test-unit-coverage: ## Run unit tests with coverage.
 .PHONY: test-integration
 test-integration: envtest ## Run integration tests (envtest) only.
 	@echo "Running integration tests..."
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -tags=integration -count=1 -timeout=20m ./test/integration/...
+	$(ENVTEST_ASSETS); \
+	KUBEBUILDER_ASSETS="$$assets" $(GOTEST) -v -tags=integration -count=1 -timeout=20m ./test/integration/...
 
 .PHONY: test-integration-coverage
 test-integration-coverage: envtest ## Run integration tests (envtest) with coverage.
 	@echo "Running integration tests with coverage..."
 	@mkdir -p $(COVERAGE_DIR)
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -tags=integration -count=1 -timeout=20m -coverprofile=$(COVERAGE_DIR)/integration.out -covermode=atomic -coverpkg=./... ./test/integration/...
+	$(ENVTEST_ASSETS); \
+	KUBEBUILDER_ASSETS="$$assets" $(GOTEST) -v -tags=integration -count=1 -timeout=20m -coverprofile=$(COVERAGE_DIR)/integration.out -covermode=atomic -coverpkg=./... ./test/integration/...
 
 .PHONY: test-e2e
 test-e2e: ## Run E2E smoke tests against a running Kind cluster.
