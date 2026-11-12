@@ -67,6 +67,16 @@
       ]
     },
     {
+      "description": "Go version: the golang builder image in the Containerfile moves only with the Go version group, through the custom regex manager on the golang-version datasource. Switch off the docker datasource's own lookup of the same image, which otherwise opened a separate pull request for the same line and could merge it before or after the group",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "golang"
+      ],
+      "enabled": false
+    },
+    {
       "description": "Go modules: enable updates for indirect dependencies so transitive security patches (e.g. golang.org/x/net via govulncheck) land without waiting for a direct require to bump",
       "matchManagers": [
         "gomod"
