@@ -176,10 +176,27 @@ managers emit `depName: golang` from the `golang-version` datasource, and a pack
 datasource into a single "Go version" pull request so they cannot drift apart. Verified on
 2026-09-19 by reading each file and the custom managers in [`renovate.json`](../../renovate.json).
 
+The Containerfile line is also an image reference, so Renovate's built-in dockerfile manager reads
+it too, as `golang` from the `docker` datasource, outside the group. Until 2026-11-12 that opened a
+second pull request for the same line, for 1.27.0, 1.27.1 and 1.27.4, and either one could merge
+first. For 1.27.0 the Containerfile moved on 2026-08-24 and the rest of the group on 2026-08-27; for
+those three days the image was built with Go 1.27.0 while CI tested with 1.26.6. A package rule now
+switches the `docker` lookup of `golang` off, so the line moves only inside the group. Verified on
+2026-11-12 with a local dry run against a tree set back to 1.27.3: the dockerfile dependency
+reported `skipReason: disabled`, and `go.mod`, the Containerfile and both workflows proposed 1.27.4
+in `renovate/go-version`.
+
+The group needs the matching `golang:<version>-alpine` image to exist, because E2E and the
+Container Malware Scan build the Containerfile on every pull request. Docker Hub publishes it after
+the Go release; until it does, the group's pull request fails in those two jobs and needs a rerun.
+No run on `renovate/go-version` up to 2026-11-12 failed in either job — its failures were Code
+Linting and the GoSec scan — but that is an observation, not something the configuration
+guarantees.
+
 | File | Literal | Form | Matched by |
 |---|---|---|---|
 | [`go.mod`](../../go.mod) | `go <version>` | full version | custom regex manager on `^go\.mod$` |
-| [`Containerfile`](../../Containerfile) | `FROM --platform=$BUILDPLATFORM golang:<version>-alpine` | full version | custom regex manager on `^Containerfile$` / `^Dockerfile$`, whose pattern tolerates the optional `--platform` prefix |
+| [`Containerfile`](../../Containerfile) | `FROM --platform=$BUILDPLATFORM golang:<version>-alpine` | full version | custom regex manager on `^Containerfile$` / `^Dockerfile$`, whose pattern tolerates the optional `--platform` prefix; the dockerfile manager's own `docker` lookup of the same image is switched off |
 | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) | `GO_VERSION: '<version>'` | full version | custom regex manager on `^\.github/workflows/.*\.ya?ml$` |
 | [`.github/workflows/build.yml`](../../.github/workflows/build.yml) | `GO_VERSION: '<version>'` | full version | the same manager |
 | [`.github/release-template.hbs`](../../.github/release-template.hbs) | `go-<major>.<minor>-blue` | major.minor only, via `extractVersionTemplate` | custom regex manager on that file, with `loose` versioning |
